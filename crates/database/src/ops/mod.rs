@@ -12,4 +12,4 @@ pub mod task_runs;
 pub mod tutorial_seeder;
 
 // `ops::user`, `ops::role`, `ops::tenant` moved to the closed
-// `cognee-access-control` crate as part of T2-move (oss-split-plan §4 S2).
+// `cognee-access-control` crate.

@@ -8,8 +8,7 @@ How to cut and publish a cognee-rust release. Two tracks:
   source via `cd python && maturin develop` (or `maturin build --release` for a
   local wheel).
 - **Track B** — crates.io: publish the 24 OSS `cognee-*` library crates in
-  topological order (release-plz drives this). OSS git deps were removed in
-  T4, so non-leaf crates are now publishable.
+  topological order (release-plz drives this).
 
 ## Pre-flight (all tracks)
 
@@ -88,7 +87,6 @@ Attach the resulting tarball (lib + headers + `LICENSE-MIT` + `LICENSE-APACHE`) 
 
 ## Publish — crates.io (Track B)
 
-OSS git deps were removed in T4, so `cargo publish` works for non-leaf crates.
 Publishing is driven by release-plz (see `.github/workflows/release-plz.yml`)
 which walks the 24 OSS crates in topological order. For a manual fallback:
 

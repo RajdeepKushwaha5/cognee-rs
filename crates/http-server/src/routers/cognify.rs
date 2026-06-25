@@ -500,7 +500,7 @@ pub async fn ws_subscribe(
         use axum::extract::ws::Message;
 
         // Post-upgrade WS authentication moved closed alongside the
-        // cookie/JWT auth state in T3-pre. The closed
+        // cookie/JWT auth state. The closed
         // `cognee-http-cloud` crate may wrap this router with its own
         // post-upgrade gate; OSS treats the WS as unauthenticated.
         let _ = &headers;

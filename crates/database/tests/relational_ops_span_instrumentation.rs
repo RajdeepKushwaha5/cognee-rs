@@ -12,7 +12,7 @@
 #![cfg(feature = "sqlite")]
 
 // `RoleDb`/`TenantDb`/`UserDb` moved to the closed `cognee-access-control`
-// crate as part of T2-move (oss-split-plan §4 S2). The smoke tests that
+// crate. The smoke tests that
 // asserted spans for their direct-DB impls (`role_list_roles_in_tenant_*`,
 // `tenant_list_tenants_for_user_*`, `user_list_users_*`,
 // `acl_authorized_dataset_ids_*`) moved with them. The OSS surface here
@@ -42,7 +42,7 @@ fn assert_relational_span(spans: &[CapturedSpan], expected: &str) {
 }
 
 // ─── ops/acl.rs: direct-DB span coverage moved to the closed
-//     cognee-access-control crate's tests (T2-move). The trait-only
+//     cognee-access-control crate's tests. The trait-only
 //     helper `grant_all_permissions_on_dataset_via_trait` retains no
 //     own span (it wraps trait methods whose spans are emitted by the
 //     concrete impl).
@@ -134,7 +134,7 @@ async fn pipeline_runs_get_pipeline_run_emits_span() {
     );
 }
 
-// ─── ops/role.rs: moved to cognee-access-control (T2-move).
+// ─── ops/role.rs: moved to cognee-access-control.
 
 // ─── ops/search_history.rs ───────────────────────────────────────────────────
 
@@ -188,7 +188,7 @@ async fn task_runs_update_task_run_status_emits_span() {
     );
 }
 
-// ─── ops/tenant.rs: moved to cognee-access-control (T2-move).
+// ─── ops/tenant.rs: moved to cognee-access-control.
 
 // ─── ops/tutorial_seeder.rs ──────────────────────────────────────────────────
 
@@ -215,7 +215,7 @@ async fn tutorial_seeder_emits_span() {
     );
 }
 
-// ─── ops/user.rs: moved to cognee-access-control (T2-move).
+// ─── ops/user.rs: moved to cognee-access-control.
 
 // ─── compile-time export sanity ──────────────────────────────────────────────
 

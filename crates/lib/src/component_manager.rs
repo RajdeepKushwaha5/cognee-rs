@@ -354,7 +354,7 @@ impl ComponentManager {
                     Ok(Arc::new(BruteForceVectorDB::new()))
                 }
             }
-            // T4-move extracted the Qdrant adapter out of OSS into the closed
+            // the closed split extracted the Qdrant adapter out of OSS into the closed
             // `cognee-vector-qdrant` crate. OSS hard-errors rather than silently
             // substituting a different backend, mirroring the closed-adapter
             // handling elsewhere in this file (e.g. LiteRT). LanceDB stays OSS

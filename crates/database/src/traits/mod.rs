@@ -18,4 +18,4 @@ pub use session_lifecycle_db::{
 };
 
 // `RoleDb`, `TenantDb`, `UserDb` moved to the closed `cognee-access-control`
-// crate as part of T2-move (oss-split-plan §4 S2).
+// crate.

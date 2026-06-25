@@ -196,7 +196,7 @@ pub async fn post_visualize_multi(
             ));
         };
 
-        // The closed-side `users` table moved out of OSS in T3-pre, so
+        // The closed-side `users` table moved out of OSS, so
         // OSS falls back to the user id as the palette key. Closed
         // embedders that want the email-keyed palette wrap this router
         // and substitute their own email lookup.

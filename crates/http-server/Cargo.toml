@@ -80,10 +80,9 @@ dev-mock = ["cognee-vector/testing"]
 # Web framework and HTTP stack. axum 0.8 requires hyper 1.x, declared
 # explicitly here so the http-server can call hyper APIs directly
 # (server/http1/http2) without depending on a re-export. The OSS workspace
-# no longer carries a `[patch.crates-io]` block (the qdrant v0.14 hyper
-# fork moved to the closed `cognee-cloud-rust` workspace in T4-move
-# alongside the qdrant adapter), so the version pinned below is the only
-# hyper in the OSS dependency graph.
+# carries no `[patch.crates-io]` block — the qdrant v0.14 hyper fork lives
+# in the closed cognee-cloud-rs workspace alongside the qdrant adapter —
+# so the version pinned below is the only hyper in the OSS dependency graph.
 axum = { version = "0.8", features = ["multipart", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
@@ -130,7 +129,7 @@ utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
 # Secret-handling for API-key fields in `HttpServerConfig` /
 # `wire_default_backends` (LLM + embedding providers). The JWT / cookie /
 # password / SMTP auth deps moved to the closed `cognee-http-cloud`
-# crate alongside the auth router family (T3-pre).
+# crate alongside the auth router family.
 secrecy = "0.10"
 
 # Hashing

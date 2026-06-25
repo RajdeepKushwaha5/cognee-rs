@@ -2,7 +2,7 @@
 #
 # Docs: https://release-plz.dev/docs/config
 #
-# This config is consumed by the release-plz GitHub Action (added in T13).
+# This config is consumed by the release-plz GitHub Action.
 # It is intentionally minimal: every publishable workspace member shares the
 # same policy. Per-crate overrides live in `[[package]]` blocks below if and
 # when we need to diverge.

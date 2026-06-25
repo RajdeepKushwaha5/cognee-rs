@@ -119,7 +119,7 @@ impl RouterBuilder {
             .nest("/api/v1/visualize", routers::visualize::router())
             // P5 admin routers (settings stays OSS; configuration +
             // permissions move closed — both consume types relocated to
-            // cognee-access-control in T2-move).
+            // cognee-access-control).
             .nest("/api/v1/settings", routers::settings::router())
             // P6 observability
             .nest("/api/v1/activity", routers::activity::router())

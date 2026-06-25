@@ -445,7 +445,7 @@ axum                 = "0.8"
 tokio                = { workspace = true, features = ["full"] }
 tower                = "0.5"
 tower-http           = { version = "0.6", features = ["cors", "trace", "limit"] }
-hyper                = { version = "1", features = ["server", "http1", "http2"] }  # axum 0.8 needs hyper 1.x. After T4-move the workspace [patch.crates-io] block was removed (the qdrant v0.14 hyper fork moved to cognee-cloud-rust), so hyper 1.x is the only version in the OSS graph.
+hyper                = { version = "1", features = ["server", "http1", "http2"] }  # axum 0.8 needs hyper 1.x. The qdrant v0.14 hyper fork lives in closed cognee-cloud-rs, so hyper 1.x is the only version in the OSS graph.
 cognee-lib           = { path = "../lib" }       # no `server` feature on cognee-lib here — that would be a cycle
 cognee-models        = { path = "../models" }
 serde                = { workspace = true, features = ["derive"] }
@@ -606,12 +606,12 @@ No runtime GIL, no dynamic dispatch on handlers, no global mutable state — all
 
 | Topic | Doc | Reason for deferral |
 |---|---|---|
-| Auth internals (JWT format, cookie layout, API key storage, password hash migration from bcrypt) | `auth.md` (stub — moved to closed `cognee-http-cloud` in T3; see [`cognee-cloud-rs`](https://github.com/topoteretes/cognee-cloud-rs)) | Non-trivial; fastapi-users compatibility requires a careful spec. |
+| Auth internals (JWT format, cookie layout, API key storage, password hash migration from bcrypt) | `auth.md` (stub — moved to closed `cognee-http-cloud`; see [`cognee-cloud-rs`](https://github.com/topoteretes/cognee-cloud-rs)) | Non-trivial; fastapi-users compatibility requires a careful spec. |
 | Per-router endpoint contracts (request/response DTO field names, status codes, validation rules) | `routers/*.md` | Each router gets its own doc so it can be implemented + reviewed in isolation. |
 | Background pipeline registry (schema, eviction policy, restart recovery) | `pipelines.md` | Needs a decision on persistence (in-memory only vs DB-backed). |
 | WebSocket protocol | `websocket.md` | Needs exact message shape parity with the Python WS handler. |
 | OTEL span buffer | `observability.md` | Needs a decision on `tracing-opentelemetry` vs custom layer. |
-| Multi-tenant + RBAC schema | `tenants.md` (stub — moved to closed `cognee-http-cloud` in T3; see [`cognee-cloud-rs`](https://github.com/topoteretes/cognee-cloud-rs)) | Requires SeaORM migrations matching the Python Alembic schema. |
+| Multi-tenant + RBAC schema | `tenants.md` (stub — moved to closed `cognee-http-cloud`; see [`cognee-cloud-rs`](https://github.com/topoteretes/cognee-cloud-rs)) | Requires SeaORM migrations matching the Python Alembic schema. |
 
 ## 22. Open questions
 

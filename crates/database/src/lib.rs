@@ -54,6 +54,6 @@ pub use types::{
 // The `auth`, `permissions`, `UserDb`/`RoleDb`/`TenantDb`,
 // `SeaOrmUserAuthRepository`, `SeaOrmApiKeyRepository`, `ApiKey`, `AuthUser`,
 // `CreateUserPayload`, `UpdateUserPayload`, `ActiveUserWithApiKeyCount` items
-// moved to the closed `cognee-access-control` crate as part of T2-move
-// (oss-split-plan §4 S2). The `types` module deliberately remains private —
+// moved to the closed `cognee-access-control` crate
+//. The `types` module deliberately remains private —
 // closed callers reach `DatabaseError` via the top-level re-export above.

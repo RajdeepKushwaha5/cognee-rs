@@ -10,8 +10,7 @@ use crate::types::DatabaseError;
 /// thread-safe for async multi-threaded usage.
 ///
 /// The blanket `impl AclDb for DatabaseConnection` moved to the closed
-/// `cognee-access-control` crate as part of T2-move (oss-split-plan §4
-/// S2). OSS callers wire ACL through `MockAclDb` (tests) or through the
+/// `cognee-access-control` crate. OSS callers wire ACL through `MockAclDb` (tests) or through the
 /// closed `AccessControl` newtype (production cloud builds).
 #[async_trait]
 pub trait AclDb: Send + Sync {

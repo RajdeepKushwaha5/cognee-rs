@@ -8,7 +8,7 @@
 //! The auth/permissions helpers (`setup_auth_db`, `build_auth_test_state`,
 //! `seed_user`, `bearer_header`, `cookie_header`, `build_permissions_state`,
 //! the closed seed helpers) moved closed alongside the auth router
-//! family in T3-pre. What remains is the OSS-side P0/P4/P7 surface.
+//! family. What remains is the OSS-side P0/P4/P7 surface.
 #![allow(dead_code)]
 
 use axum::{Router, body::Body, http::Request};

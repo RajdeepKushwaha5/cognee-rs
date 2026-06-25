@@ -2,7 +2,7 @@
 //!
 //! The direct-`DatabaseConnection` implementations that backed the
 //! `AclDb` blanket impl moved into the closed `cognee-access-control`
-//! crate as part of T2-move (oss-split-plan §4 S2): the auth entities
+//! crate: the auth entities
 //! they depended on (`acl`, `permission`, `principal`, `user_role`,
 //! `user_tenant`) no longer exist on the OSS schema.
 //!

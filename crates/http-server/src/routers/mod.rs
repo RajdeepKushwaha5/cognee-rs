@@ -13,7 +13,7 @@ pub mod add;
 pub mod cognify;
 // `configuration` router (per-principal config blobs) moves to closed
 // alongside the auth surface — it consumes the `principal_configuration`
-// entity which moved to `cognee-access-control` in T2-move. T3-move
+// entity which moved to `cognee-access-control`. the closed split
 // physically relocates the file.
 // pub mod configuration;
 pub mod datasets;

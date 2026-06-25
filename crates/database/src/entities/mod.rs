@@ -31,5 +31,5 @@ pub mod session_record;
 // Auth-related entities (acl, permission, principal, principal_configuration,
 // role, role_default_permission, tenant, tenant_default_permission, user,
 // user_api_key, user_default_permission, user_role, user_tenant) moved to
-// the closed `cognee-access-control` crate as part of T2-move
-// (oss-split-plan §4 S2).
+// the closed `cognee-access-control` crate
+//.

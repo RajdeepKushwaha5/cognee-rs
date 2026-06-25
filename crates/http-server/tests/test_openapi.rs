@@ -55,7 +55,7 @@ async fn test_openapi_info() {
 /// P5 acceptance criterion: `GET /openapi.json` advertises the OSS-staying
 /// `/api/v1/settings` path. The `/api/v1/configuration/...` and
 /// `/api/v1/permissions/...` paths moved to the closed `cognee-http-cloud`
-/// crate (T3-move) and are asserted in its own OpenAPI overlay test.
+/// crate and are asserted in its own OpenAPI overlay test.
 #[tokio::test]
 async fn test_openapi_advertises_p5_paths() {
     let state = support::build_test_state().await;

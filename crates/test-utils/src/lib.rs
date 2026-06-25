@@ -19,8 +19,8 @@ pub mod mock_transcriber;
 pub mod span_capture;
 
 // `mock_user_db`, `mock_role_db`, `mock_tenant_db` moved to the closed
-// `cognee-access-control::test_utils` module as part of T2-move
-// (oss-split-plan §4 S2).
+// `cognee-access-control::test_utils` module
+//.
 
 use std::{path::PathBuf, sync::Arc};
 

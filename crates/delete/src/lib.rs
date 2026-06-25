@@ -2955,12 +2955,10 @@ mod tests {
 
     /// Helper to create an AuthorizedDeleteService backed by a real SQLite DB.
     ///
-    /// The closed `AccessControl` (`impl AclDb for ...`) lives in
-    /// `cognee-cloud-rust::cognee-access-control` post T2-move. OSS tests
-    /// drive ACL decisions through `MockAclDb`; this helper grants all four
-    /// permissions on every dataset by default so existing behavioural
-    /// assertions (which previously relied on `impl AclDb for
-    /// DatabaseConnection` + a real ACL row) keep passing.
+    /// The closed `AccessControl` (`impl AclDb for ...`) lives in the
+    /// closed `cognee-access-control` crate. OSS tests drive ACL decisions
+    /// through `MockAclDb`; this helper grants all four permissions on
+    /// every dataset by default so behavioural assertions keep passing.
     async fn make_authorized_service() -> (
         AuthorizedDeleteService,
         Arc<MockStorage>,
@@ -3149,7 +3147,7 @@ mod tests {
     async fn delete_cascades_acl_entries() {
         // This test used to verify FK CASCADE on `acls.dataset_id` through
         // the real `ops::acl::*` standalone functions. With the `acls` table
-        // moved to the closed `cognee-access-control` migration (T2-move),
+        // moved to the closed `cognee-access-control` migration,
         // OSS cannot exercise the production CASCADE — that is now covered
         // by integration tests in the closed crate. To keep the OSS test
         // surface meaningful we drive the in-memory `MockAclDb` and verify
@@ -3157,8 +3155,8 @@ mod tests {
         // grant exists before and is unaffected by deleting the OSS
         // `datasets` row (the mock has no FK cascade).
         //
-        // TODO(T3+): replicate FK CASCADE verification in
-        // `cognee-cloud-rust::cognee-access-control` integration tests.
+        // TODO: replicate FK CASCADE verification in the closed
+        // `cognee-access-control` integration tests.
         use cognee_database::AclDb;
         let db = connect("sqlite::memory:").await.unwrap();
         initialize(&db).await.unwrap();

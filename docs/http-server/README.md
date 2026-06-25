@@ -8,10 +8,10 @@ reference.
 ## Cross-cutting design
 
 - **[architecture.md](architecture.md)** — crate topology, dual-surface design (library + binary), middleware stack, config lifecycle.
-- **[auth.md](auth.md)** — stub; the auth subsystem (JWT, fastapi-users parity, password-hash migration, bearer/cookie/api-key) moved to the closed `cognee-http-cloud` crate in T3.
+- **[auth.md](auth.md)** — stub; the auth subsystem (JWT, fastapi-users parity, password-hash migration, bearer/cookie/api-key) lives in the closed `cognee-http-cloud` crate.
 - **[pipelines.md](pipelines.md)** — background job lifecycle, `PipelineRunRegistry`, status mapping, durable vs live events.
 - **[websocket.md](websocket.md)** — subscription model, status semantics, terminal close behavior.
-- **[tenants.md](tenants.md)** — stub; multi-tenant schema, permission model, and ACL resolution moved to the closed `cognee-http-cloud` crate in T3.
+- **[tenants.md](tenants.md)** — stub; multi-tenant schema, permission model, and ACL resolution lives in the closed `cognee-http-cloud` crate.
 - **[observability.md](observability.md)** — span instrumentation and telemetry attributes for the server.
 
 ## Endpoints

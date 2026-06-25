@@ -42,4 +42,4 @@ pub use triplet::Triplet;
 pub use user::User;
 
 // `Role` and `Tenant` moved to the closed `cognee-access-control::models`
-// module as part of T2-move (oss-split-plan §4 S2).
+// module.
