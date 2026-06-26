@@ -7,7 +7,6 @@ license.workspace = true
 description = "Deletion and orphan-sweep operations for the cognee knowledge graph."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

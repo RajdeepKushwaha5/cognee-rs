@@ -7,7 +7,6 @@ license.workspace = true
 description = "Core pipeline primitives and orchestration types for the cognee AI-memory engine."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

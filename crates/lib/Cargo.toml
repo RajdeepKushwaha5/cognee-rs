@@ -7,7 +7,6 @@ license.workspace = true
 description = "Cognee — an AI-memory pipeline that turns raw data into queryable knowledge graphs (umbrella crate)."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

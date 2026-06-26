@@ -7,7 +7,6 @@ license.workspace = true
 description = "Knowledge-graph extraction (cognify) — turn ingested data into a graph for cognee."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
