@@ -7,7 +7,6 @@ license.workspace = true
 description = "Vector-store abstraction with brute-force, LanceDB, and pgvector adapters for cognee."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

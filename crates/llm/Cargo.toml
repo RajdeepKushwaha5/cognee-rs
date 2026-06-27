@@ -7,7 +7,6 @@ license.workspace = true
 description = "LLM client abstraction (OpenAI-compatible) for the cognee AI-memory pipeline."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

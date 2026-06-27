@@ -7,7 +7,6 @@ license.workspace = true
 description = "Context retrieval (search) over the cognee knowledge graph and vector store."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

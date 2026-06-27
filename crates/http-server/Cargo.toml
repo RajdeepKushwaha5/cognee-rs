@@ -7,7 +7,6 @@ license.workspace = true
 description = "HTTP server exposing the cognee add/cognify/search pipeline (single-user, no-auth)."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

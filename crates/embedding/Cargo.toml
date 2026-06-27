@@ -7,7 +7,6 @@ license.workspace = true
 description = "Embedding-engine abstraction (ONNX, OpenAI, Ollama) for the cognee pipeline."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

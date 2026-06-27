@@ -7,7 +7,6 @@ license.workspace = true
 description = "OpenTelemetry tracing and metrics integration for the cognee pipeline."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true

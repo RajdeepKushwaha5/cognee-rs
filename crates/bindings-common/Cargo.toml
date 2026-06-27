@@ -7,7 +7,6 @@ license.workspace = true
 description = "Shared facade (HandleState, CogneeServices, SdkError, wire helpers) consumed by the Python / JS / C API cognee bindings."
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
