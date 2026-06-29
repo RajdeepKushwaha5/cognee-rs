@@ -13,7 +13,7 @@ use cognee_graph::GraphDBTrait;
 use cognee_graph::LadybugAdapter;
 #[cfg(feature = "pggraph")]
 use cognee_graph::PgGraphAdapter;
-use cognee_llm::{Llm, OpenAIAdapter, Transcriber};
+use cognee_llm::{Llm, Transcriber, build_openai_compatible_adapter};
 use cognee_storage::{LocalStorage, StorageTrait};
 #[cfg(feature = "pgvector")]
 use cognee_vector::PgVectorAdapter;
@@ -597,24 +597,14 @@ impl ComponentManager {
         // Build the real adapter exactly as before.
         let adapter: Arc<dyn Llm> = match provider.as_str() {
             "openai" => {
-                if llm_api_key.is_empty() {
-                    return Err(ComponentError::Config(
-                        "llm_api_key must be configured".to_string(),
-                    ));
-                }
-
-                let endpoint = if llm_endpoint.is_empty() {
-                    None
-                } else {
-                    Some(llm_endpoint)
-                };
-
-                let retries = llm_max_retries.max(1);
-
-                let adapter = OpenAIAdapter::new(llm_model, llm_api_key, endpoint)
-                    .map_err(|e| ComponentError::Llm(format!("initialization failed: {e}")))?
-                    .with_structured_output_retries(retries)
-                    .with_network_retries(retries);
+                let adapter = build_openai_compatible_adapter(
+                    "openai",
+                    &llm_model,
+                    &llm_api_key,
+                    &llm_endpoint,
+                    llm_max_retries,
+                )
+                .map_err(|e| ComponentError::Llm(e.to_string()))?;
 
                 Arc::new(adapter)
             }
@@ -670,24 +660,14 @@ impl ComponentManager {
 
         match provider.as_str() {
             "openai" => {
-                if llm_api_key.is_empty() {
-                    return Err(ComponentError::Config(
-                        "llm_api_key must be configured".to_string(),
-                    ));
-                }
-
-                let endpoint = if llm_endpoint.is_empty() {
-                    None
-                } else {
-                    Some(llm_endpoint)
-                };
-
-                let retries = llm_max_retries.max(1);
-
-                let adapter = OpenAIAdapter::new(llm_model, llm_api_key, endpoint)
-                    .map_err(|e| ComponentError::Llm(format!("initialization failed: {e}")))?
-                    .with_structured_output_retries(retries)
-                    .with_network_retries(retries);
+                let adapter = build_openai_compatible_adapter(
+                    "openai",
+                    &llm_model,
+                    &llm_api_key,
+                    &llm_endpoint,
+                    llm_max_retries,
+                )
+                .map_err(|e| ComponentError::Llm(e.to_string()))?;
 
                 Ok(Some(Arc::new(adapter) as Arc<dyn Transcriber>))
             }

@@ -12,7 +12,9 @@ use cognee_database::{
 use cognee_delete::DeleteService;
 use cognee_embedding::{EmbeddingConfig, EmbeddingEngine, EmbeddingProvider};
 use cognee_graph::{GraphDBTrait, LadybugAdapter};
-use cognee_llm::{Llm, OpenAIAdapter, OpenAIResponsesClient, ResponsesClient, Transcriber};
+use cognee_llm::{
+    Llm, OpenAIResponsesClient, ResponsesClient, Transcriber, build_openai_compatible_adapter,
+};
 use cognee_ontology::{OntologyManager, OntologyResolver};
 use cognee_search::{
     SeaOrmSessionStore, SearchBuilder, SearchOrchestrator, SessionManager, SessionStore,
@@ -262,23 +264,19 @@ fn wire_llm(cfg: &HttpServerConfig) -> Option<Arc<dyn Llm>> {
         return None;
     }
 
-    let api_key = cfg.llm_api_key.expose_secret().to_string();
+    let api_key = cfg.llm_api_key.expose_secret();
     if api_key.is_empty() {
         tracing::warn!("LLM API key missing; llm not wired");
         return None;
     }
 
-    let endpoint = if cfg.llm_endpoint.trim().is_empty() {
-        None
-    } else {
-        Some(cfg.llm_endpoint.clone())
-    };
-
-    match OpenAIAdapter::new(cfg.llm_model.clone(), api_key, endpoint).map(|adapter| {
-        adapter
-            .with_structured_output_retries(cfg.llm_max_retries.max(1))
-            .with_network_retries(cfg.llm_max_retries.max(1))
-    }) {
+    match build_openai_compatible_adapter(
+        &cfg.llm_provider,
+        &cfg.llm_model,
+        api_key,
+        &cfg.llm_endpoint,
+        cfg.llm_max_retries,
+    ) {
         Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn Llm>),
         Err(err) => {
             tracing::warn!("llm wiring failed, wiring as None: {err}");
@@ -292,22 +290,18 @@ fn wire_transcriber(cfg: &HttpServerConfig) -> Option<Arc<dyn Transcriber>> {
         return None;
     }
 
-    let api_key = cfg.llm_api_key.expose_secret().to_string();
+    let api_key = cfg.llm_api_key.expose_secret();
     if api_key.is_empty() {
         return None;
     }
 
-    let endpoint = if cfg.llm_endpoint.trim().is_empty() {
-        None
-    } else {
-        Some(cfg.llm_endpoint.clone())
-    };
-
-    match OpenAIAdapter::new(cfg.llm_model.clone(), api_key, endpoint).map(|adapter| {
-        adapter
-            .with_structured_output_retries(cfg.llm_max_retries.max(1))
-            .with_network_retries(cfg.llm_max_retries.max(1))
-    }) {
+    match build_openai_compatible_adapter(
+        &cfg.llm_provider,
+        &cfg.llm_model,
+        api_key,
+        &cfg.llm_endpoint,
+        cfg.llm_max_retries,
+    ) {
         Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn Transcriber>),
         Err(err) => {
             tracing::warn!("transcriber wiring failed, wiring as None: {err}");
