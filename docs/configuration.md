@@ -49,6 +49,27 @@ A fallback LLM (`llm_fallback_provider/_model/_endpoint/_api_key`) is configurab
 programmatically (no env binding). `MOCK_LLM` + cassettes power the offline
 benchmark — see [performance/mock-benchmark.md](performance/mock-benchmark.md).
 
+### Supported `LLM_PROVIDER` values
+
+Several providers are OpenAI-compatible HTTP endpoints, so they route through the
+same adapter — differing only in base URL, whether `LLM_API_KEY` is required, and
+litellm-style model-prefix stripping. The OpenAI-only request quirks are gated on
+the `api.openai.com` host, so they never fire against another endpoint.
+
+| `LLM_PROVIDER` | `LLM_API_KEY` | `LLM_ENDPOINT` default | Model prefix stripped |
+|---|---|---|---|
+| `openai` | required | `https://api.openai.com/v1` | `openai/` |
+| `ollama` | optional (placeholder used) | `http://localhost:11434/v1` | `ollama/` |
+| `mistral` | required | `https://api.mistral.ai/v1` | `mistral/` |
+| `gemini` | required | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini/` |
+| `custom` / `openai_compatible` | optional | **required** (no default) | _(none)_ |
+| `mock` | — | — | — (see `MOCK_LLM`) |
+
+`LLM_ENDPOINT` always overrides the default when set. Audio transcription
+(Whisper) is wired only for `openai` and `custom`/`openai_compatible` (which may
+expose `/audio/transcriptions`); `ollama`/`mistral`/`gemini` get graceful no-audio.
+Native Anthropic, Azure, and Bedrock adapters are tracked separately in issue #17.
+
 ## Embedding
 
 Read by `EmbeddingConfig::from_env()` ([`crates/embedding/src/config.rs`](../crates/embedding/src/config.rs)).
