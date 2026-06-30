@@ -24,6 +24,17 @@ const MISTRAL_DEFAULT_ENDPOINT: &str = "https://api.mistral.ai/v1";
 /// Default Gemini OpenAI-compatible base URL.
 const GEMINI_DEFAULT_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
 
+/// Providers this factory routes onto [`OpenAIAdapter`]. Single source of truth so
+/// the "unsupported provider" message can never drift from the match arms below.
+const SUPPORTED_PROVIDERS: &[&str] = &[
+    "openai",
+    "ollama",
+    "mistral",
+    "gemini",
+    "custom",
+    "openai_compatible",
+];
+
 /// Build an [`OpenAIAdapter`] for an OpenAI-compatible `provider`.
 ///
 /// Supported providers (case-insensitive): `openai`, `ollama`, `mistral`,
@@ -55,57 +66,45 @@ pub fn build_openai_compatible_adapter(
     let provider = provider.to_ascii_lowercase();
     let endpoint = endpoint.trim();
 
-    // Per provider: resolved base URL, whether an API key is mandatory, and the
-    // litellm-style model prefix to strip (if any).
-    let (base_url, api_key_required, strip_prefix): (Option<String>, bool, Option<&str>) =
-        match provider.as_str() {
-            // Empty endpoint → None so the adapter uses its OpenAI default.
-            "openai" => (non_empty(endpoint), true, None),
-            "ollama" => (
-                Some(endpoint_or(endpoint, OLLAMA_DEFAULT_ENDPOINT)),
-                false,
-                Some("ollama/"),
-            ),
-            "mistral" => (
-                Some(endpoint_or(endpoint, MISTRAL_DEFAULT_ENDPOINT)),
-                true,
-                Some("mistral/"),
-            ),
-            "gemini" => (
-                Some(endpoint_or(endpoint, GEMINI_DEFAULT_ENDPOINT)),
-                true,
-                Some("gemini/"),
-            ),
-            "custom" | "openai_compatible" => {
-                if endpoint.is_empty() {
-                    return Err(LlmError::ConfigError(format!(
-                        "llm_endpoint must be configured for provider '{provider}'"
-                    )));
-                }
-                (Some(endpoint.to_string()), false, None)
-            }
-            other => {
+    // Per provider: resolved base URL and the litellm-style model prefix to strip.
+    let (base_url, strip_prefix): (Option<String>, Option<&str>) = match provider.as_str() {
+        // Empty endpoint → None so the adapter uses its OpenAI default.
+        "openai" => (non_empty(endpoint), None),
+        "ollama" => (
+            Some(endpoint_or(endpoint, OLLAMA_DEFAULT_ENDPOINT)),
+            Some("ollama/"),
+        ),
+        "mistral" => (
+            Some(endpoint_or(endpoint, MISTRAL_DEFAULT_ENDPOINT)),
+            Some("mistral/"),
+        ),
+        "gemini" => (
+            Some(endpoint_or(endpoint, GEMINI_DEFAULT_ENDPOINT)),
+            Some("gemini/"),
+        ),
+        "custom" | "openai_compatible" => {
+            if endpoint.is_empty() {
                 return Err(LlmError::ConfigError(format!(
-                    "Unsupported llm_provider '{other}'. \
-                     Supported: openai, ollama, mistral, gemini, custom."
+                    "llm_endpoint must be configured for provider '{provider}'"
                 )));
             }
-        };
+            (Some(endpoint.to_string()), None)
+        }
+        other => {
+            return Err(LlmError::ConfigError(format!(
+                "Unsupported llm_provider '{other}'. Supported: {}.",
+                SUPPORTED_PROVIDERS.join(", ")
+            )));
+        }
+    };
 
-    if api_key_required && api_key.is_empty() {
+    // Every supported provider requires an API key, matching the Python SDK's
+    // _API_KEY_REQUIRED_PROVIDERS (openai, ollama, mistral, gemini, custom).
+    if api_key.is_empty() {
         return Err(LlmError::ConfigError(
             "llm_api_key must be configured".to_string(),
         ));
     }
-
-    // Ollama ignores auth but the OpenAI-style client still sends a bearer token;
-    // use a harmless placeholder when none is configured (matches Python cognee's
-    // `LLM_API_KEY="ollama"` convention).
-    let api_key = if provider == "ollama" && api_key.is_empty() {
-        "ollama"
-    } else {
-        api_key
-    };
 
     let model = match strip_prefix {
         Some(prefix) => model.strip_prefix(prefix).unwrap_or(model),
@@ -175,10 +174,11 @@ mod tests {
     }
 
     #[test]
-    fn ollama_defaults_endpoint_and_allows_empty_key() {
-        // No endpoint, no key → still builds (Ollama needs neither from the user).
-        let adapter = build_openai_compatible_adapter("ollama", "ollama/llama3.1:8b", "", "", 3)
-            .expect("ollama adapter should build");
+    fn ollama_defaults_endpoint_and_strips_prefix() {
+        // No endpoint → the Ollama default is used; the `ollama/` prefix is stripped.
+        let adapter =
+            build_openai_compatible_adapter("ollama", "ollama/llama3.1:8b", "sk-test", "", 3)
+                .expect("ollama adapter should build");
         assert_eq!(adapter.model(), "llama3.1:8b");
     }
 
@@ -187,12 +187,19 @@ mod tests {
         let adapter = build_openai_compatible_adapter(
             "ollama",
             "llama3.1:8b",
-            "",
+            "sk-test",
             "http://remote:11434/v1",
             3,
         )
         .expect("ollama adapter should build");
         assert_eq!(adapter.model(), "llama3.1:8b");
+    }
+
+    #[test]
+    fn ollama_requires_api_key() {
+        // Parity with Python's _API_KEY_REQUIRED_PROVIDERS: ollama requires a key.
+        let result = build_openai_compatible_adapter("ollama", "llama3.1:8b", "", "", 3);
+        assert!(matches!(result, Err(LlmError::ConfigError(_))));
     }
 
     #[test]
@@ -222,18 +229,26 @@ mod tests {
 
     #[test]
     fn custom_requires_endpoint() {
-        let missing = build_openai_compatible_adapter("custom", "my-model", "", "", 3);
+        let missing = build_openai_compatible_adapter("custom", "my-model", "sk-test", "", 3);
         assert!(matches!(missing, Err(LlmError::ConfigError(_))));
 
         let adapter = build_openai_compatible_adapter(
             "openai_compatible",
             "my-model",
-            "",
+            "sk-test",
             "https://my.host/v1",
             3,
         )
         .expect("custom adapter should build");
         // No prefix stripping for custom — the model is passed through verbatim.
         assert_eq!(adapter.model(), "my-model");
+    }
+
+    #[test]
+    fn custom_requires_api_key() {
+        // Parity with Python's _API_KEY_REQUIRED_PROVIDERS: custom requires a key.
+        let result =
+            build_openai_compatible_adapter("custom", "my-model", "", "https://my.host/v1", 3);
+        assert!(matches!(result, Err(LlmError::ConfigError(_))));
     }
 }

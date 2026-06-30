@@ -52,23 +52,30 @@ benchmark — see [performance/mock-benchmark.md](performance/mock-benchmark.md)
 ### Supported `LLM_PROVIDER` values
 
 Several providers are OpenAI-compatible HTTP endpoints, so they route through the
-same adapter — differing only in base URL, whether `LLM_API_KEY` is required, and
-litellm-style model-prefix stripping. The OpenAI-only request quirks are gated on
-the `api.openai.com` host, so they never fire against another endpoint.
+same adapter — differing only in base URL and litellm-style model-prefix stripping.
+`LLM_API_KEY` is required for every provider (matching the Python SDK's
+`_API_KEY_REQUIRED_PROVIDERS`; for a local Ollama any non-empty value works). The
+OpenAI-only request quirks are gated on the `api.openai.com` host, so they never
+fire against another endpoint.
 
 | `LLM_PROVIDER` | `LLM_API_KEY` | `LLM_ENDPOINT` default | Model prefix stripped |
 |---|---|---|---|
 | `openai` | required | `https://api.openai.com/v1` | `openai/` |
-| `ollama` | optional (placeholder used) | `http://localhost:11434/v1` | `ollama/` |
+| `ollama` | required (any value for local) | `http://localhost:11434/v1` | `ollama/` |
 | `mistral` | required | `https://api.mistral.ai/v1` | `mistral/` |
 | `gemini` | required | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini/` |
-| `custom` / `openai_compatible` | optional | **required** (no default) | _(none)_ |
+| `custom` / `openai_compatible` | required | **required** (no default) | _(none)_ |
 | `mock` | — | — | — (see `MOCK_LLM`) |
 
 `LLM_ENDPOINT` always overrides the default when set. Audio transcription
 (Whisper) is wired only for `openai` and `custom`/`openai_compatible` (which may
 expose `/audio/transcriptions`); `ollama`/`mistral`/`gemini` get graceful no-audio.
 Native Anthropic, Azure, and Bedrock adapters are tracked separately in issue #17.
+
+> **Ollama embeddings:** set `EMBEDDING_ENDPOINT` explicitly when using
+> `EMBEDDING_PROVIDER=ollama`. The Ollama embedder needs the `/api/embed` route, and
+> the embedding endpoint does not inherit `LLM_ENDPOINT` (which points at the `/v1`
+> chat base), so leaving it unset would target the wrong path.
 
 ## Embedding
 
