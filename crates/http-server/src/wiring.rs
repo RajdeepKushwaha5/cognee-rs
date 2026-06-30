@@ -256,55 +256,43 @@ async fn wire_embedding_engine(cfg: &HttpServerConfig) -> Option<Arc<dyn Embeddi
 }
 
 fn wire_llm(cfg: &HttpServerConfig) -> Option<Arc<dyn Llm>> {
-    if !cfg.llm_provider.eq_ignore_ascii_case("openai") {
-        tracing::warn!(
-            "LLM provider '{}' is not supported by standalone wiring yet; llm not wired",
-            cfg.llm_provider
-        );
-        return None;
-    }
-
-    let api_key = cfg.llm_api_key.expose_secret();
-    if api_key.is_empty() {
-        tracing::warn!("LLM API key missing; llm not wired");
-        return None;
-    }
-
+    // Provider routing (and the required-key / required-endpoint validation) lives
+    // in the shared factory; an unsupported provider or missing credential errors
+    // there and we wire None.
     match build_openai_compatible_adapter(
         &cfg.llm_provider,
         &cfg.llm_model,
-        api_key,
+        cfg.llm_api_key.expose_secret(),
         &cfg.llm_endpoint,
         cfg.llm_max_retries,
     ) {
         Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn Llm>),
         Err(err) => {
-            tracing::warn!("llm wiring failed, wiring as None: {err}");
+            tracing::warn!("llm not wired: {err}");
             None
         }
     }
 }
 
 fn wire_transcriber(cfg: &HttpServerConfig) -> Option<Arc<dyn Transcriber>> {
-    if !cfg.llm_provider.eq_ignore_ascii_case("openai") {
-        return None;
-    }
-
-    let api_key = cfg.llm_api_key.expose_secret();
-    if api_key.is_empty() {
+    // Whisper-style transcription only works against OpenAI and user-pointed
+    // OpenAI-compatible servers that expose /audio/transcriptions; other providers
+    // get graceful no-audio (None).
+    let provider = cfg.llm_provider.to_ascii_lowercase();
+    if !matches!(provider.as_str(), "openai" | "custom" | "openai_compatible") {
         return None;
     }
 
     match build_openai_compatible_adapter(
         &cfg.llm_provider,
         &cfg.llm_model,
-        api_key,
+        cfg.llm_api_key.expose_secret(),
         &cfg.llm_endpoint,
         cfg.llm_max_retries,
     ) {
         Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn Transcriber>),
         Err(err) => {
-            tracing::warn!("transcriber wiring failed, wiring as None: {err}");
+            tracing::warn!("transcriber not wired: {err}");
             None
         }
     }

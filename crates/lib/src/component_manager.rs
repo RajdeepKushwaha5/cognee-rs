@@ -594,11 +594,12 @@ impl ComponentManager {
             }
         }
 
-        // Build the real adapter exactly as before.
+        // Build the real adapter. OpenAI and the OpenAI-compatible providers all
+        // route through the shared factory (issue #17, Tier 1).
         let adapter: Arc<dyn Llm> = match provider.as_str() {
-            "openai" => {
+            "openai" | "ollama" | "mistral" | "gemini" | "custom" | "openai_compatible" => {
                 let adapter = build_openai_compatible_adapter(
-                    "openai",
+                    &provider,
                     &llm_model,
                     &llm_api_key,
                     &llm_endpoint,
@@ -617,7 +618,8 @@ impl ComponentManager {
             }
             _ => {
                 return Err(ComponentError::Config(format!(
-                    "Unsupported llm_provider '{provider}'. Supported: openai, mock.",
+                    "Unsupported llm_provider '{provider}'. \
+                     Supported: openai, ollama, mistral, gemini, custom, mock.",
                 )));
             }
         };
@@ -659,9 +661,14 @@ impl ComponentManager {
         };
 
         match provider.as_str() {
-            "openai" => {
+            // Whisper-style transcription works against OpenAI and any user-pointed
+            // OpenAI-compatible server that exposes /audio/transcriptions
+            // (Groq, vLLM, a LiteLLM proxy). Ollama/Mistral/Gemini do not expose
+            // that route via the chat path, so they return None (graceful no-audio)
+            // rather than building an adapter that 404s at runtime.
+            "openai" | "custom" | "openai_compatible" => {
                 let adapter = build_openai_compatible_adapter(
-                    "openai",
+                    &provider,
                     &llm_model,
                     &llm_api_key,
                     &llm_endpoint,
@@ -671,7 +678,7 @@ impl ComponentManager {
 
                 Ok(Some(Arc::new(adapter) as Arc<dyn Transcriber>))
             }
-            // litert and any future providers that do not implement Transcriber
+            // litert and providers that do not expose OpenAI-compatible audio
             // return None — audio stays gracefully unsupported (D5).
             _ => Ok(None),
         }
