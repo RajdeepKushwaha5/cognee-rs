@@ -29,11 +29,11 @@ CARGO_FLAGS="--manifest-path $MANIFEST --no-default-features --features sqlite,t
 # ---------------------------------------------------------------------------
 echo "==> Building for aarch64-apple-ios (device) ..."
 export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-cargo rustc --target aarch64-apple-ios $CARGO_FLAGS -- --crate-type staticlib
+cargo rustc --crate-type staticlib --target aarch64-apple-ios $CARGO_FLAGS
 
 echo "==> Building for aarch64-apple-ios-sim (simulator) ..."
 export SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-cargo rustc --target aarch64-apple-ios-sim $CARGO_FLAGS -- --crate-type staticlib
+cargo rustc --crate-type staticlib --target aarch64-apple-ios-sim $CARGO_FLAGS
 
 # ---------------------------------------------------------------------------
 # 2. Stage headers + module map
