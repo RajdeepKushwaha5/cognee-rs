@@ -6,7 +6,7 @@
 // Run on iOS Simulator:
 //   xcodebuild test \
 //     -scheme CogneeSDK \
-//     -destination 'platform=iOS Simulator,name=iPhone 16' \
+//     -destination 'platform=iOS Simulator,name=iPhone 17' \
 //     2>&1 | grep -E 'Test|PASS|FAIL|error'
 
 import XCTest
@@ -34,7 +34,7 @@ final class PipelineTests: XCTestCase {
     private func textInputsJSON(_ text: String) throws -> String {
         let payload: [[String: String]] = [["type": "text", "text": text]]
         let data = try JSONSerialization.data(withJSONObject: payload)
-        return String(data: data, encoding: .utf8)!
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
     }
 
     /// Load the first entry from the bundled memories.json and apply the same
