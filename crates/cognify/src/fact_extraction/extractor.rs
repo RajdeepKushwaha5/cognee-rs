@@ -50,6 +50,21 @@ fn normalize_node_names(graph: &mut KnowledgeGraph) {
     }
 }
 
+/// The `GenerationOptions` shared by the per-chunk and batched extraction calls.
+///
+/// `max_tokens: None` is a documented invariant (Python parity): the Python
+/// `acreate_structured_output` passes no cap, so the response uses the model's
+/// full default output budget. A small cap truncates a dense graph mid-JSON and
+/// aborts cognify with a deserialization error. Kept in one place so the two
+/// call sites cannot drift.
+fn extraction_options() -> GenerationOptions {
+    GenerationOptions {
+        temperature: Some(0.1),
+        max_tokens: None,
+        ..Default::default()
+    }
+}
+
 /// Why a batched group call could not be used as-is, so the caller can react to
 /// each cause differently.
 enum GroupError {
@@ -132,21 +147,7 @@ impl FactExtractor {
 
         let result: M = self
             .llm
-            .create_structured_output(
-                text,
-                system_prompt,
-                // Python parity: `acreate_structured_output` passes NO
-                // max_tokens/max_completion_tokens to the extraction call, so
-                // the response uses the model's full default output budget. A
-                // small cap here truncates large graphs mid-JSON on dense
-                // chunks, aborting cognify with a deserialization error. Leave
-                // max_tokens as None to match Python (no artificial cap).
-                Some(GenerationOptions {
-                    temperature: Some(0.1),
-                    max_tokens: None,
-                    ..Default::default()
-                }),
-            )
+            .create_structured_output(text, system_prompt, Some(extraction_options()))
             .await
             .map_err(|e| CognifyError::LlmError(e.to_string()))?;
 
@@ -261,7 +262,11 @@ impl FactExtractor {
     /// per-call prompt. Whether it preserves extraction quality depends on the
     /// model and is a data-driven decision (see the parity harness in the tests);
     /// keep it opt-in until a calibration run on your corpus supports the chosen
-    /// `group_size`.
+    /// `group_size`. The count win is also not unconditional: a mis-counted group
+    /// falls back to per-chunk, so a model that persistently mis-counts issues
+    /// `N + ceil(N / group_size)` requests, worse than plain per-chunk `N`. The
+    /// calibration run should therefore watch the mismatch rate, not just
+    /// node/edge parity.
     pub async fn extract_facts_grouped(
         &self,
         texts: Vec<String>,
@@ -272,7 +277,11 @@ impl FactExtractor {
         let mut out: Vec<KnowledgeGraph> = Vec::with_capacity(texts.len());
 
         for group in texts.chunks(group_size) {
-            if group_size == 1 {
+            // A single-chunk group (group_size == 1, or a trailing remainder like
+            // n=7,k=3 -> [3,3,1]) takes the per-chunk path: batching one chunk
+            // saves no requests and would send it as a `[{index,text}]` array with
+            // the batch instructions, a different prompt than plain `extract_facts`.
+            if group.len() == 1 {
                 out.push(
                     self.extract_facts(&group[0], custom_prompt.as_deref())
                         .await?,
@@ -338,13 +347,9 @@ impl FactExtractor {
             .create_structured_output(
                 &user_prompt,
                 &system_prompt,
-                // Same as per-chunk extraction: no output cap, so a dense batch
-                // is not truncated mid-JSON (Python parity).
-                Some(GenerationOptions {
-                    temperature: Some(0.1),
-                    max_tokens: None,
-                    ..Default::default()
-                }),
+                // Same options as the per-chunk path (no output cap); see
+                // `extraction_options`.
+                Some(extraction_options()),
             )
             .await
             .map_err(|e| {
@@ -361,6 +366,11 @@ impl FactExtractor {
         for graph in &mut graphs {
             normalize_node_names(graph);
         }
+        debug!(
+            "Batched extraction produced {} graph(s) for {} chunk(s)",
+            graphs.len(),
+            group.len()
+        );
         Ok(graphs)
     }
 
