@@ -90,8 +90,8 @@ ladybug        = ["cognee-graph/ladybug", "cognee-components/ladybug"]
 # Embedded LanceDB vector store (Arrow + lance native stack — a large build, so
 # consumers on another vector backend can drop it).
 lancedb        = ["cognee-vector/lancedb", "cognee-components/lancedb"]
-pgvector       = ["cognee-vector/pgvector", "cognee-components/pgvector", "dep:url"]
-pggraph        = ["cognee-graph/postgres", "cognee-components/pggraph", "dep:url"]
+pgvector       = ["cognee-vector/pgvector", "cognee-components/pgvector"]
+pggraph        = ["cognee-graph/postgres", "cognee-components/pggraph"]
 sqlite         = ["cognee-database/sqlite"]
 postgres       = ["cognee-database/postgres"]
 hf-tokenizer   = ["cognee-chunking/hf-tokenizer"]
@@ -192,7 +192,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-url = { workspace = true, optional = true }
+url = { workspace = true }
 uuid.workspace = true
 
 # Integration tests whose whole file is behind a `#![cfg(feature = ...)]`.

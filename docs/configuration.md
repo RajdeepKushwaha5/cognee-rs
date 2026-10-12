@@ -524,6 +524,15 @@ are normalised client-side.
 | `VECTOR_DB_USERNAME` / `VECTOR_DB_PASSWORD` | … | _(empty)_ |
 
 Supported providers:
+
+> **This list is the built-in set, not the set of valid values.** Any crate can
+> register an additional provider under any id via `ComponentRegistry`, and
+> `VECTOR_DB_PROVIDER` / `GRAPH_DATABASE_PROVIDER` accept it — including
+> Postgres-backed providers, which receive the assembled
+> `vector_postgres_url` / `graph_postgres_url` from the `*_HOST` / `*_PORT` /
+> `*_NAME` / `*_USERNAME` / `*_PASSWORD` settings exactly as the built-ins do.
+> Registering over a built-in id replaces it. See
+> [guides/external-providers.md](guides/external-providers.md).
 - `lancedb` — embedded Apache-Arrow / Lance vector store, on disk. The default
   provider, and default-on in `cognee`, `cognee-http-server` and every binding;
   requires the `lancedb` Cargo feature (the Arrow/Lance native stack is a large

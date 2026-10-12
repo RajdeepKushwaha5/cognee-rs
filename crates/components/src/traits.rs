@@ -5,6 +5,9 @@
 //! [`crate::ComponentRegistry::with_builtins`]; external adapter crates
 //! implement these traits and register their factories at their own binary entry points.
 //!
+//! Adding a backend must never require a change to this repository — see
+//! `docs/guides/external-providers.md` for what that commits this crate to.
+//!
 //! All traits are `Send + Sync` and use `#[async_trait]` so that
 //! `Arc<dyn XFactory>` is dyn-compatible and the holding `ComponentManager`
 //! stays `Send + Sync` (required by the `Arc<HandleState>` bindings layer).

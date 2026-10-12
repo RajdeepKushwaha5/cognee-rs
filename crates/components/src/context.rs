@@ -34,11 +34,28 @@ pub struct BackendBuildContext {
     /// Explicit ladybug/kuzu graph file path. Empty → the factory derives
     /// `{system_root_directory}/graph`.
     pub graph_file_path: String,
-    /// Resolution outcome for the Postgres graph backend: `None` when the
-    /// provider is not Postgres, `Some(Ok(url))` on success, `Some(Err(msg))`
-    /// when the provider *is* Postgres but URL resolution failed — carrying the
+    /// Resolution outcome of the `graph_database_*` settings as a Postgres URL,
+    /// offered to **whichever** graph provider is selected — built-in or
+    /// externally registered.
+    ///
+    /// `Some(Ok(url))` when a URL was assembled from configuration;
+    /// `Some(Err(msg))` when assembly was attempted and failed, carrying the
     /// specific cause (e.g. missing credentials) so the factory can restate it
-    /// in the returned error rather than only logging it.
+    /// in the returned error rather than only logging it; `None` when the
+    /// caller attempted no resolution (a hand-built context, as in
+    /// `build_database`, or a lowering that still gates on provider id).
+    ///
+    /// `Ok` means a URL was *assembled*, not that a server exists: with no
+    /// Postgres-specific settings, assembly falls back to the relational
+    /// `db_*` configuration, whose defaults point at `localhost:5432`. A
+    /// factory should fail with the setting the operator missed rather than
+    /// let a connection error to an unrelated local database stand as the
+    /// diagnosis.
+    ///
+    /// This is **not** a signal that the provider is Postgres-backed. It is
+    /// populated regardless of provider id, because the registry is an open
+    /// extension point and the caller cannot know which external providers want
+    /// a Postgres URL. A provider that does not need one ignores the field.
     pub graph_postgres_url: Option<Result<String, String>>,
 
     // ── vector ────────────────────────────────────────────────────────────
@@ -48,9 +65,11 @@ pub struct BackendBuildContext {
     /// Raw vector DB URL/path as configured. Consulted for the `:memory:`
     /// escape hatch and for the LanceDB on-disk path.
     pub vector_db_url: String,
-    /// Resolution outcome for the pgvector backend: `None` when the provider is
-    /// not pgvector, `Some(Ok(url))` on success, `Some(Err(msg))` when the
-    /// provider *is* pgvector but URL resolution failed (carries the cause).
+    /// Resolution outcome of the `vector_db_*` settings as a Postgres URL,
+    /// offered to **whichever** vector provider is selected — built-in or
+    /// externally registered. Same three-state contract, and the same caveat
+    /// that it does not indicate the provider is Postgres-backed, as
+    /// [`Self::graph_postgres_url`].
     pub vector_postgres_url: Option<Result<String, String>>,
     /// Embedding vector dimensionality (needed by pgvector table creation).
     pub embedding_dimensions: usize,

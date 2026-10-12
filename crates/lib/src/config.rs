@@ -18,7 +18,12 @@ pub const DEFAULT_SYSTEM_PROMPT_PATH: &str = "answer_simple_question.txt";
 
 /// Assemble a `postgres://user:pass@host:port/dbname` URL with percent-encoded
 /// credentials. Shared by the vector and graph URL resolvers.
-#[cfg(any(feature = "pgvector", feature = "pggraph"))]
+///
+/// Not gated on the built-in Postgres features: an externally registered
+/// provider may be Postgres-backed on a build where `pgvector` / `pggraph` are
+/// off, and nothing here touches an adapter. Its one dependency, `url`, is
+/// therefore a direct non-optional dep of this crate — it is already in the
+/// graph of a `--no-default-features` build, so that costs no compilation.
 fn build_postgres_url(
     host: &str,
     port: u16,
@@ -981,39 +986,29 @@ impl Settings {
         use std::path::PathBuf;
 
         let graph_provider = self.graph_database_provider.to_lowercase();
-        // Carry the resolution `Result` through to the factory so it can restate
-        // the specific cause (e.g. "Missing required Postgres graph credentials")
-        // in the returned error, not just in a log line an SDK user may not see.
-        let graph_postgres_url = {
-            #[cfg(feature = "pggraph")]
-            {
-                if matches!(graph_provider.as_str(), "postgres" | "postgresql") {
-                    Some(self.resolved_graph_postgres_url())
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(feature = "pggraph"))]
-            {
-                None
-            }
-        };
+        // Resolved for EVERY provider, not only the built-in Postgres ones.
+        //
+        // `ComponentRegistry` is an open extension point: an external crate may
+        // register a Postgres-backed provider under any id it likes, and this
+        // function cannot know which ids those are. Gating the resolution
+        // on a hardcoded list of built-in ids made every such provider
+        // unreachable — the factory received `None` and could only fail. Gating
+        // it on the `pggraph` / `pgvector` cargo features made it worse, by
+        // tying an external adapter to an unrelated built-in being compiled in.
+        //
+        // So the context offers the resolution and each factory decides whether
+        // it wants it. Providers with nothing to do with Postgres simply never
+        // read the field. The cost is assembling two strings that may go
+        // unused; the benefit is that "register a provider" is sufficient.
+        //
+        // The `Result` is carried through rather than unwrapped so a factory can
+        // restate the specific cause (e.g. "Missing required Postgres graph
+        // credentials") in the error it returns, not just in a log line an SDK
+        // user may never see.
+        let graph_postgres_url = Some(self.resolved_graph_postgres_url());
 
         let vector_provider = self.vector_db_provider.to_lowercase();
-        let vector_postgres_url = {
-            #[cfg(feature = "pgvector")]
-            {
-                if vector_provider == "pgvector" {
-                    Some(self.resolved_vector_postgres_url())
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(feature = "pgvector"))]
-            {
-                None
-            }
-        };
+        let vector_postgres_url = Some(self.resolved_vector_postgres_url());
 
         // Embedding endpoint/key fall back to the LLM provider's when no
         // embedding-specific values are set (shared OpenAI-compatible account).
@@ -1158,7 +1153,10 @@ impl Settings {
     /// Build a Postgres connection URL from the `graph_database_*` settings,
     /// falling back to the relational `db_*` fields when graph-specific creds
     /// are not fully configured (Python `get_graph_engine.py:332-367` parity).
-    #[cfg(feature = "pggraph")]
+    ///
+    /// Always compiled: see [`Self::backend_context`] — the resolution is
+    /// offered to whichever graph provider is selected, including externally
+    /// registered ones, so it cannot depend on the built-in `pggraph` feature.
     pub(crate) fn resolved_graph_postgres_url(&self) -> Result<String, String> {
         if self.graph_database_url.starts_with("postgres://")
             || self.graph_database_url.starts_with("postgresql://")
@@ -1184,7 +1182,13 @@ impl Settings {
                 self.graph_database_password.as_str(),
             )
         } else {
-            tracing::warn!(
+            // `debug`, not `warn`: `Settings::backend_context` resolves this for
+            // every provider now, so a warning here fires on every deployment
+            // -- including ones that never mention Postgres. The fallback is
+            // also the documented single-shared-Postgres layout rather than a
+            // misconfiguration. A genuine failure still returns `Err` below,
+            // and that reaches the user through the factory.
+            tracing::debug!(
                 "Postgres graph credentials not fully configured; falling back to the \
                  relational database configuration. Set GRAPH_DATABASE_* explicitly to avoid this."
             );
@@ -1204,7 +1208,9 @@ impl Settings {
     }
 
     /// Build a Postgres connection URL from the `vector_db_*` settings.
-    #[cfg(feature = "pgvector")]
+    ///
+    /// Always compiled, for the reason given on
+    /// [`Self::resolved_graph_postgres_url`].
     pub(crate) fn resolved_vector_postgres_url(&self) -> Result<String, String> {
         if self.vector_db_url.starts_with("postgres://")
             || self.vector_db_url.starts_with("postgresql://")
@@ -1239,7 +1245,13 @@ impl Settings {
                 self.vector_db_password.as_str(),
             )
         } else {
-            tracing::warn!(
+            // `debug`, not `warn`: `Settings::backend_context` resolves this for
+            // every provider now, so a warning here fires on every deployment
+            // -- including ones that never mention Postgres. The fallback is
+            // also the documented single-shared-Postgres layout rather than a
+            // misconfiguration. A genuine failure still returns `Err` below,
+            // and that reaches the user through the factory.
+            tracing::debug!(
                 "Postgres vector credentials not fully configured; falling back to the \
                  relational database configuration. Set VECTOR_DB_* explicitly to avoid this."
             );
@@ -4133,6 +4145,72 @@ mod tests {
         assert_eq!(
             sslmode_from_connect_args(r#"{"ssl":{"ca":"/etc/ca.pem"}}"#).as_deref(),
             Some("require")
+        );
+    }
+
+    /// An externally registered provider must receive the resolved Postgres
+    /// URLs, under whatever id it chose.
+    ///
+    /// `ComponentRegistry` lets any crate register a provider, so the set of
+    /// Postgres-backed provider ids is open and this crate cannot enumerate it.
+    /// `backend_context` used to resolve only for the built-in ids
+    /// (`postgres`/`postgresql`, `pgvector`), which handed every external
+    /// Postgres-backed adapter a `None` it could only turn into "requires a
+    /// resolved PostgreSQL URL" — the provider was unreachable through
+    /// configuration on every entry point. Pin that it is resolved for an id
+    /// this crate has never heard of.
+    #[test]
+    fn backend_context_resolves_postgres_urls_for_an_external_provider() {
+        let s = Settings {
+            graph_database_provider: "some-external-provider".to_string(),
+            vector_db_provider: "some-external-provider".to_string(),
+            db_provider: "postgres".to_string(),
+            db_host: "shared-pg".to_string(),
+            db_port: 5432,
+            db_name: "cognee_db".to_string(),
+            db_username: "postgres".to_string(),
+            db_password: "pw".to_string(),
+            ..Settings::default()
+        };
+        let ctx = s.backend_context();
+        assert_eq!(
+            ctx.graph_postgres_url,
+            Some(Ok(
+                "postgres://postgres:pw@shared-pg:5432/cognee_db".to_string()
+            )),
+            "an external graph provider must be offered the resolved URL"
+        );
+        assert_eq!(
+            ctx.vector_postgres_url,
+            Some(Ok(
+                "postgres://postgres:pw@shared-pg:5432/cognee_db".to_string()
+            )),
+            "an external vector provider must be offered the resolved URL"
+        );
+        // The provider id is passed through untouched (lowercased) so the
+        // registry can find the factory that was registered under it.
+        assert_eq!(ctx.graph_provider, "some-external-provider");
+        assert_eq!(ctx.vector_provider, "some-external-provider");
+    }
+
+    /// A failed resolution must reach the factory as `Some(Err(cause))`, not
+    /// `None`, so the factory can restate the real reason instead of the
+    /// generic "requires a resolved PostgreSQL URL".
+    #[test]
+    fn backend_context_carries_the_resolution_failure_cause() {
+        // Blank relational host with no vector-specific credentials: nothing
+        // left to fall back to (`vector_postgres_url_errs_when_relational_host_
+        // or_name_missing` pins that this is an error rather than a bogus URL).
+        let s = Settings {
+            graph_database_provider: "some-external-provider".to_string(),
+            vector_db_provider: "some-external-provider".to_string(),
+            db_host: String::new(),
+            ..Settings::default()
+        };
+        let ctx = s.backend_context();
+        assert!(
+            matches!(ctx.vector_postgres_url, Some(Err(_))),
+            "an unresolvable URL must carry its cause, not vanish into None"
         );
     }
 
