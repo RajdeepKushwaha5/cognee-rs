@@ -6,13 +6,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use serde::{Deserialize, Serialize};
 
 /// The configuration-boundary environment abstraction, re-exported so callers of
 /// [`Settings::overlay_from`] need no direct `cognee-config-core` dependency.
 pub use cognee_config_core::{EnvSource, MapEnv};
+
+mod keys;
+pub use cognee_config_core::{ConfigSchema, ConfigSection, ConfigValues, KeyDef, SectionSchema};
+pub use keys::{KeySpec, builtin_schema, key_spec, keys, schema_with};
 
 pub const DEFAULT_SYSTEM_PROMPT_PATH: &str = "answer_simple_question.txt";
 
@@ -463,6 +467,23 @@ pub struct Settings {
     /// `set_config`, [`ConfigManager::set_single_process`], or
     /// `COGNEE_SINGLE_PROCESS=1`.
     pub single_process: Option<bool>,
+
+    /// Make an unknown config key an error instead of a warning
+    /// (`COGNEE_STRICT_CONFIG`). Off by default: a key can be unknown because
+    /// it is misspelled, or because the component that owns it is not
+    /// compiled into or registered with this build.
+    pub strict_config: bool,
+
+    /// Values of the component-owned config sections (see
+    /// [`cognee_config_core::section`]), keyed by canonical key such as
+    /// `graph.ladybug.max_db_size`.
+    ///
+    /// Flattened: in a config file or a binding's settings object these keys
+    /// sit next to the `Settings` fields, and any key that is not a `Settings`
+    /// field lands here. [`ConfigManager`] checks them against its schema;
+    /// one that matches no registered section is an unknown key.
+    #[serde(flatten)]
+    pub sections: cognee_config_core::ConfigValues,
 }
 
 impl Settings {
@@ -493,444 +514,29 @@ impl Settings {
     /// This is a configuration boundary: it is the one place `Settings` opens
     /// the process environment. Use [`Settings::overlay_from`] to overlay from
     /// any other [`EnvSource`] (e.g. a `MapEnv` in tests).
+    pub fn overlay_from_env(&mut self) {
+        self.overlay_from_env_with_schema(builtin_schema());
+    }
+
+    /// [`Settings::load_from_env`] for a build whose component registry adds
+    /// config sections of its own: `schema` must cover every section the
+    /// process will use (see [`schema_with`]), so their env vars are read too.
+    pub fn load_from_env_with_schema(schema: &ConfigSchema) -> Self {
+        let mut s = Self::default();
+        s.overlay_from_env_with_schema(schema);
+        s
+    }
+
+    /// [`Settings::overlay_from_env`] with an explicit schema; see
+    /// [`Settings::load_from_env_with_schema`].
     #[allow(
         clippy::disallowed_methods,
         reason = "config boundary: Settings is resolved from the process env here"
     )]
-    pub fn overlay_from_env(&mut self) {
+    pub fn overlay_from_env_with_schema(&mut self, schema: &ConfigSchema) {
         // Load .env (no-op if absent or if the vars are already in the environment).
         cognee_config_core::load_dotenv();
-        self.overlay_from(&cognee_config_core::ProcessEnv::new());
-    }
-
-    /// Overlay the variables of `env` on top of `self`.
-    ///
-    /// Same rules as [`Settings::overlay_from_env`] (only set, non-empty
-    /// variables change a field), but reading from `env` instead of the
-    /// process environment, and without loading `.env`.
-    pub fn overlay_from(&mut self, env: &dyn EnvSource) {
-        // Helpers ----------------------------------------------------------------
-        let str_var = |name: &str| -> Option<String> { env.get(name).filter(|v| !v.is_empty()) };
-        // Try `primary` first; fall back to `alias` if primary is unset/empty.
-        let str_alias = |primary: &str, alias: &str| -> Option<String> {
-            str_var(primary).or_else(|| str_var(alias))
-        };
-
-        // -- LLM -----------------------------------------------------------------
-        if let Some(v) = str_var("LLM_PROVIDER") {
-            self.llm_provider = v;
-        }
-        if let Some(v) = str_alias("LLM_MODEL", "OPENAI_MODEL") {
-            self.llm_model = v;
-        }
-        if let Some(v) = str_alias("LLM_API_KEY", "OPENAI_TOKEN") {
-            self.llm_api_key = v;
-        }
-        if let Some(v) = str_alias("LLM_ENDPOINT", "OPENAI_URL") {
-            self.llm_endpoint = v;
-        }
-        if let Some(v) = str_var("LLM_API_VERSION") {
-            self.llm_api_version = v;
-        }
-        if let Some(v) = str_var("LLM_REASONING") {
-            self.llm_reasoning = v;
-        }
-        if let Some(v) = str_var("LLM_STRUCTURED_OUTPUT_MODE") {
-            self.llm_structured_output_mode = v;
-        }
-        // Only an explicitly-provided LLM_TEMPERATURE populates this; absence
-        // leaves it `None` so nothing is sent, matching Python's
-        // `model_fields_set` gate.
-        if let Some(v) = str_var("LLM_TEMPERATURE")
-            && let Ok(f) = v.parse::<f64>()
-        {
-            self.llm_temperature = Some(f);
-        }
-        if let Some(v) = str_alias("LLM_MAX_COMPLETION_TOKENS", "LLM_MAX_TOKENS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_max_completion_tokens = n;
-        }
-        // `LLM_ARGS` — a JSON object of extra request parameters merged into every
-        // LLM chat-completion call, mirroring Python cognee's `llm_config.llm_args`
-        // (e.g. `LLM_ARGS={"max_tokens": 16384}`). A malformed value or a non-object
-        // JSON is ignored (left at the default empty map) rather than aborting
-        // startup, matching the lenient handling of the other optional LLM knobs.
-        if let Some(v) = str_var("LLM_ARGS") {
-            match serde_json::from_str::<serde_json::Value>(&v) {
-                Ok(serde_json::Value::Object(map)) => self.llm_args = map,
-                _ => {
-                    tracing::warn!(
-                        "LLM_ARGS is set but is not a JSON object; ignoring it. \
-                         Expected e.g. LLM_ARGS='{{\"max_tokens\": 16384}}'"
-                    );
-                }
-            }
-        }
-        if let Some(v) = str_var("LLM_STREAMING") {
-            self.llm_streaming = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("LLM_MAX_RETRIES")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_max_retries = n;
-        }
-        if let Some(v) = str_var("LLM_NETWORK_RETRIES")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_network_retries = n;
-        }
-        if let Some(v) = str_var("LLM_MIN_RETRY_SECONDS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_min_retry_seconds = n;
-        }
-        if let Some(v) = str_var("LLM_MAX_PARALLEL_REQUESTS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_max_parallel_requests = n;
-        }
-        if let Some(v) = str_var("LLM_REQUEST_TIMEOUT_SECONDS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_request_timeout_seconds = n;
-        }
-        if let Some(v) = str_var("LLM_CONNECT_TIMEOUT_SECONDS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_connect_timeout_seconds = n;
-        }
-        if let Some(v) = str_var("LLM_REQUEST_DEADLINE_SECONDS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_request_deadline_seconds = n;
-        }
-        // -- Chunking ------------------------------------------------------------
-        // Rust extension, no Python counterpart: upstream takes `chunk_size` as a
-        // per-call argument, which the HTTP server path has no way to reach. Left
-        // unset, the size is auto-calculated from the embedding engine and the LLM
-        // ceiling (see `CognifyConfig::auto_chunk_size`).
-        if let Some(v) = str_alias("COGNEE_CHUNK_SIZE", "CHUNK_SIZE")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.chunk_size = Some(n);
-        }
-        if let Some(v) = str_alias("COGNEE_CHUNK_OVERLAP", "CHUNK_OVERLAP")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.chunk_overlap = n;
-        }
-        // Mirror MOCK_EMBEDDING parsing (accept true/1/yes, case-insensitive).
-        if let Some(v) = str_var("MOCK_LLM") {
-            let v = v.to_lowercase();
-            self.llm_mock = v == "true" || v == "1" || v == "yes";
-        }
-        if let Some(v) = str_var("MOCK_LLM_CASSETTE") {
-            self.llm_cassette = v;
-        }
-        if let Some(v) = str_var("COGNEE_RECORD_LLM") {
-            self.llm_record_path = v;
-        }
-
-        // -- Graph database ------------------------------------------------------
-        if let Some(v) = str_var("GRAPH_DATABASE_PROVIDER") {
-            self.graph_database_provider = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_URL") {
-            self.graph_database_url = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_NAME") {
-            self.graph_database_name = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_USERNAME") {
-            self.graph_database_username = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_PASSWORD") {
-            self.graph_database_password = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_PORT")
-            && let Ok(n) = v.parse::<u16>()
-        {
-            self.graph_database_port = n;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_HOST") {
-            self.graph_database_host = v;
-        }
-        if let Some(v) = str_var("GRAPH_DATABASE_KEY") {
-            self.graph_database_key = v;
-        }
-        if let Some(v) = str_var("GRAPH_FILE_PATH") {
-            self.graph_file_path = v;
-        }
-
-        // -- Vector database -----------------------------------------------------
-        if let Some(v) = str_var("VECTOR_DB_PROVIDER") {
-            self.vector_db_provider = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_URL") {
-            self.vector_db_url = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_PORT")
-            && let Ok(n) = v.parse::<u16>()
-        {
-            self.vector_db_port = n;
-        }
-        if let Some(v) = str_var("VECTOR_DB_NAME") {
-            self.vector_db_name = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_KEY") {
-            self.vector_db_key = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_USERNAME") {
-            self.vector_db_username = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_PASSWORD") {
-            self.vector_db_password = v;
-        }
-        if let Some(v) = str_var("VECTOR_DB_HOST") {
-            self.vector_db_host = v;
-        }
-
-        // -- Relational database -------------------------------------------------
-        if let Some(v) = str_var("DB_PROVIDER") {
-            self.db_provider = v;
-        }
-        if let Some(v) = str_var("DB_HOST") {
-            self.db_host = v;
-        }
-        if let Some(v) = str_var("DB_PORT")
-            && let Ok(n) = v.parse::<u16>()
-        {
-            self.db_port = n;
-        }
-        if let Some(v) = str_var("DB_NAME") {
-            self.db_name = v;
-        }
-        if let Some(v) = str_var("DB_USERNAME") {
-            self.db_username = v;
-        }
-        if let Some(v) = str_var("DB_PASSWORD") {
-            self.db_password = v;
-        }
-        // TLS mode: prefer the explicit libpq-style `DB_SSLMODE`; otherwise
-        // derive it from the `ssl` key of the Python-chart `DATABASE_CONNECT_ARGS`
-        // JSON (asyncpg form), so an existing chart that only sets connectArgs
-        // still gets TLS on the sqlx side.
-        if let Some(v) = str_var("DB_SSLMODE") {
-            self.db_sslmode = v;
-        } else if let Some(v) = str_var("DATABASE_CONNECT_ARGS")
-            && let Some(mode) = sslmode_from_connect_args(&v)
-        {
-            self.db_sslmode = mode;
-        }
-        if let Some(v) = str_var("DATABASE_URL") {
-            self.relational_db_url = v;
-        }
-
-        // -- Embedding -----------------------------------------------------------
-        if let Some(v) = str_var("EMBEDDING_PROVIDER") {
-            self.embedding_provider = v;
-        }
-        if let Some(v) = str_var("EMBEDDING_ENDPOINT") {
-            self.embedding_endpoint = v;
-        }
-        if let Some(v) = str_alias("EMBEDDING_API_KEY", "LLM_API_KEY") {
-            self.embedding_api_key = v;
-        }
-        if let Some(v) = str_var("EMBEDDING_MODEL") {
-            self.embedding_model_name = v;
-        }
-        if let Some(v) = str_var("EMBEDDING_DIMENSIONS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_dimensions = n;
-        }
-        if let Some(v) = str_var("EMBEDDING_BATCH_SIZE")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_batch_size = n;
-        }
-        if let Some(v) = str_var("EMBEDDING_ONNX_BATCH_SIZE")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_onnx_batch_size = n;
-        }
-        if let Some(v) = str_var("EMBEDDING_MAX_SEQUENCE_LENGTH")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_max_sequence_length = n;
-        }
-        if let Some(v) = str_alias("EMBEDDING_MODEL_PATH", "COGNEE_E2E_EMBED_MODEL_PATH") {
-            self.embedding_model_path = v;
-        }
-        if let Some(v) = str_alias("EMBEDDING_TOKENIZER_PATH", "COGNEE_E2E_TOKENIZER_PATH") {
-            self.embedding_tokenizer_path = v;
-        }
-
-        // -- Base / system -------------------------------------------------------
-        if let Some(v) = str_var("COGNEE_SYSTEM_ROOT_DIRECTORY") {
-            self.system_root_directory = v;
-        }
-        if let Some(v) = str_var("COGNEE_DATA_ROOT_DIRECTORY") {
-            self.data_root_directory = v;
-        }
-        if let Some(v) = str_var("COGNEE_DEFAULT_DATASET_NAME") {
-            self.default_dataset_name = v;
-        }
-        if let Some(v) = str_var("COGNEE_DEFAULT_USER_ID") {
-            self.default_user_id = v;
-        }
-
-        // -- Ontology ------------------------------------------------------------
-        // NOTE: ontology_resolver and ontology_matching_strategy are stored for
-        // future multi-resolver / multi-strategy support. Currently the CLI always
-        // uses RdfLibOntologyResolver + FuzzyMatchingStrategy when ontology_file_path
-        // is set; these two fields have no runtime effect yet.
-        if let Some(v) = str_var("ONTOLOGY_FILE_PATH") {
-            self.ontology_file_path = v;
-        }
-        if let Some(v) = str_var("ONTOLOGY_RESOLVER") {
-            self.ontology_resolver = v;
-        }
-        if let Some(v) = str_var("ONTOLOGY_MATCHING_STRATEGY") {
-            self.ontology_matching_strategy = v;
-        }
-
-        // -- Session / cache -----------------------------------------------------
-        if let Some(v) = str_var("CACHE_BACKEND") {
-            self.cache_backend = v;
-        }
-        if let Some(v) = str_var("CACHE_HOST") {
-            self.cache_host = v;
-        }
-        if let Some(v) = str_var("CACHE_PORT")
-            && let Ok(n) = v.parse::<u16>()
-        {
-            self.cache_port = n;
-        }
-        if let Some(v) = str_var("CACHE_USERNAME") {
-            self.cache_username = v;
-        }
-        if let Some(v) = str_var("CACHE_PASSWORD") {
-            self.cache_password = v;
-        }
-        if let Some(v) = str_var("SESSION_TTL_SECONDS")
-            && let Ok(n) = v.parse::<u64>()
-        {
-            self.session_ttl_seconds = n;
-        }
-        if let Some(v) = str_var("CACHING") {
-            self.enable_caching = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("AUTO_FEEDBACK") {
-            self.auto_feedback = cognee_utils::parse_env_bool(&v);
-        }
-
-        // -- Authentication / ACL ------------------------------------------------
-        if let Some(v) = str_var("DEFAULT_USER_EMAIL") {
-            self.default_user_email = v;
-        }
-        if let Some(v) = str_var("DEFAULT_USER_PASSWORD") {
-            self.default_user_password = v;
-        }
-        if let Some(v) = str_var("ENABLE_BACKEND_ACCESS_CONTROL") {
-            self.enable_access_control = cognee_utils::parse_env_bool(&v);
-        }
-
-        // -- Logging -------------------------------------------------------------
-        if let Some(v) = str_var("LOG_LEVEL") {
-            self.log_level = v;
-        }
-        // COGNEE_LOGS_DIR maps to existing logs_root_directory
-        if let Some(v) = str_var("COGNEE_LOGS_DIR") {
-            self.logs_root_directory = v;
-        }
-        // CACHE_ROOT_DIRECTORY maps to existing cache_root_directory
-        if let Some(v) = str_var("CACHE_ROOT_DIRECTORY") {
-            self.cache_root_directory = v;
-        }
-
-        // -- Rate limiting -------------------------------------------------------
-        if let Some(v) = str_var("AUTO_RATE_LIMIT") {
-            self.auto_rate_limit = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("LLM_RATE_LIMIT_ENABLED") {
-            self.llm_rate_limit_enabled = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("LLM_RATE_LIMIT_REQUESTS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_rate_limit_requests = n;
-        }
-        if let Some(v) = str_var("LLM_RATE_LIMIT_INTERVAL")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.llm_rate_limit_interval = n;
-        }
-        if let Some(v) = str_var("EMBEDDING_RATE_LIMIT_ENABLED") {
-            self.embedding_rate_limit_enabled = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("EMBEDDING_RATE_LIMIT_REQUESTS")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_rate_limit_requests = n;
-        }
-        if let Some(v) = str_var("EMBEDDING_RATE_LIMIT_INTERVAL")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.embedding_rate_limit_interval = n;
-        }
-
-        // -- Storage backend -----------------------------------------------------
-        if let Some(v) = str_var("STORAGE_BACKEND") {
-            self.storage_backend = v;
-        }
-        if let Some(v) = str_var("STORAGE_BUCKET_NAME") {
-            self.storage_bucket_name = v;
-        }
-
-        // -- Observability -------------------------------------------------------
-        if let Some(v) = str_var("COGNEE_TRACING_ENABLED") {
-            self.cognee_tracing_enabled = cognee_utils::parse_env_bool(&v);
-        }
-        if let Some(v) = str_var("OTEL_SERVICE_NAME") {
-            self.otel_service_name = v;
-        }
-        if let Some(v) = str_var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-            self.otel_exporter_otlp_endpoint = v;
-        }
-        if let Some(v) = str_var("OTEL_EXPORTER_OTLP_HEADERS") {
-            self.otel_exporter_otlp_headers = v;
-        }
-        if let Some(v) = str_var("OTEL_EXPORTER_OTLP_PROTOCOL") {
-            self.otel_exporter_otlp_protocol = v;
-        }
-        if let Some(v) = str_var("OTEL_SPAN_PROCESSOR") {
-            self.otel_span_processor = v;
-        }
-        if let Some(v) = str_var("OTEL_TRACES_SAMPLER") {
-            self.otel_traces_sampler = v;
-        }
-        if let Some(v) = str_var("OTEL_TRACES_SAMPLER_ARG") {
-            self.otel_traces_sampler_arg = v;
-        }
-
-        // -- Feature flags -------------------------------------------------------
-        if let Some(v) = str_var("ENABLE_LAST_ACCESSED") {
-            self.enable_last_accessed = cognee_utils::parse_env_bool(&v);
-        }
-        // Routed through `parse_single_process_override` rather than parsed
-        // here, so this path and `cognee_database::single_process_from_env`
-        // (which the HTTP server uses) cannot drift. They did: `str_var` keeps
-        // a whitespace-only value, which a bare `parse_env_bool` reads as an
-        // explicit `false` while the other path read it as "derive" — opposite
-        // answers about whether a database may be swept.
-        if let Some(v) = env
-            .get(cognee_database::SINGLE_PROCESS_ENV)
-            .and_then(|raw| cognee_database::parse_single_process_override(&raw))
-        {
-            self.single_process = Some(v);
-        }
+        self.overlay_from_with_schema(&cognee_config_core::ProcessEnv::new(), schema);
     }
 
     /// Whether exactly one process uses the relational database.
@@ -1078,6 +684,7 @@ impl Settings {
             .unwrap_or(8191);
 
         cognee_components::BackendBuildContext {
+            sections: self.sections.clone(),
             data_root_directory: PathBuf::from(&self.data_root_directory),
             system_root_directory: PathBuf::from(&self.system_root_directory),
             relational_db_url: self.resolved_relational_db_url(),
@@ -1578,6 +1185,8 @@ impl Default for Settings {
             // Feature flags
             enable_last_accessed: false,
             single_process: None,
+            strict_config: false,
+            sections: cognee_config_core::ConfigValues::new(),
         }
     }
 }
@@ -1593,6 +1202,17 @@ pub enum ConfigError {
     UnknownKey(String),
     #[error("Type mismatch for key '{key}': {reason}")]
     TypeMismatch { key: String, reason: String },
+}
+
+impl From<cognee_config_core::KeyError> for ConfigError {
+    fn from(error: cognee_config_core::KeyError) -> Self {
+        match error {
+            cognee_config_core::KeyError::Unknown(key) => ConfigError::UnknownKey(key),
+            cognee_config_core::KeyError::Invalid { key, reason } => {
+                ConfigError::TypeMismatch { key, reason }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1618,22 +1238,187 @@ pub enum ConfigError {
 /// assert_eq!(cfg.read().llm_model, "gpt-4o");
 /// ```
 pub struct ConfigManager {
+    // Lock order: `schema`, then `inner`, then `invalid`. A method that holds
+    // more than one of them must take them in this order, or it can deadlock
+    // against `extend_schema`.
     inner: Arc<RwLock<Settings>>,
     version: Arc<AtomicU64>,
+    /// The component config sections this manager knows: the built-in ones,
+    /// plus those of a custom registry added by
+    /// [`ConfigManager::extend_schema`].
+    schema: Arc<RwLock<ConfigSchema>>,
+    /// Bulk-loaded values of a known key that had the wrong type, as
+    /// `(canonical key, reason)`. They were dropped, and
+    /// [`ConfigManager::check_strict`] reports them until the key is set again.
+    invalid: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+/// Bring settings that were loaded in bulk (deserialized from a config file or
+/// a binding's settings object) into canonical form against `schema`, and
+/// return the values of a known key that had the wrong type.
+///
+/// `Settings::sections` is a `#[serde(flatten)]` catch-all, so a `Settings`
+/// key serde does not know by that name lands in it too: the
+/// `#[serde(skip)]` fields (`llm_args`, `summarization_schema`) and key
+/// aliases (`embedding_model`). Those are moved out and applied through the
+/// key registry first, so only component section keys stay in `sections`.
+fn normalize_bulk(schema: &ConfigSchema, settings: &mut Settings) -> Vec<(String, String)> {
+    let mut invalid = Vec::new();
+    let core: Vec<(String, &'static KeySpec)> = settings
+        .sections
+        .keys()
+        .filter_map(|key| key_spec(key).map(|spec| (key.clone(), spec)))
+        .collect();
+    for (key, spec) in core {
+        let Some(value) = settings.sections.remove(&key) else {
+            continue;
+        };
+        if let Err(error) = (spec.set)(settings, &key, value) {
+            let reason = match error {
+                ConfigError::TypeMismatch { reason, .. } => reason,
+                other => other.to_string(),
+            };
+            tracing::warn!(key, reason, "config value of the wrong type");
+            invalid.push((spec.key.to_string(), reason));
+        }
+    }
+    invalid.extend(schema.normalize_lenient(&mut settings.sections).invalid);
+    invalid
 }
 
 impl ConfigManager {
     /// Create a new `ConfigManager` wrapping the given settings.
+    ///
+    /// Bulk-loaded values in `settings` are checked against the built-in
+    /// schema: aliases become canonical keys, a value of the wrong type is
+    /// dropped and reported by [`ConfigManager::check_strict`], and an
+    /// unknown key is kept with a warning (an error under strict mode, again
+    /// at `check_strict`).
     pub fn new(settings: Settings) -> Self {
+        Self::with_schema(settings, builtin_schema().clone())
+    }
+
+    /// [`ConfigManager::new`] for a build whose component registry adds
+    /// config sections of its own: `schema` is the full schema (see
+    /// [`schema_with`]), so the values of those sections are recognized from
+    /// the start rather than reported as unknown first.
+    pub fn with_schema(settings: Settings, schema: ConfigSchema) -> Self {
+        let mut settings = settings;
+        let invalid = normalize_bulk(&schema, &mut settings);
         Self {
             inner: Arc::new(RwLock::new(settings)),
             version: Arc::new(AtomicU64::new(0)),
+            schema: Arc::new(RwLock::new(schema)),
+            invalid: Arc::new(Mutex::new(invalid)),
         }
+    }
+
+    /// Add the config sections of a custom component registry (see
+    /// `ComponentRegistry::config_schema`), so their keys become settable
+    /// here and section values that were unknown so far are checked.
+    pub fn extend_schema(
+        &self,
+        other: &ConfigSchema,
+    ) -> Result<(), cognee_config_core::SchemaError> {
+        let mut schema = self.schema.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let before = schema.sections().len();
+        schema.merge(other)?;
+        if schema.sections().len() == before {
+            // Nothing new (e.g. the schema already came from `with_schema`):
+            // the values were normalized against these sections already.
+            return Ok(());
+        }
+        let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let invalid = normalize_bulk(&schema, &mut s);
+        self.invalid
+            .lock()
+            .expect("lock poison is unrecoverable") // lock poison is unrecoverable
+            .extend(invalid);
+        Ok(())
+    }
+
+    /// A copy of the component config schema this manager knows.
+    pub fn schema(&self) -> ConfigSchema {
+        self.schema
+            .read()
+            .expect("lock poison is unrecoverable") // lock poison is unrecoverable
+            .clone()
+    }
+
+    /// Fail if the configuration that was loaded in bulk (a config file, a
+    /// binding's settings object) held a value of the wrong type for a known
+    /// key, or, with `strict_config` on, a key that no registered setting
+    /// owns. Otherwise `Ok`: unknown keys were already reported as warnings.
+    ///
+    /// Explicit [`ConfigManager::set`] calls apply the policy themselves; this
+    /// covers keys that arrived in bulk, which are checked when the
+    /// configuration is first used.
+    pub fn check_strict(&self) -> Result<(), ConfigError> {
+        let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let s = self.read();
+        if let Some((key, reason)) = self
+            .invalid
+            .lock()
+            .expect("lock poison is unrecoverable") // lock poison is unrecoverable
+            .first()
+        {
+            return Err(ConfigError::TypeMismatch {
+                key: key.clone(),
+                reason: reason.clone(),
+            });
+        }
+        if !s.strict_config {
+            return Ok(());
+        }
+        match schema.unknown_keys(&s.sections).first() {
+            Some(key) => Err(ConfigError::UnknownKey((*key).to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Forget a reported wrongly typed bulk value of `key` (canonical): the
+    /// key was just set explicitly.
+    fn clear_invalid(&self, key: &str) {
+        self.invalid
+            .lock()
+            .expect("lock poison is unrecoverable") // lock poison is unrecoverable
+            .retain(|(k, _)| k != key);
+    }
+
+    /// Every key whose value is a credential (a `Settings` row or a section
+    /// setting marked `secret`), as it appears in the serialized `Settings`.
+    /// Anything that shows the configuration must mask these.
+    pub fn secret_keys(&self) -> Vec<&'static str> {
+        let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        keys()
+            .iter()
+            .filter(|spec| spec.secret)
+            .map(|spec| spec.key)
+            .chain(
+                schema
+                    .key_defs()
+                    .filter(|def| def.secret)
+                    .map(|def| def.key),
+            )
+            .collect()
     }
 
     /// Convenience constructor: `Settings::load_from_env()` + wrap.
     pub fn from_env() -> Self {
         Self::new(Settings::load_from_env())
+    }
+
+    /// [`ConfigManager::from_env`] for a custom component registry: `extra` is
+    /// the registry's schema (`ComponentRegistry::config_schema()`). Its
+    /// sections are known *before* the environment is read, so their env vars
+    /// are loaded too, which adding them later with
+    /// [`ConfigManager::extend_schema`] cannot do.
+    pub fn from_env_with_schema(
+        extra: &ConfigSchema,
+    ) -> Result<Self, cognee_config_core::SchemaError> {
+        let schema = schema_with(extra)?;
+        let settings = Settings::load_from_env_with_schema(&schema);
+        Ok(Self::with_schema(settings, schema))
     }
 
     /// Obtain a read-lock on the current settings.
@@ -1657,6 +1442,8 @@ impl Clone for ConfigManager {
         Self {
             inner: Arc::clone(&self.inner),
             version: Arc::clone(&self.version),
+            schema: Arc::clone(&self.schema),
+            invalid: Arc::clone(&self.invalid),
         }
     }
 }
@@ -2558,167 +2345,89 @@ impl ConfigManager {
 
     /// Generic setter matching Python's `config.set(key, value)`.
     ///
-    /// Dispatches to the appropriate typed setter based on the key name.
+    /// Accepts every key in the [registry](keys), including its aliases.
     /// Returns `ConfigError::UnknownKey` for unrecognized keys and
     /// `ConfigError::TypeMismatch` when the JSON value type doesn't match.
+    ///
+    /// `system_root_directory` goes through
+    /// [`ConfigManager::set_system_root_directory`], so the graph and vector
+    /// paths derived from the old root move with it.
     pub fn set(&self, key: &str, value: serde_json::Value) -> Result<(), ConfigError> {
-        match key {
-            // LLM
-            "llm_provider" => self.set_llm_provider(as_string(key, &value)?.as_str()),
-            "llm_model" => self.set_llm_model(as_string(key, &value)?.as_str()),
-            "llm_api_key" => self.set_llm_api_key(as_string(key, &value)?.as_str()),
-            "llm_endpoint" => self.set_llm_endpoint(as_string(key, &value)?.as_str()),
-            // LLM tuning
-            "llm_api_version" => self.set_llm_api_version(as_string(key, &value)?.as_str()),
-            "llm_reasoning" => self.set_llm_reasoning(as_string(key, &value)?.as_str()),
-            "llm_structured_output_mode" => {
-                self.set_llm_structured_output_mode(as_string(key, &value)?.as_str())
+        if let Some(spec) = key_spec(key) {
+            if spec.key == "system_root_directory" {
+                self.set_system_root_directory(as_string(key, &value)?.as_str());
+                return Ok(());
             }
-            "llm_temperature" if value.is_null() => {
+            let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+            (spec.set)(&mut s, key, value)?;
+            drop(s);
+            self.clear_invalid(spec.key);
+            self.bump_version();
+            return Ok(());
+        }
+        let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        if schema.key_def(key).is_some() {
+            let canonical = schema
+                .set(&mut s.sections, key, &value)
+                .map_err(ConfigError::from)?;
+            drop(s);
+            drop(schema);
+            self.clear_invalid(canonical);
+            self.bump_version();
+            return Ok(());
+        }
+        let strict = s.strict_config;
+        drop(s);
+        cognee_config_core::unknown_key(key, strict).map_err(ConfigError::from)
+    }
+
+    /// Apply a JSON object of settings in bulk, e.g. a binding's constructor
+    /// settings object.
+    ///
+    /// `Settings` keys and known section keys are set as by
+    /// [`ConfigManager::set`]; a value of the wrong type is an error. A key
+    /// this manager does not know (yet) is *kept* in `Settings::sections`
+    /// with a warning rather than dropped: it may belong to a component
+    /// registry added later with [`ConfigManager::extend_schema`], which
+    /// checks it then. Strict mode is enforced by
+    /// [`ConfigManager::check_strict`] once the full schema is known.
+    pub fn apply_patch(
+        &self,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ConfigError> {
+        for (key, value) in patch {
+            let known = key_spec(key).is_some()
+                || self
+                    .schema
+                    .read()
+                    .expect("lock poison is unrecoverable") // lock poison is unrecoverable
+                    .key_def(key)
+                    .is_some();
+            if known {
+                self.set(key, value.clone())?;
+            } else {
+                // Lenient here even in strict mode: see the doc comment.
+                let _ = cognee_config_core::unknown_key(key, false);
                 let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-                s.llm_temperature = None;
+                s.sections.insert(key.clone(), value.clone());
                 drop(s);
                 self.bump_version();
             }
-            "llm_temperature" => self.set_llm_temperature(as_f64(key, &value)?),
-            "llm_streaming" => self.set_llm_streaming(as_bool(key, &value)?),
-            "llm_max_completion_tokens" => {
-                self.set_llm_max_completion_tokens(as_u32(key, &value)?);
-            }
-            "llm_max_retries" => self.set_llm_max_retries(as_u32(key, &value)?),
-            "llm_network_retries" => self.set_llm_network_retries(as_u32(key, &value)?),
-            "llm_max_parallel_requests" => {
-                self.set_llm_max_parallel_requests(as_u32(key, &value)?);
-            }
-            "llm_mock" => self.set_llm_mock(as_bool(key, &value)?),
-            "llm_cassette" => self.set_llm_cassette(as_string(key, &value)?.as_str()),
-            "llm_record_path" => self.set_llm_record_path(as_string(key, &value)?.as_str()),
-            // Embedding
-            "embedding_provider" => {
-                self.set_embedding_provider(as_string(key, &value)?.as_str());
-            }
-            "embedding_model" | "embedding_model_name" => {
-                self.set_embedding_model(as_string(key, &value)?.as_str());
-            }
-            "embedding_dimensions" => self.set_embedding_dimensions(as_u32(key, &value)?),
-            "embedding_endpoint" => {
-                self.set_embedding_endpoint(as_string(key, &value)?.as_str());
-            }
-            "embedding_api_key" => self.set_embedding_api_key(as_string(key, &value)?.as_str()),
-            "embedding_model_path" => {
-                self.set_embedding_model_path(as_string(key, &value)?.as_str());
-            }
-            "embedding_tokenizer_path" => {
-                self.set_embedding_tokenizer_path(as_string(key, &value)?.as_str());
-            }
-            // Vector DB
-            "vector_db_provider" => {
-                self.set_vector_db_provider(as_string(key, &value)?.as_str());
-            }
-            "vector_db_url" => self.set_vector_db_url(as_string(key, &value)?.as_str()),
-            "vector_db_key" => self.set_vector_db_key(as_string(key, &value)?.as_str()),
-            "vector_db_host" => self.set_vector_db_host(as_string(key, &value)?.as_str()),
-            "vector_db_port" => self.set_vector_db_port(as_u16(key, &value)?),
-            "vector_db_name" => self.set_vector_db_name(as_string(key, &value)?.as_str()),
-            // Graph DB
-            "graph_database_provider" => {
-                self.set_graph_database_provider(as_string(key, &value)?.as_str());
-            }
-            "graph_model" => self.set_graph_model(as_string(key, &value)?.as_str()),
-            "graph_file_path" => self.set_graph_file_path(as_string(key, &value)?.as_str()),
-            // Chunking
-            "chunk_strategy" => self.set_chunk_strategy(as_string(key, &value)?.as_str()),
-            "chunk_engine" => self.set_chunk_engine(as_string(key, &value)?.as_str()),
-            // `null` restores the auto-calculation (Python `chunk_size=None`).
-            "chunk_size" if value.is_null() => self.clear_chunk_size(),
-            "chunk_size" => self.set_chunk_size(as_u32(key, &value)?),
-            "chunk_overlap" => self.set_chunk_overlap(as_u32(key, &value)?),
-            // System paths
-            "system_root_directory" => {
-                self.set_system_root_directory(as_string(key, &value)?.as_str());
-            }
-            "data_root_directory" => {
-                self.set_data_root_directory(as_string(key, &value)?.as_str());
-            }
-            "cache_root_directory" => {
-                self.set_cache_root_directory(as_string(key, &value)?.as_str());
-            }
-            "logs_root_directory" => {
-                self.set_logs_root_directory(as_string(key, &value)?.as_str());
-            }
-            "monitoring_tool" => self.set_monitoring_tool(as_string(key, &value)?.as_str()),
-            // Ontology
-            "ontology_file_path" => {
-                self.set_ontology_file_path(as_string(key, &value)?.as_str());
-            }
-            "ontology_resolver" => {
-                self.set_ontology_resolver(as_string(key, &value)?.as_str());
-            }
-            "ontology_matching_strategy" => {
-                self.set_ontology_matching_strategy(as_string(key, &value)?.as_str());
-            }
-            // Embedding extras
-            "embedding_api_version" => {
-                self.set_embedding_api_version(as_string(key, &value)?.as_str());
-            }
-            "transcription_model" => {
-                self.set_transcription_model(as_string(key, &value)?.as_str());
-            }
-            // LLM fallback
-            "llm_fallback_model" => {
-                self.set_llm_fallback_model(as_string(key, &value)?.as_str());
-            }
-            "llm_fallback_provider" => {
-                self.set_llm_fallback_provider(as_string(key, &value)?.as_str());
-            }
-            "llm_fallback_endpoint" => {
-                self.set_llm_fallback_endpoint(as_string(key, &value)?.as_str());
-            }
-            "llm_fallback_api_key" => {
-                self.set_llm_fallback_api_key(as_string(key, &value)?.as_str());
-            }
-            // Relational DB
-            "relational_db_url" => {
-                self.set_relational_db_url(as_string(key, &value)?.as_str());
-            }
-            // `null` restores the derived answer, exactly as it does for
-            // `chunk_size` and `llm_temperature`.
-            "single_process" if value.is_null() => self.clear_single_process(),
-            // A string *or a JSON number* goes through the same parser the env
-            // var uses, so a binding passing `"1"`, a binding passing `1`, and
-            // `COGNEE_SINGLE_PROCESS=1` cannot mean different things — and a
-            // blank string means "derive", matching `null` above rather than
-            // reading as a silent `false`.
-            //
-            // The number arm matters because callers reach this dispatcher
-            // with already-parsed JSON: `cognee-cli config set` parses its
-            // argument before dispatching, and a JS/Python binding passing the
-            // `1` the docs list as accepted sends a number, not a string.
-            // Without it, that hit `as_bool` and was rejected.
-            "single_process" if value.is_string() || value.is_number() => {
-                let raw = value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string());
-                match cognee_database::parse_single_process_override(&raw) {
-                    Some(v) => self.set_single_process(v),
-                    None => self.clear_single_process(),
-                }
-            }
-            "single_process" => self.set_single_process(as_bool(key, &value)?),
-            "migration_db_url" => {
-                self.set_migration_db_config(as_string(key, &value)?.as_str());
-            }
-            // ML models
-            "classification_model" => {
-                self.set_classification_model(as_string(key, &value)?.as_str());
-            }
-            "summarization_model" => {
-                self.set_summarization_model(as_string(key, &value)?.as_str());
-            }
-            _ => return Err(ConfigError::UnknownKey(key.to_string())),
         }
         Ok(())
+    }
+
+    /// The current value of `key` (a `Settings` key, a section key, or an
+    /// alias of either) as JSON, unmasked. `None` for an unknown key.
+    pub fn get(&self, key: &str) -> Option<serde_json::Value> {
+        // Lock order: `schema` before `inner` (see `ConfigManager`).
+        let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let s = self.read();
+        if let Some(spec) = key_spec(key) {
+            return Some((spec.get)(&s));
+        }
+        schema.get(&s.sections, key)
     }
 }
 
@@ -3248,15 +2957,221 @@ mod tests {
         assert_eq!(cm.read().chunk_size, Some(2048));
     }
 
+    /// Lenient by default: an unknown key is a warning, changes nothing and
+    /// does not bump the version.
     #[test]
-    fn config_manager_generic_set_unknown_key() {
+    fn config_manager_generic_set_unknown_key_is_lenient_by_default() {
         let cm = ConfigManager::new(Settings::default());
-        let result = cm.set("nonexistent_key", serde_json::json!("value"));
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConfigError::UnknownKey(k) => assert_eq!(k, "nonexistent_key"),
-            other => panic!("expected UnknownKey, got: {other}"),
+        cm.set("nonexistent_key", serde_json::json!("value"))
+            .expect("lenient by default");
+        assert_eq!(cm.version(), 0);
+        assert!(cm.read().sections.is_empty());
+    }
+
+    /// With `strict_config` on, an unknown key is an error, from `set` and
+    /// for keys that arrived in bulk (`check_strict`).
+    #[test]
+    fn config_manager_generic_set_unknown_key_errors_when_strict() {
+        let cm = ConfigManager::new(Settings::default());
+        cm.set("strict_config", serde_json::json!(true)).unwrap();
+        match cm.set("nonexistent_key", serde_json::json!("value")) {
+            Err(ConfigError::UnknownKey(k)) => assert_eq!(k, "nonexistent_key"),
+            other => panic!("expected UnknownKey, got: {other:?}"),
         }
+
+        let mut settings = Settings {
+            strict_config: true,
+            ..Settings::default()
+        };
+        settings
+            .sections
+            .insert("stale.key".into(), serde_json::json!(1));
+        let cm = ConfigManager::new(settings);
+        assert!(matches!(cm.check_strict(), Err(ConfigError::UnknownKey(k)) if k == "stale.key"));
+        assert_eq!(
+            cm.read().sections.get("stale.key"),
+            Some(&serde_json::json!(1)),
+            "kept"
+        );
+    }
+
+    cognee_config_core::config_section! {
+        /// A section only a custom registry knows.
+        pub struct CustomSection in "test.custom" {
+            /// A knob.
+            pub x: u32 = 1 => { env: ["COGNEE_TEST_CUSTOM_X"], alias: ["custom_x"], secret: false },
+        }
+    }
+
+    /// A custom registry's section env vars are read when env is loaded with
+    /// the full schema, and not by the built-in loader.
+    #[test]
+    fn custom_registry_sections_load_from_env_with_the_full_schema() {
+        let mut registry = cognee_components::ComponentRegistry::with_builtins();
+        registry.register_config_section(
+            <CustomSection as cognee_config_core::ConfigSection>::schema(),
+        );
+        let extra = registry.config_schema().unwrap();
+        let schema = schema_with(&extra).unwrap();
+        let env = MapEnv::new().with("COGNEE_TEST_CUSTOM_X", "5");
+
+        let mut builtin_only = Settings::default();
+        builtin_only.overlay_from(&env);
+        assert!(
+            builtin_only.sections.is_empty(),
+            "the built-in loader does not know it"
+        );
+
+        let mut settings = Settings::default();
+        settings.overlay_from_with_schema(&env, &schema);
+        let cm = crate::ComponentManager::with_registry(ConfigManager::new(settings), registry);
+        assert_eq!(cm.config().get("test.custom.x"), Some(serde_json::json!(5)));
+        assert_eq!(cm.config().get("custom_x"), Some(serde_json::json!(5)));
+        cm.config().set("custom_x", serde_json::json!(9)).unwrap();
+        let section: CustomSection = cm.config().read().backend_context().section();
+        assert_eq!(section.x, 9);
+    }
+
+    fn custom_schema() -> ConfigSchema {
+        let mut extra = ConfigSchema::new();
+        extra
+            .add(<CustomSection as cognee_config_core::ConfigSection>::schema())
+            .unwrap();
+        schema_with(&extra).unwrap()
+    }
+
+    /// A bulk-loaded section value of the wrong type is an error at the first
+    /// fallible step, strict mode or not, until the key is set again.
+    #[test]
+    fn wrongly_typed_bulk_section_value_is_reported() {
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({ "custom_x": "big" })).unwrap();
+        let cm = ConfigManager::with_schema(settings, custom_schema());
+        match cm.check_strict() {
+            Err(ConfigError::TypeMismatch { key, .. }) => assert_eq!(key, "test.custom.x"),
+            other => panic!("expected a type mismatch, got {other:?}"),
+        }
+        assert_eq!(
+            cm.get("test.custom.x"),
+            Some(serde_json::json!(1)),
+            "default"
+        );
+        cm.set("custom_x", serde_json::json!(3)).unwrap();
+        cm.check_strict().unwrap();
+    }
+
+    /// `Settings` keys that serde does not know by that name (the
+    /// `#[serde(skip)]` fields and key aliases) land in the flattened
+    /// `sections` map; `ConfigManager::new` applies them as settings instead
+    /// of treating them as unknown section keys.
+    #[test]
+    fn bulk_loaded_settings_keys_are_not_unknown_section_keys() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "strict_config": true,
+            "llm_args": { "max_tokens": 100 },
+            "embedding_model": "x",
+        }))
+        .unwrap();
+        let cm = ConfigManager::new(settings);
+        cm.check_strict().unwrap();
+        let s = cm.read();
+        assert_eq!(s.llm_args.get("max_tokens"), Some(&serde_json::json!(100)));
+        assert_eq!(s.embedding_model_name, "x");
+        assert!(s.sections.is_empty(), "{:?}", s.sections);
+    }
+
+    /// A wrongly typed bulk value of a `Settings` key routed through the
+    /// flatten map is reported like a section value.
+    #[test]
+    fn wrongly_typed_bulk_settings_alias_is_reported() {
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({ "embedding_model": 5 })).unwrap();
+        let cm = ConfigManager::new(settings);
+        assert!(matches!(
+            cm.check_strict(),
+            Err(ConfigError::TypeMismatch { .. })
+        ));
+    }
+
+    /// Settings built with the full schema recognize a custom section's values
+    /// from the start: nothing is reported as unknown, and re-adding the same
+    /// sections is a no-op.
+    #[test]
+    fn with_schema_knows_custom_sections_up_front() {
+        let mut settings = Settings {
+            strict_config: true,
+            ..Settings::default()
+        };
+        settings
+            .sections
+            .insert("test.custom.x".into(), serde_json::json!(5));
+        let schema = custom_schema();
+        let cm = ConfigManager::with_schema(settings, schema.clone());
+        cm.check_strict().unwrap();
+        cm.extend_schema(&schema).unwrap();
+        cm.check_strict().unwrap();
+        assert_eq!(cm.get("test.custom.x"), Some(serde_json::json!(5)));
+    }
+
+    /// `check_strict`/`get` and `extend_schema` take the two locks in the same
+    /// order, so they cannot deadlock against each other.
+    #[test]
+    fn extend_schema_does_not_deadlock_against_readers() {
+        let cm = ConfigManager::new(Settings {
+            strict_config: true,
+            ..Settings::default()
+        });
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let cm = cm.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let _ = cm.check_strict();
+                        let _ = cm.get("test.custom.x");
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..200 {
+            let mut extra = ConfigSchema::new();
+            extra
+                .add(<CustomSection as cognee_config_core::ConfigSection>::schema())
+                .unwrap();
+            cm.extend_schema(&extra).unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    /// `secret_keys` covers the registry rows and secret section settings.
+    #[test]
+    fn secret_keys_cover_registry_rows() {
+        let keys = ConfigManager::new(Settings::default()).secret_keys();
+        assert!(keys.contains(&"llm_api_key"));
+        assert!(keys.contains(&"llm_fallback_api_key"));
+        assert!(!keys.contains(&"llm_model"));
+    }
+
+    /// A key owned by a component config section is settable by its
+    /// canonical key and its plain alias, and reaches the build context.
+    #[cfg(feature = "ladybug")]
+    #[test]
+    fn section_keys_are_settable_and_reach_the_build_context() {
+        let cm = ConfigManager::new(Settings::default());
+        cm.set("graph_max_db_size", serde_json::json!(2048))
+            .unwrap();
+        assert_eq!(
+            cm.get("graph.ladybug.max_db_size"),
+            Some(serde_json::json!(2048))
+        );
+        assert!(matches!(
+            cm.set("graph.ladybug.max_db_size", serde_json::json!("big")),
+            Err(ConfigError::TypeMismatch { .. })
+        ));
+        let ctx = cm.read().backend_context();
+        let section: cognee_graph::LadybugConfig = ctx.section();
+        assert_eq!(section.max_db_size, 2048);
     }
 
     #[test]
