@@ -403,3 +403,124 @@ pub(crate) fn non_empty(value: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
+
+/// The default vector backend: `lancedb`, except on an Android build without
+/// the `lancedb` feature, whose effective backend has always been in-memory
+/// brute-force.
+///
+/// `lancedb` is kept as the literal default so existing configs boot without
+/// edits. It is not a fallback: the registry ERRORS when no factory is
+/// registered under the provider id, naming the feature to rebuild with, so a
+/// consumer that drops the `lancedb` feature (default-on in `cognee` and every
+/// binding) must set `vector.provider` explicitly. Production deployments
+/// should set `pgvector` (with `vector.url`) for durable storage.
+///
+/// Android is the one first-party profile that drops `lancedb`
+/// (`cognee/android-default`: the Arrow + lance native stack does not
+/// cross-compile). Its effective backend has always been brute-force anyway —
+/// when the feature IS present, `LanceDbFactory::build` falls back to
+/// brute-force on Android — so naming brute-force here keeps that behaviour
+/// and stops a stock Android build from erroring on a provider whose factory
+/// was never registered.
+///
+/// This covers only the *default*. An explicit `lancedb` still arrives from a
+/// persisted config.json or `VECTOR_DB_PROVIDER`; that is absorbed by
+/// `ANDROID_LANCEDB_FALLBACK` in `ComponentRegistry::resolve_vector_key`. Keep
+/// the two in step.
+fn default_vector_provider() -> String {
+    if cfg!(all(target_os = "android", not(feature = "lancedb"))) {
+        "brute-force".to_string()
+    } else {
+        "lancedb".to_string()
+    }
+}
+
+config_section! {
+    /// Settings shared by every vector database backend. Registered by the
+    /// vector kind.
+    pub struct VectorConfig in "vector" {
+        /// Backend id selecting the vector factory (`lancedb`, `pgvector`,
+        /// `brute-force`, …). `lancedb` is kept as the default so existing
+        /// configs boot unchanged; it errors, rather than falling back, when its
+        /// feature is missing (except on Android, see `ANDROID_LANCEDB_FALLBACK`).
+        pub provider: String = default_vector_provider() => {
+            env: ["VECTOR_DB_PROVIDER"], alias: ["vector_db_provider"], secret: false,
+        },
+        /// URL or path; empty derives `{system_root}/vectors`.
+        pub url: String = String::new() => {
+            env: ["VECTOR_DB_URL"], alias: ["vector_db_url"], secret: false,
+        },
+        /// Port.
+        pub port: u16 = 1234 => {
+            env: ["VECTOR_DB_PORT"], alias: ["vector_db_port"], secret: false,
+        },
+        /// Database name.
+        pub name: String = String::new() => {
+            env: ["VECTOR_DB_NAME"], alias: ["vector_db_name"], secret: false,
+        },
+        /// API key.
+        pub key: String = String::new() => {
+            env: ["VECTOR_DB_KEY"], alias: ["vector_db_key"], secret: true,
+        },
+        /// Username.
+        pub username: String = String::new() => {
+            env: ["VECTOR_DB_USERNAME"], alias: ["vector_db_username"], secret: false,
+        },
+        /// Password.
+        pub password: String = String::new() => {
+            env: ["VECTOR_DB_PASSWORD"], alias: ["vector_db_password"], secret: true,
+        },
+        /// Host.
+        pub host: String = String::new() => {
+            env: ["VECTOR_DB_HOST"], alias: ["vector_db_host"], secret: false,
+        },
+    }
+}
+
+config_section! {
+    /// Settings shared by every graph database backend. Registered by the
+    /// graph kind.
+    pub struct GraphConfig in "graph" {
+        /// Backend id selecting the graph factory. The default is derived from
+        /// the compiled backends (see `default_graph_provider`).
+        pub provider: String = crate::default_graph_provider().to_string() => {
+            env: ["GRAPH_DATABASE_PROVIDER"], alias: ["graph_database_provider"], secret: false,
+        },
+        /// URL.
+        pub url: String = String::new() => {
+            env: ["GRAPH_DATABASE_URL"], alias: ["graph_database_url"], secret: false,
+        },
+        /// Database name.
+        pub name: String = String::new() => {
+            env: ["GRAPH_DATABASE_NAME"], alias: ["graph_database_name"], secret: false,
+        },
+        /// Username.
+        pub username: String = String::new() => {
+            env: ["GRAPH_DATABASE_USERNAME"], alias: ["graph_database_username"], secret: false,
+        },
+        /// Password.
+        pub password: String = String::new() => {
+            env: ["GRAPH_DATABASE_PASSWORD"], alias: ["graph_database_password"], secret: true,
+        },
+        /// Port.
+        pub port: u16 = 123 => {
+            env: ["GRAPH_DATABASE_PORT"], alias: ["graph_database_port"], secret: false,
+        },
+        /// Host.
+        pub host: String = String::new() => {
+            env: ["GRAPH_DATABASE_HOST"], alias: ["graph_database_host"], secret: false,
+        },
+        /// API key.
+        pub key: String = String::new() => {
+            env: ["GRAPH_DATABASE_KEY"], alias: ["graph_database_key"], secret: true,
+        },
+        /// Embedded graph file path; empty derives `{system_root}/graph`.
+        pub file_path: String = String::new() => {
+            env: ["GRAPH_FILE_PATH"], alias: ["graph_file_path"], secret: false,
+        },
+        /// Graph file name (not used yet; see SDK-1070).
+        pub filename: String = String::new() => {
+            env: [], alias: ["graph_filename"], secret: false,
+        },
+    }
+}

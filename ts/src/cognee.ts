@@ -66,10 +66,16 @@ function snakeToCamel(key: string): string {
  * `chunkSize`, ...), so the
  * object returned by `config.get()` matches `CogneeConfigObject` / the setters.
  */
-function configToCamel(obj: Record<string, unknown>): Record<string, unknown> {
+function configToCamel(
+  obj: Record<string, unknown>,
+  aliases: Record<string, string> = {},
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
-    out[snakeToCamel(k)] = v;
+    // A section key with a Python alias reads back under that alias's
+    // camelCase (`vector.provider` -> `vector_db_provider` ->
+    // `vectorDbProvider`), so the documented names stay stable.
+    out[snakeToCamel(aliases[k] ?? k)] = v;
   }
   // The `setEmbeddingModel` setter writes the Rust `embedding_model_name`
   // field, so the snapshot surfaces it as `embeddingModelName`. Expose an
@@ -103,10 +109,13 @@ const SETTINGS_KEY_ALIASES: Record<string, string> = {
  * (camel→snake is idempotent on them), so both spellings are accepted — fixing
  * silently-ignored camelCase constructor args.
  *
- * A component section key read back by `config.get()` (`llm.auto_rate_limit`
- * -> `llmAutoRateLimit`) arrives here as `llm_auto_rate_limit`; the native
- * constructor maps that flattened spelling back to the canonical key, so a
- * `new Cognee(other.config.get())` round trip keeps every setting.
+ * A component section key read back by `config.get()` comes back either under
+ * its Python alias's camelCase (`llm.auto_rate_limit` -> `autoRateLimit`,
+ * arriving here as the alias `auto_rate_limit`) or, when it has no alias, with
+ * its dots as word breaks (`llm.debug_requests` -> `llmDebugRequests`,
+ * arriving here as `llm_debug_requests`); the native constructor maps both
+ * spellings back to the canonical key, so a `new Cognee(other.config.get())`
+ * round trip keeps every setting.
  */
 function normalizeSettings(settings: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -403,7 +412,8 @@ export class Cognee {
         catch (e) { throw wrapNativeError(e); }
       },
       // Read-back
-      get: () => configToCamel(native.getConfig(h) as Record<string, unknown>),
+      get: () =>
+        configToCamel(native.getConfig(h) as Record<string, unknown>, native.configKeyAliases(h)),
     };
 
     // ── datasets sub-object ──────────────────────────────────────────────────

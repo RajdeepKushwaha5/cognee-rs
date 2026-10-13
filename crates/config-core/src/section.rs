@@ -71,8 +71,10 @@ impl ConfigValue for bool {
 macro_rules! unsigned_config_value {
     ($($t:ty),*) => {$(
         impl ConfigValue for $t {
+            /// Surrounding whitespace (a common `.env` / YAML artifact) is
+            /// ignored.
             fn parse_env(raw: &str) -> Option<Self> {
-                raw.parse().ok()
+                raw.trim().parse().ok()
             }
             fn from_json(value: &Value) -> Result<Self, String> {
                 value
@@ -91,8 +93,9 @@ macro_rules! unsigned_config_value {
 unsigned_config_value!(u16, u32, u64, usize);
 
 impl ConfigValue for f64 {
+    /// Surrounding whitespace is ignored.
     fn parse_env(raw: &str) -> Option<Self> {
-        raw.parse().ok()
+        raw.trim().parse().ok()
     }
     fn from_json(value: &Value) -> Result<Self, String> {
         value
@@ -502,14 +505,15 @@ impl ConfigSchema {
     }
 
     /// Every registered setting with its current value (from `values`, else
-    /// its default), keyed canonically. With `mask = Some(marker)`, a
-    /// non-empty secret value is replaced by `marker`.
+    /// its default), keyed canonically. With `mask = Some(marker)`, every
+    /// non-null secret value (an empty one too, so its presence leaks
+    /// nothing) is replaced by `marker`.
     pub fn snapshot(&self, values: &ConfigValues, mask: Option<&str>) -> ConfigValues {
         self.key_defs()
             .map(|def| {
                 let value = values.get(def.key).cloned().unwrap_or_else(def.default);
                 let shown = match mask {
-                    Some(marker) if def.secret && !is_empty_value(&value) => {
+                    Some(marker) if def.secret && !value.is_null() => {
                         Value::String(marker.to_string())
                     }
                     _ => value,
@@ -526,14 +530,6 @@ impl ConfigSchema {
             .filter(|key| self.key_def(key).is_none())
             .map(String::as_str)
             .collect()
-    }
-}
-
-fn is_empty_value(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(s) => s.is_empty(),
-        _ => false,
     }
 }
 
@@ -688,6 +684,14 @@ mod tests {
         assert_eq!(keys, ["demo.size", "demo.token", "demo.flag"]);
         assert!(Demo::schema().keys[1].secret);
         assert_eq!(Demo::schema().keys[0].doc.trim(), "A size.");
+    }
+
+    #[test]
+    fn numeric_env_values_ignore_surrounding_whitespace() {
+        assert_eq!(<u32 as ConfigValue>::parse_env(" 48 "), Some(48));
+        assert_eq!(<u64 as ConfigValue>::parse_env("\t7\n"), Some(7));
+        assert_eq!(<f64 as ConfigValue>::parse_env(" 0.5 "), Some(0.5));
+        assert_eq!(<u32 as ConfigValue>::parse_env(" 4 8 "), None);
     }
 
     #[test]
