@@ -23,28 +23,32 @@ use crate::traits::{EmbeddingFactory, GraphDbFactory, LlmFactory, VectorDbFactor
 /// registry to a `ComponentManager` or the HTTP server wiring. `build_*` is the
 /// single construction path both callers share.
 ///
-/// Vector / graph / llm are keyed by provider id (the real extension points).
-/// Embedding holds a single replaceable factory, because provider selection
-/// happens inside `EmbeddingConfig::create_engine`.
+/// Every kind is keyed by lowercase provider id. For embedding,
+/// [`build_embedding`](Self::build_embedding) selects the factory from
+/// `ctx.embedding.provider` (empty means `onnx`); `mock` is handled by the
+/// registry itself and needs no factory.
 pub struct ComponentRegistry {
     vector: HashMap<String, Arc<dyn VectorDbFactory>>,
     graph: HashMap<String, Arc<dyn GraphDbFactory>>,
     llm: HashMap<String, Arc<dyn LlmFactory>>,
-    embedding: Arc<dyn EmbeddingFactory>,
+    embedding: HashMap<String, Arc<dyn EmbeddingFactory>>,
     /// Config sections registered directly (not through a factory).
     config_sections: Vec<&'static SectionSchema>,
 }
 
 impl ComponentRegistry {
-    /// An empty registry with only the default embedding factory installed.
-    /// Prefer [`with_builtins`](Self::with_builtins) unless you are assembling
-    /// a bespoke provider set from scratch.
+    /// An empty registry: no factory of any kind, embedding included, so the
+    /// only embedding provider it can build is `mock`. Register embedding
+    /// factories with [`register_embedding`](Self::register_embedding) (for
+    /// example `DefaultEmbeddingFactory::new("openai")`). Prefer
+    /// [`with_builtins`](Self::with_builtins) unless you are assembling a
+    /// bespoke provider set from scratch.
     pub fn empty() -> Self {
         Self {
             vector: HashMap::new(),
             graph: HashMap::new(),
             llm: HashMap::new(),
-            embedding: Arc::new(DefaultEmbeddingFactory),
+            embedding: HashMap::new(),
             config_sections: Vec::new(),
         }
     }
@@ -113,6 +117,20 @@ impl ComponentRegistry {
         #[cfg(feature = "bedrock")]
         reg.register_llm(Arc::new(llm::BedrockLlmFactory));
 
+        // ── embedding ─────────────────────────────────────────────────────
+        // One factory per provider id, each registering its provider's config
+        // section. `mock` is handled by `build_embedding` itself.
+        #[cfg(feature = "onnx")]
+        {
+            reg.register_embedding(Arc::new(DefaultEmbeddingFactory::new("onnx")));
+            reg.register_embedding(Arc::new(DefaultEmbeddingFactory::new("fastembed")));
+        }
+        for id in ["openai", "openai_compatible", "ollama"] {
+            reg.register_embedding(Arc::new(DefaultEmbeddingFactory::new(id)));
+        }
+        #[cfg(feature = "bedrock")]
+        reg.register_embedding(Arc::new(DefaultEmbeddingFactory::new("bedrock")));
+
         reg
     }
 
@@ -133,10 +151,16 @@ impl ComponentRegistry {
         self.llm.insert(f.provider().to_lowercase(), f);
     }
 
-    /// Replace the embedding factory (provider selection is internal to the
-    /// engine, so there is a single slot).
+    /// Register (or override) an embedding factory under `f.provider()`.
+    pub fn register_embedding(&mut self, f: Arc<dyn EmbeddingFactory>) {
+        self.embedding.insert(f.provider().to_lowercase(), f);
+    }
+
+    /// Former single-slot setter; now the same as
+    /// [`register_embedding`](Self::register_embedding).
+    #[deprecated(note = "embedding factories are per provider now; use register_embedding")]
     pub fn set_embedding(&mut self, f: Arc<dyn EmbeddingFactory>) {
-        self.embedding = f;
+        self.register_embedding(f);
     }
 
     /// Register a configuration section that is not owned by a factory (for
@@ -162,8 +186,10 @@ impl ComponentRegistry {
         }
         // Kind sections first: the settings every adapter of a kind shares,
         // registered by the kind itself.
-        let mut sections: Vec<&'static SectionSchema> =
-            vec![<crate::sections::LlmConfig as cognee_config_core::ConfigSection>::schema()];
+        let mut sections: Vec<&'static SectionSchema> = vec![
+            <crate::sections::LlmConfig as cognee_config_core::ConfigSection>::schema(),
+            <crate::sections::EmbeddingConfig as cognee_config_core::ConfigSection>::schema(),
+        ];
         for f in sorted(&self.vector) {
             sections.extend(f.config_sections());
         }
@@ -173,7 +199,9 @@ impl ComponentRegistry {
         for f in sorted(&self.llm) {
             sections.extend(f.config_sections());
         }
-        sections.extend(self.embedding.config_sections());
+        for f in sorted(&self.embedding) {
+            sections.extend(f.config_sections());
+        }
         sections.extend(self.config_sections.iter().copied());
 
         let mut schema = ConfigSchema::new();
@@ -378,12 +406,50 @@ impl ComponentRegistry {
         }
     }
 
-    /// Build the embedding engine via the (single) embedding factory.
+    /// Build the embedding engine selected by `ctx.embedding.provider`.
+    ///
+    /// The id is trimmed and lowercased, matching
+    /// [`register_embedding`](Self::register_embedding). A mock request
+    /// (`ctx.embedding.mock` or provider `mock`) builds the mock engine without
+    /// a factory; an empty id means `onnx`. An unregistered id is an error:
+    /// an unrecognized one is reported as a typo, a recognized one as a
+    /// provider this build does not include.
+    ///
+    /// The process-wide embedding pacer is installed here, before dispatch, so
+    /// every provider gets it, including ones added with `register_embedding`.
     pub async fn build_embedding(
         &self,
         ctx: &BackendBuildContext,
     ) -> Result<Arc<dyn EmbeddingEngine>, ComponentError> {
-        self.embedding.build(ctx).await
+        crate::builtins::embedding::install_embedding_pacer(ctx);
+        // `mock` short-circuits provider selection, like the LLM mock.
+        let provider = ctx.embedding.provider.trim().to_lowercase();
+        if ctx.embedding.mock || provider == "mock" {
+            return crate::builtins::embedding::build_mock_embedding(ctx).await;
+        }
+        // Empty means the default provider.
+        let key = if provider.is_empty() {
+            "onnx".to_string()
+        } else {
+            provider
+        };
+        if let Some(factory) = self.embedding.get(&key) {
+            return factory.build(ctx).await;
+        }
+        // Not registered: an unrecognized id is a typo (never a silent ONNX
+        // fallback); a recognized one is a provider compiled out of this build.
+        crate::builtins::embedding::validate_provider_id(&key, false)?;
+        Err(ComponentError::EmbeddingEngine(format!(
+            "embedding provider '{key}' is not available in this build. Registered: {}",
+            self.embedding_providers().join(", ")
+        )))
+    }
+
+    /// Provider ids with a registered embedding factory (sorted).
+    pub fn embedding_providers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.embedding.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 }
 
@@ -987,6 +1053,156 @@ mod tests {
         );
     }
 
+    /// An embedding factory that records that it was chosen and then fails
+    /// with its own id, so a test can tell which factory `build_embedding`
+    /// dispatched to without constructing a real engine.
+    struct StubEmbedding {
+        id: &'static str,
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StubEmbedding {
+        fn new(id: &'static str) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
+            let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    id,
+                    called: Arc::clone(&called),
+                }),
+                called,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingFactory for StubEmbedding {
+        fn provider(&self) -> &str {
+            self.id
+        }
+        async fn build(
+            &self,
+            _ctx: &BackendBuildContext,
+        ) -> Result<Arc<dyn EmbeddingEngine>, ComponentError> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(ComponentError::EmbeddingEngine(format!("stub:{}", self.id)))
+        }
+    }
+
+    fn embedding_error(result: Result<Arc<dyn EmbeddingEngine>, ComponentError>) -> ComponentError {
+        match result {
+            Ok(_) => panic!("expected an error, got an engine"),
+            Err(e) => e,
+        }
+    }
+
+    // `mock` needs no factory: an empty registry still builds it, from the
+    // provider id in any case or padding, and from the `mock` flag alone.
+    #[tokio::test]
+    async fn build_embedding_mock_short_circuits_without_a_factory() {
+        let mut reg = ComponentRegistry::empty();
+        // A factory registered under `mock` must not be consulted either.
+        let (stub, called) = StubEmbedding::new("mock");
+        reg.register_embedding(stub);
+        for provider in ["mock", "MOCK", " mock "] {
+            let mut ctx = test_ctx();
+            ctx.embedding.provider = provider.to_string();
+            ctx.embedding.mock = false;
+            if let Err(e) = reg.build_embedding(&ctx).await {
+                panic!("provider {provider:?} must build the mock engine: {e:?}");
+            }
+        }
+        let mut ctx = test_ctx();
+        ctx.embedding.provider = "openai".to_string();
+        ctx.embedding.mock = true;
+        if let Err(e) = reg.build_embedding(&ctx).await {
+            panic!("the mock flag must override the provider: {e:?}");
+        }
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "mock must short-circuit before factory lookup"
+        );
+    }
+
+    // The lookup key must match what `register_embedding` stores: a factory
+    // registered under a mixed-case id is reached from any spelling of it.
+    #[tokio::test]
+    async fn build_embedding_dispatches_to_a_registered_factory_case_insensitively() {
+        let mut reg = ComponentRegistry::empty();
+        let (stub, called) = StubEmbedding::new("MyEmbed");
+        reg.register_embedding(stub);
+        assert_eq!(reg.embedding_providers(), vec!["myembed".to_string()]);
+
+        for provider in ["myembed", "MyEmbed", "  MYEMBED "] {
+            called.store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut ctx = test_ctx();
+            ctx.embedding.provider = provider.to_string();
+            let err = embedding_error(reg.build_embedding(&ctx).await);
+            assert!(
+                matches!(&err, ComponentError::EmbeddingEngine(m) if m == "stub:MyEmbed"),
+                "provider {provider:?} must reach the registered factory, got: {err:?}"
+            );
+            assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    // An empty or blank id means `onnx`, and registering under a built-in id
+    // replaces the built-in factory.
+    #[tokio::test]
+    async fn build_embedding_empty_provider_routes_to_onnx_and_builtins_can_be_overridden() {
+        let mut reg = ComponentRegistry::with_builtins();
+        let (stub, called) = StubEmbedding::new("onnx");
+        reg.register_embedding(stub);
+
+        for provider in ["", "   ", "onnx", "ONNX"] {
+            called.store(false, std::sync::atomic::Ordering::SeqCst);
+            let mut ctx = test_ctx();
+            ctx.embedding.provider = provider.to_string();
+            let err = embedding_error(reg.build_embedding(&ctx).await);
+            assert!(
+                matches!(&err, ComponentError::EmbeddingEngine(m) if m == "stub:onnx"),
+                "provider {provider:?} must reach the overriding `onnx` factory, got: {err:?}"
+            );
+            assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    // A recognized provider with no factory is a build without it, not a
+    // typo; an unrecognized one is a typo, never a silent fallback.
+    #[tokio::test]
+    async fn build_embedding_tells_a_missing_provider_from_a_typo() {
+        let reg = ComponentRegistry::empty();
+
+        for provider in ["openai", "", "Bedrock"] {
+            let mut ctx = test_ctx();
+            ctx.embedding.provider = provider.to_string();
+            let err = embedding_error(reg.build_embedding(&ctx).await);
+            assert!(
+                matches!(&err, ComponentError::EmbeddingEngine(m)
+                    if m.contains("not available in this build")),
+                "provider {provider:?} is recognized, so it must be reported as not \
+                 available, got: {err:?}"
+            );
+        }
+
+        let mut ctx = test_ctx();
+        ctx.embedding.provider = "opnai".to_string();
+        let err = embedding_error(reg.build_embedding(&ctx).await);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown embedding provider 'opnai'"),
+            "a typo must be reported as unknown: {msg}"
+        );
+        assert!(!msg.contains("not available in this build"), "{msg}");
+
+        // The same holds with the built-ins registered.
+        let reg = ComponentRegistry::with_builtins();
+        let err = embedding_error(reg.build_embedding(&ctx).await);
+        assert!(
+            err.to_string()
+                .contains("unknown embedding provider 'opnai'")
+        );
+    }
+
     fn test_ctx() -> BackendBuildContext {
         BackendBuildContext {
             sections: Default::default(),
@@ -1012,17 +1228,11 @@ mod tests {
                 rate_limit_interval: 60,
                 mock: false,
                 mock_mode: Default::default(),
-                api_version: None,
-                huggingface_tokenizer: None,
                 max_completion_tokens: 8191,
-                onnx_model_path: std::path::PathBuf::new(),
-                onnx_tokenizer_path: std::path::PathBuf::new(),
-                onnx_model_name: "bge-small-en-v1.5".to_string(),
-                onnx_dimensions: 384,
-                onnx_max_sequence_length: 512,
-                onnx_batch_size: 32,
+                max_sequence_length: 512,
             },
             llm: crate::context::LlmInputs {
+                api_version: String::new(),
                 debug_requests: false,
                 temperature: None,
                 provider: "openai".to_string(),
@@ -1047,7 +1257,6 @@ mod tests {
                 auto_rate_limit: true,
                 max_completion_tokens: cognee_llm::OpenAIAdapter::DEFAULT_MAX_COMPLETION_TOKENS,
                 llm_args: serde_json::Map::new(),
-                api_version: String::new(),
                 reasoning_override: None,
                 structured_output_mode: cognee_llm::StructuredOutputMode::Auto,
                 mock: false,
