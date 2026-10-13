@@ -84,6 +84,10 @@ pub struct ComponentManager {
     // (env reads + the Postgres credential-fallback warning) runs once per config
     // version instead of once per component (7×).
     context: TokioRwLock<Option<(u64, cognee_components::BackendBuildContext)>>,
+    // This manager's resolved `llm.api_key`, registered with product analytics
+    // (hashed into `api_key_tracking_id`) for as long as the manager lives.
+    // The configured key (env, config file or code), never a raw env read.
+    telemetry_key: cognee_telemetry::LlmKeyRegistration,
 }
 
 impl ComponentManager {
@@ -110,6 +114,8 @@ impl ComponentManager {
             }
             Err(error) => tracing::error!(%error, "component config sections not registered"),
         }
+        let telemetry_key =
+            cognee_telemetry::LlmKeyRegistration::new(Some(&config.read().llm().api_key));
         Self {
             config,
             registry,
@@ -121,6 +127,7 @@ impl ComponentManager {
             llm: TokioRwLock::new(None),
             transcriber: TokioRwLock::new(None),
             context: TokioRwLock::new(None),
+            telemetry_key,
         }
     }
 
@@ -167,7 +174,13 @@ impl ComponentManager {
         }
         // No `.await` between the config read and storing the result, so the
         // (non-`Send`) settings guard never crosses an await point.
-        let ctx = self.config.read().backend_context();
+        let ctx = {
+            let settings = self.config.read();
+            // The configuration changed (or this is the first build): keep the
+            // key reported by product analytics in step with it.
+            self.telemetry_key.update(Some(&settings.llm().api_key));
+            settings.backend_context()
+        };
         *guard = Some((current_ver, ctx.clone()));
         ctx
     }
@@ -635,6 +648,31 @@ impl PipelineContext for ComponentManager {
 mod tests {
     use super::*;
     use crate::config::{ConfigManager, Settings};
+
+    /// The analytics key is the manager's resolved `llm.api_key` (here from
+    /// `LLM_API_KEY`, the variable Python hashes, so one key gives one
+    /// `api_key_tracking_id` in both SDKs), it follows a key set from code once
+    /// the config is rebuilt, and it is unregistered with the manager. Checked
+    /// on the manager's own registration: other tests in this binary build
+    /// managers concurrently, so the process-wide aggregate is covered in
+    /// `cognee-telemetry` instead.
+    #[test]
+    fn telemetry_key_is_the_resolved_llm_key_of_this_manager() {
+        let mut settings = Settings::default();
+        settings.overlay_from(&cognee_config_core::MapEnv::new().with("LLM_API_KEY", "sk-x"));
+        let cm = ComponentManager::new(ConfigManager::new(settings));
+        assert_eq!(cm.telemetry_key.registered().as_deref(), Some("sk-x"));
+
+        cm.config().set_llm_api_key("sk-from-code");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(cm.build_context());
+        assert_eq!(
+            cm.telemetry_key.registered().as_deref(),
+            Some("sk-from-code")
+        );
+    }
 
     fn cm_with_provider(provider: &str) -> ComponentManager {
         let settings = Settings {

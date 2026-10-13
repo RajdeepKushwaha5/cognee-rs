@@ -22,18 +22,16 @@ use tokio::sync::Notify;
 
 use crate::UserIdRef;
 use crate::client::client;
-use crate::env::{is_disabled, proxy_url, request_timeout_secs};
-use crate::ids::{get_anonymous_id, get_api_key_tracking_id, get_persistent_id};
+use crate::config::{current_config, is_enabled_in, with_config};
+use crate::ids::{
+    get_anonymous_id, get_persistent_id,
+    inner_api_key_tracking_id_with_salt as api_key_tracking_id_with_salt,
+};
 use crate::payload::{
     AdditionalProperties, Properties, TelemetryPayload, UserProperties, format_time_field,
 };
 use crate::sanitize::sanitize_nested_properties;
 
-/// Real implementation of `send_telemetry`. Returns immediately;
-/// the HTTP POST is dispatched on a detached tokio task. When called
-/// outside a tokio runtime, falls back to a one-shot single-thread
-/// runtime (decision 5) and blocks the calling thread up to
-/// `TELEMETRY_REQUEST_TIMEOUT` (default 5s, clamped `[1, 60]`).
 /// Outstanding detached POSTs, so a teardown can wait for them.
 ///
 /// A counter plus a `Notify` rather than a `JoinSet`/`TaskTracker`: the
@@ -118,16 +116,28 @@ pub(crate) async fn flush_impl(timeout: Duration) -> bool {
     }
 }
 
+/// Real implementation of `send_telemetry`. Returns immediately;
+/// the HTTP POST is dispatched on a detached tokio task. When called
+/// outside a tokio runtime, falls back to a one-shot single-thread
+/// runtime (decision 5) and blocks the calling thread up to the
+/// configured request timeout (default 5s, clamped `[1, 60]`).
 pub(crate) fn send_telemetry_impl(
     event_name: &str,
     user_id: UserIdRef<'_>,
     additional_properties: Option<Value>,
 ) {
-    if is_disabled() {
+    // One snapshot per event: the switch, and the salt for the key hash.
+    let config = current_config();
+    if !is_enabled_in(&config) {
         return;
     }
 
-    let body = build_body(event_name, user_id, additional_properties);
+    let body = build_body(
+        event_name,
+        user_id,
+        additional_properties,
+        config.api_key_tracking_salt.as_deref(),
+    );
 
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
@@ -158,10 +168,11 @@ fn build_body(
     event_name: &str,
     user_id: UserIdRef<'_>,
     additional_properties: Option<Value>,
+    api_key_tracking_salt: Option<&str>,
 ) -> Value {
     let anon = get_anonymous_id();
     let persistent = get_persistent_id();
-    let tracking = get_api_key_tracking_id();
+    let tracking = api_key_tracking_id_with_salt(api_key_tracking_salt);
     let user = match user_id {
         UserIdRef::Uuid(u) => u.to_string(),
         UserIdRef::Symbolic(s) => s.to_string(),
@@ -214,8 +225,20 @@ async fn post(body: Value) {
     if body.is_null() {
         return;
     }
-    let url = proxy_url();
-    match client().post(&url).json(&body).send().await {
+    // Re-checked here, not only at dispatch: an event queued before
+    // `set_enabled(false)` must not leave the process after it.
+    let Some((endpoint, timeout)) = with_config(|c| {
+        is_enabled_in(c).then(|| (c.endpoint().to_string(), c.effective_request_timeout()))
+    }) else {
+        return;
+    };
+    match client()
+        .post(&endpoint)
+        .timeout(timeout)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(resp) if !resp.status().is_success() => {
             tracing::debug!(
                 target: "cognee.telemetry",
@@ -238,7 +261,7 @@ async fn post(body: Value) {
 /// thread until the POST completes (or times out), so by the time it
 /// returns there is nothing left in flight.
 fn spin_up_one_shot(body: Value) {
-    let timeout = std::time::Duration::from_secs(request_timeout_secs());
+    let timeout = with_config(|c| c.effective_request_timeout());
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()

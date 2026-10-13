@@ -13,9 +13,7 @@
 
 use std::sync::{Once, OnceLock};
 
-use tracing_subscriber::{
-    EnvFilter, Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
-};
+use tracing_subscriber::{Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt};
 
 static INIT: Once = Once::new();
 
@@ -55,8 +53,12 @@ pub(crate) fn install() {
         // binary. The crate is already a dependency for `setupLogging`
         // (gap 06 task 08), so calling the helper avoids duplicating
         // the literal and prevents drift.
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(cognee_logging::default_filter()));
+        // RUST_LOG > LOG_LEVEL > the default filter, resolved by the logging
+        // config's boundary like every other logging setting. Only the level
+        // is read, so a malformed, unrelated logging variable cannot drop it,
+        // and Python level names (`WARNING`) are mapped.
+        let level = cognee_logging::LoggingConfig::level_filter_from_env();
+        let filter = cognee_logging::env_filter(level.as_deref());
 
         // Reserve a reload-capable slot for the OTEL layer. Starts
         // empty (None); `setupTelemetry()` (gap 07 task 05) swaps in a
