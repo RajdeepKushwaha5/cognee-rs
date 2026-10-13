@@ -16,6 +16,8 @@ pub use advanced_graph_retrievers::{
     GraphCompletionContextExtensionRetriever, GraphCompletionCotRetriever,
     GraphSummaryCompletionRetriever,
 };
+#[cfg(test)]
+pub(crate) use base_retriever::AppliedTuning;
 pub use base_retriever::{SearchRetriever, SearchRetrieverRef};
 #[allow(
     unused_imports,
@@ -25,8 +27,8 @@ pub use chunks_retriever::ChunksRetriever;
 pub use completion_retriever::CompletionRetriever;
 pub use cypher_nl_retrievers::{CypherSearchRetriever, NaturalLanguageRetriever};
 pub use graph_completion_retriever::GraphCompletionRetriever;
-pub use hybrid::HybridRetriever;
 pub(crate) use hybrid::extract_used_ids;
+pub use hybrid::{HybridBudget, HybridRetriever};
 pub use lexical_retriever::LexicalRetriever;
 pub use lucky_feedback_rules_retrievers::{
     CodingRulesRetriever, FeedbackRetriever, FeelingLuckyRetriever,

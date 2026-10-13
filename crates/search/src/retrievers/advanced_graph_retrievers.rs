@@ -44,6 +44,7 @@ struct GraphRetrieverCore {
     wide_search_top_k: usize,
     triplet_distance_penalty: f32,
     feedback_influence: f32,
+    neighbor_cap: Option<usize>,
 }
 
 impl GraphRetrieverCore {
@@ -64,6 +65,7 @@ impl GraphRetrieverCore {
             triplet_distance_penalty: triplet_distance_penalty
                 .unwrap_or(DEFAULT_TRIPLET_DISTANCE_PENALTY),
             feedback_influence: 0.0,
+            neighbor_cap: None,
         }
     }
 
@@ -82,6 +84,7 @@ impl GraphRetrieverCore {
             triplet_distance_penalty: params
                 .triplet_distance_penalty_or(self.triplet_distance_penalty),
             feedback_influence: params.feedback_influence_or(self.feedback_influence),
+            neighbor_cap: self.neighbor_cap,
             node_type: params.node_type.clone(),
             node_name: params.node_name.clone(),
             node_name_filter_operator: params
@@ -149,6 +152,14 @@ pub struct GraphSummaryCompletionRetriever {
 }
 
 impl GraphSummaryCompletionRetriever {
+    /// Cap the neighbours expanded per seed node in triplet search
+    /// (`search.triplet_neighbor_cap`); `None` is uncapped.
+    #[must_use]
+    pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
+        self.core.neighbor_cap = cap;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector_db: Arc<dyn VectorDB>,
@@ -185,6 +196,14 @@ impl GraphSummaryCompletionRetriever {
 impl SearchRetriever for GraphSummaryCompletionRetriever {
     fn search_type(&self) -> SearchType {
         SearchType::GraphSummaryCompletion
+    }
+
+    #[cfg(test)]
+    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
+        crate::retrievers::AppliedTuning {
+            neighbor_cap: Some(self.core.neighbor_cap),
+            ..Default::default()
+        }
     }
 
     async fn get_context(
@@ -274,6 +293,14 @@ pub struct GraphCompletionContextExtensionRetriever {
 }
 
 impl GraphCompletionContextExtensionRetriever {
+    /// Cap the neighbours expanded per seed node in triplet search
+    /// (`search.triplet_neighbor_cap`); `None` is uncapped.
+    #[must_use]
+    pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
+        self.core.neighbor_cap = cap;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector_db: Arc<dyn VectorDB>,
@@ -313,6 +340,14 @@ impl GraphCompletionContextExtensionRetriever {
 impl SearchRetriever for GraphCompletionContextExtensionRetriever {
     fn search_type(&self) -> SearchType {
         SearchType::GraphCompletionContextExtension
+    }
+
+    #[cfg(test)]
+    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
+        crate::retrievers::AppliedTuning {
+            neighbor_cap: Some(self.core.neighbor_cap),
+            ..Default::default()
+        }
     }
 
     async fn get_context(
@@ -426,6 +461,14 @@ pub struct GraphCompletionCotRetriever {
 }
 
 impl GraphCompletionCotRetriever {
+    /// Cap the neighbours expanded per seed node in triplet search
+    /// (`search.triplet_neighbor_cap`); `None` is uncapped.
+    #[must_use]
+    pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
+        self.core.neighbor_cap = cap;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector_db: Arc<dyn VectorDB>,
@@ -464,6 +507,14 @@ impl GraphCompletionCotRetriever {
 impl SearchRetriever for GraphCompletionCotRetriever {
     fn search_type(&self) -> SearchType {
         SearchType::GraphCompletionCot
+    }
+
+    #[cfg(test)]
+    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
+        crate::retrievers::AppliedTuning {
+            neighbor_cap: Some(self.core.neighbor_cap),
+            ..Default::default()
+        }
     }
 
     async fn get_context(
