@@ -155,19 +155,6 @@ pub struct Settings {
     pub chunk_size: Option<u32>,
     pub chunk_overlap: u32,
 
-    pub relational_db_url: String,
-    pub migration_db_url: String,
-
-    /// Selects the relational DB backend: `"sqlite"` (default) or `"postgres"`.
-    /// When set to `"postgres"`, the individual `db_host`/`db_port`/`db_name`/
-    /// `db_username`/`db_password` fields are used instead of `relational_db_url`.
-    /// Mirrors the Python `DB_PROVIDER` environment variable.
-    pub db_provider: String,
-    pub db_host: String,
-    pub db_port: u16,
-    pub db_name: String,
-    pub db_username: String,
-    pub db_password: String,
     /// libpq-style TLS mode appended to every Postgres URL cognee *builds*
     /// (relational + pgvector + Postgres-graph). Empty string means: append
     /// nothing (local no-TLS Postgres, or sqlite). Managed providers such as
@@ -356,6 +343,12 @@ impl Settings {
         self.section()
     }
 
+    /// The relational kind section (`relational.*`): backend, URL and
+    /// connection parts.
+    pub fn relational(&self) -> cognee_components::RelationalConfig {
+        self.section()
+    }
+
     /// The storage kind section (`storage.*`): backend and bucket.
     pub fn storage(&self) -> cognee_components::StorageConfig {
         self.section()
@@ -400,21 +393,29 @@ impl Settings {
 
     /// Returns the effective relational DB connection URL.
     ///
-    /// When `db_provider` is `"postgres"`, builds
+    /// When `db_provider` is `"postgres"` or `"postgresql"` (trimmed and
+    /// case-insensitive, the same normalisation the component registry uses
+    /// to pick the relational factory), builds
     /// `postgres://username:password@host:port/name` from the individual
     /// `db_*` fields (matching Python's `DB_PROVIDER`/`DB_HOST`/… env vars).
     /// Otherwise returns `relational_db_url` verbatim.
     pub fn resolved_relational_db_url(&self) -> String {
-        if self.db_provider == "postgres" {
+        let relational = self.relational();
+        let provider = relational.provider.trim().to_ascii_lowercase();
+        if matches!(provider.as_str(), "postgres" | "postgresql") {
             with_sslmode(
                 format!(
                     "postgres://{}:{}@{}:{}/{}",
-                    self.db_username, self.db_password, self.db_host, self.db_port, self.db_name
+                    relational.username,
+                    relational.password,
+                    relational.host,
+                    relational.port,
+                    relational.name
                 ),
                 &self.db_sslmode,
             )
         } else {
-            self.relational_db_url.clone()
+            relational.url.clone()
         }
     }
 
@@ -567,6 +568,7 @@ impl Settings {
     /// offered to whichever graph provider is selected, including externally
     /// registered ones, so it cannot depend on the built-in `pggraph` feature.
     pub(crate) fn resolved_graph_postgres_url(&self) -> Result<String, String> {
+        let relational = self.relational();
         let graph = self.graph();
         if graph.url.starts_with("postgres://") || graph.url.starts_with("postgresql://") {
             return Ok(graph.url.clone());
@@ -599,15 +601,18 @@ impl Settings {
                 "Postgres graph credentials not fully configured; falling back to the \
                  relational database configuration. Set GRAPH_DATABASE_* explicitly to avoid this."
             );
-            if self.db_host.is_empty() || self.db_name.is_empty() || self.db_username.is_empty() {
+            if relational.host.is_empty()
+                || relational.name.is_empty()
+                || relational.username.is_empty()
+            {
                 return Err("Missing required Postgres graph credentials".into());
             }
             (
-                self.db_host.as_str(),
-                self.db_port,
-                self.db_name.as_str(),
-                self.db_username.as_str(),
-                self.db_password.as_str(),
+                relational.host.as_str(),
+                relational.port,
+                relational.name.as_str(),
+                relational.username.as_str(),
+                relational.password.as_str(),
             )
         };
 
@@ -619,6 +624,7 @@ impl Settings {
     /// Always compiled, for the reason given on
     /// [`Self::resolved_graph_postgres_url`].
     pub(crate) fn resolved_vector_postgres_url(&self) -> Result<String, String> {
+        let relational = self.relational();
         let vector = self.vector();
         if vector.url.starts_with("postgres://") || vector.url.starts_with("postgresql://") {
             return Ok(vector.url.clone());
@@ -660,7 +666,7 @@ impl Settings {
                 "Postgres vector credentials not fully configured; falling back to the \
                  relational database configuration. Set VECTOR_DB_* explicitly to avoid this."
             );
-            if self.db_host.is_empty() || self.db_name.is_empty() {
+            if relational.host.is_empty() || relational.name.is_empty() {
                 return Err("Missing required Postgres vector credentials".into());
             }
             // A password set while the username is blank is a real
@@ -668,7 +674,7 @@ impl Settings {
             // `postgres` there would silently authenticate as the superuser with
             // that password. Fail fast so it surfaces at startup, not as an
             // opaque connect-time auth error.
-            if self.db_username.is_empty() && !self.db_password.is_empty() {
+            if relational.username.is_empty() && !relational.password.is_empty() {
                 return Err(
                     "Missing required Postgres vector credentials: DB_PASSWORD is set but \
                      DB_USERNAME is empty"
@@ -683,17 +689,17 @@ impl Settings {
             // vectors still land in the SAME database as the relational store; it
             // does NOT resurrect the old per-field defaults (port 1234 /
             // `cognee_vectors`) that silently split the stores across databases.
-            let user = if self.db_username.is_empty() {
+            let user = if relational.username.is_empty() {
                 "postgres"
             } else {
-                self.db_username.as_str()
+                relational.username.as_str()
             };
             (
-                self.db_host.as_str(),
-                self.db_port,
-                self.db_name.as_str(),
+                relational.host.as_str(),
+                relational.port,
+                relational.name.as_str(),
                 user,
-                self.db_password.as_str(),
+                relational.password.as_str(),
             )
         };
 
@@ -726,7 +732,7 @@ impl Settings {
         );
         m.insert(
             "relational_db_provider".into(),
-            Value::String(self.db_provider.clone()),
+            Value::String(self.relational().provider.clone()),
         );
         m.insert(
             "llm_provider".into(),
@@ -792,15 +798,6 @@ impl Default for Settings {
             chunk_size: None,
             chunk_overlap: 10,
 
-            relational_db_url: "sqlite:./cognee.db?mode=rwc".to_string(),
-            migration_db_url: String::new(),
-
-            db_provider: "sqlite".to_string(),
-            db_host: "localhost".to_string(),
-            db_port: 5432,
-            db_name: "cognee_db".to_string(),
-            db_username: String::new(),
-            db_password: String::new(),
             db_sslmode: String::new(),
 
             default_system_prompt_path: DEFAULT_SYSTEM_PROMPT_PATH.to_string(),
@@ -1304,7 +1301,10 @@ impl ConfigManager {
     /// isolated tmp directory so tests do not share the default on-disk DB.
     pub fn set_relational_db_url(&self, url: &str) {
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-        s.relational_db_url = url.to_string();
+        s.sections.insert(
+            "relational.url".to_string(),
+            serde_json::json!(url.to_string()),
+        );
         drop(s);
         self.bump_version();
     }
@@ -1346,25 +1346,44 @@ impl ConfigManager {
     ) {
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
         if let Some(v) = url {
-            s.relational_db_url = v.to_string();
+            s.sections.insert(
+                "relational.url".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         if let Some(v) = provider {
-            s.db_provider = v.to_string();
+            s.sections.insert(
+                "relational.provider".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         if let Some(v) = host {
-            s.db_host = v.to_string();
+            s.sections.insert(
+                "relational.host".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         if let Some(v) = port {
-            s.db_port = v;
+            s.sections
+                .insert("relational.port".to_string(), serde_json::json!(v));
         }
         if let Some(v) = name {
-            s.db_name = v.to_string();
+            s.sections.insert(
+                "relational.name".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         if let Some(v) = username {
-            s.db_username = v.to_string();
+            s.sections.insert(
+                "relational.username".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         if let Some(v) = password {
-            s.db_password = v.to_string();
+            s.sections.insert(
+                "relational.password".to_string(),
+                serde_json::json!(v.to_string()),
+            );
         }
         drop(s);
         self.bump_version();
@@ -1373,7 +1392,10 @@ impl ConfigManager {
     /// Set the migration DB URL.
     pub fn set_migration_db_config(&self, url: &str) {
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-        s.migration_db_url = url.to_string();
+        s.sections.insert(
+            "relational.migration_url".to_string(),
+            serde_json::json!(url.to_string()),
+        );
         drop(s);
         self.bump_version();
     }
@@ -1912,12 +1934,18 @@ impl ConfigManager {
         );
 
         // Relational DB
-        m.insert("db_provider".into(), Value::String(s.db_provider.clone()));
+        m.insert(
+            "db_provider".into(),
+            Value::String(s.relational().provider.clone()),
+        );
         m.insert(
             "relational_db_url".into(),
-            Value::String(mask_url(&s.relational_db_url)),
+            Value::String(mask_url(&s.relational().url)),
         );
-        m.insert("db_password".into(), Value::String(mask(&s.db_password)));
+        m.insert(
+            "db_password".into(),
+            Value::String(mask(&s.relational().password)),
+        );
         m.insert(
             "single_process".into(),
             // `null` = derived from the relational URL, not "false". The
@@ -2942,7 +2970,7 @@ mod tests {
     #[test]
     fn secret_keys_cover_registry_rows() {
         let keys = ConfigManager::new(Settings::default()).secret_keys();
-        assert!(keys.contains(&"db_password"));
+        assert!(keys.contains(&"default_user_password"));
         assert!(keys.contains(&"llm.fallback_api_key"));
         assert!(!keys.contains(&"llm.model"));
     }
@@ -3663,6 +3691,14 @@ mod tests {
         let cfg = Settings {
             sections: [
                 (
+                    "relational.password".to_string(),
+                    serde_json::json!("db-pass"),
+                ),
+                (
+                    "relational.url".to_string(),
+                    serde_json::json!("postgres://user:pass@host/db"),
+                ),
+                (
                     "vector.password".to_string(),
                     serde_json::json!("vector-pass"),
                 ),
@@ -3677,8 +3713,6 @@ mod tests {
                 ("llm.api_key".to_string(), serde_json::json!("sk-secret")),
             ]
             .into(),
-            db_password: "db-pass".into(),
-            relational_db_url: "postgres://user:pass@host/db".into(),
             ..Settings::default()
         };
 
@@ -3780,8 +3814,8 @@ mod tests {
             None,
         );
         let s = cfg.read();
-        assert_eq!(s.relational_db_url, "sqlite:///tmp/test.db");
-        assert_eq!(s.db_provider, "sqlite");
+        assert_eq!(s.relational().url, "sqlite:///tmp/test.db");
+        assert_eq!(s.relational().provider, "sqlite");
     }
 
     #[test]
@@ -3828,7 +3862,7 @@ mod tests {
         let cfg = ConfigManager::new(Settings::default());
         cfg.set_migration_db_config("postgres://localhost/migrations");
         assert_eq!(
-            cfg.read().migration_db_url,
+            cfg.read().relational().migration_url,
             "postgres://localhost/migrations"
         );
     }
@@ -3838,12 +3872,30 @@ mod tests {
     #[test]
     fn relational_postgres_url_has_no_sslmode_by_default() {
         let s = Settings {
-            db_provider: "postgres".to_string(),
-            db_host: "db.internal".to_string(),
-            db_port: 5432,
-            db_name: "cognee".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
+            sections: [
+                (
+                    "relational.provider".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!("db.internal".to_string()),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee".to_string()),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("pw".to_string()),
+                ),
+            ]
+            .into(),
             db_sslmode: String::new(),
             ..Settings::default()
         };
@@ -3856,12 +3908,30 @@ mod tests {
     #[test]
     fn relational_postgres_url_appends_sslmode_when_set() {
         let s = Settings {
-            db_provider: "postgres".to_string(),
-            db_host: "db.internal".to_string(),
-            db_port: 5432,
-            db_name: "cognee".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
+            sections: [
+                (
+                    "relational.provider".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!("db.internal".to_string()),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee".to_string()),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("pw".to_string()),
+                ),
+            ]
+            .into(),
             db_sslmode: "require".to_string(),
             ..Settings::default()
         };
@@ -3872,13 +3942,65 @@ mod tests {
     }
 
     #[test]
+    fn relational_postgres_url_is_built_for_every_provider_spelling_the_registry_accepts() {
+        // The registry selects the SeaORM factory for `postgres` and
+        // `postgresql` after trimming and lowercasing; URL resolution must
+        // agree, or the Postgres factory silently connects to the SQLite
+        // default URL.
+        for provider in ["postgresql", " Postgres ", "POSTGRESQL"] {
+            let s = Settings {
+                sections: [
+                    (
+                        "relational.provider".to_string(),
+                        serde_json::json!(provider.to_string()),
+                    ),
+                    (
+                        "relational.host".to_string(),
+                        serde_json::json!("db.internal".to_string()),
+                    ),
+                    ("relational.port".to_string(), serde_json::json!(5432)),
+                    (
+                        "relational.name".to_string(),
+                        serde_json::json!("cognee".to_string()),
+                    ),
+                    (
+                        "relational.username".to_string(),
+                        serde_json::json!("postgres".to_string()),
+                    ),
+                    (
+                        "relational.password".to_string(),
+                        serde_json::json!("pw".to_string()),
+                    ),
+                ]
+                .into(),
+                db_sslmode: String::new(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                s.resolved_relational_db_url(),
+                "postgres://postgres:pw@db.internal:5432/cognee",
+                "provider {provider:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sqlite_relational_url_is_untouched_by_sslmode() {
         // Non-postgres provider must never gain a `?sslmode=` — it would break
         // the sqlite connection string.
         let s = Settings {
-            db_provider: "sqlite".to_string(),
+            sections: [
+                (
+                    "relational.provider".to_string(),
+                    serde_json::json!("sqlite".to_string()),
+                ),
+                (
+                    "relational.url".to_string(),
+                    serde_json::json!("sqlite:./cognee.db?mode=rwc".to_string()),
+                ),
+            ]
+            .into(),
             db_sslmode: "require".to_string(),
-            relational_db_url: "sqlite:./cognee.db?mode=rwc".to_string(),
             ..Settings::default()
         };
         assert_eq!(
@@ -3962,14 +4084,26 @@ mod tests {
                     "vector.provider".to_string(),
                     serde_json::json!("some-external-provider"),
                 ),
+                (
+                    "relational.provider".to_string(),
+                    serde_json::json!("postgres"),
+                ),
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!("shared-pg"),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee_db"),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres"),
+                ),
+                ("relational.password".to_string(), serde_json::json!("pw")),
             ]
             .into(),
-            db_provider: "postgres".to_string(),
-            db_host: "shared-pg".to_string(),
-            db_port: 5432,
-            db_name: "cognee_db".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
             ..Settings::default()
         };
         let ctx = s.backend_context();
@@ -4011,9 +4145,12 @@ mod tests {
                     "vector.provider".to_string(),
                     serde_json::json!("some-external-provider"),
                 ),
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!(String::new()),
+                ),
             ]
             .into(),
-            db_host: String::new(),
             ..Settings::default()
         };
         let ctx = s.backend_context();
@@ -4070,17 +4207,34 @@ mod tests {
         // DATABASE — NOT port 1234 or a `cognee_vectors` database (Fixes 1 & 2).
         // This is the path the pg_shared_db_single_stack test could not exercise.
         let s = Settings {
-            sections: [(
-                "vector.provider".to_string(),
-                serde_json::json!("pgvector".to_string()),
-            )]
+            sections: [
+                (
+                    "relational.provider".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!("shared-pg".to_string()),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee_db".to_string()),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("pw".to_string()),
+                ),
+                (
+                    "vector.provider".to_string(),
+                    serde_json::json!("pgvector".to_string()),
+                ),
+            ]
             .into(),
-            db_provider: "postgres".to_string(),
-            db_host: "shared-pg".to_string(),
-            db_port: 5432,
-            db_name: "cognee_db".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
             ..Settings::default()
         };
         assert_eq!(
@@ -4098,6 +4252,23 @@ mod tests {
         let s = Settings {
             sections: [
                 (
+                    "relational.host".to_string(),
+                    serde_json::json!("shared-pg".to_string()),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee_db".to_string()),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("pw".to_string()),
+                ),
+                (
                     "vector.provider".to_string(),
                     serde_json::json!("pgvector".to_string()),
                 ),
@@ -4107,11 +4278,6 @@ mod tests {
                 ),
             ]
             .into(),
-            db_host: "shared-pg".to_string(),
-            db_port: 5432,
-            db_name: "cognee_db".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
             ..Settings::default()
         };
         assert_eq!(
@@ -4129,12 +4295,17 @@ mod tests {
         // (localhost/5432/cognee_db) — NOT the old per-field defaults
         // (port 1234 / `cognee_vectors`) that split the stores.
         let s = Settings {
-            sections: [(
-                "vector.provider".to_string(),
-                serde_json::json!("pgvector".to_string()),
-            )]
+            sections: [
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!(String::new()),
+                ),
+                (
+                    "vector.provider".to_string(),
+                    serde_json::json!("pgvector".to_string()),
+                ),
+            ]
             .into(),
-            db_username: String::new(),
             ..Settings::default()
         };
         assert_eq!(
@@ -4149,13 +4320,21 @@ mod tests {
         // A password with a blank username is a misconfiguration, not the
         // default: fail fast rather than silently authenticating as `postgres`.
         let s = Settings {
-            sections: [(
-                "vector.provider".to_string(),
-                serde_json::json!("pgvector".to_string()),
-            )]
+            sections: [
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!(String::new()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("secret".to_string()),
+                ),
+                (
+                    "vector.provider".to_string(),
+                    serde_json::json!("pgvector".to_string()),
+                ),
+            ]
             .into(),
-            db_username: String::new(),
-            db_password: "secret".to_string(),
             ..Settings::default()
         };
         assert!(s.resolved_vector_postgres_url().is_err());
@@ -4167,12 +4346,17 @@ mod tests {
         // If even the relational host/name are blank there is nothing to fall
         // back to, so surface an explicit error rather than a bogus URL.
         let s = Settings {
-            sections: [(
-                "vector.provider".to_string(),
-                serde_json::json!("pgvector".to_string()),
-            )]
+            sections: [
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!(String::new()),
+                ),
+                (
+                    "vector.provider".to_string(),
+                    serde_json::json!("pgvector".to_string()),
+                ),
+            ]
             .into(),
-            db_host: String::new(),
             ..Settings::default()
         };
         assert!(s.resolved_vector_postgres_url().is_err());
@@ -4210,16 +4394,30 @@ mod tests {
     fn vector_postgres_url_appends_sslmode() {
         // sslmode is appended on the relational-fallback (single-DB) path too.
         let s = Settings {
-            sections: [(
-                "vector.provider".to_string(),
-                serde_json::json!("pgvector".to_string()),
-            )]
+            sections: [
+                (
+                    "relational.host".to_string(),
+                    serde_json::json!("shared-pg".to_string()),
+                ),
+                ("relational.port".to_string(), serde_json::json!(5432)),
+                (
+                    "relational.name".to_string(),
+                    serde_json::json!("cognee_db".to_string()),
+                ),
+                (
+                    "relational.username".to_string(),
+                    serde_json::json!("postgres".to_string()),
+                ),
+                (
+                    "relational.password".to_string(),
+                    serde_json::json!("pw".to_string()),
+                ),
+                (
+                    "vector.provider".to_string(),
+                    serde_json::json!("pgvector".to_string()),
+                ),
+            ]
             .into(),
-            db_host: "shared-pg".to_string(),
-            db_port: 5432,
-            db_name: "cognee_db".to_string(),
-            db_username: "postgres".to_string(),
-            db_password: "pw".to_string(),
             db_sslmode: "require".to_string(),
             ..Settings::default()
         };
