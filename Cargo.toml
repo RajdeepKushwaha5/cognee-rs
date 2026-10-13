@@ -124,7 +124,15 @@ opentelemetry = { version = "=0.31", default-features = false, features = ["trac
 opentelemetry-otlp = { version = "=0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 opentelemetry-semantic-conventions = "=0.31"
 opentelemetry_sdk = { version = "=0.31", default-features = false, features = ["trace", "rt-tokio"] }
-ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
+# PINNED, not a range. `ort` is a pre-release line, so a `2.0.0-rc.11`
+# requirement admits every later rc -- and rc.14 (2026-10-13) shipped a
+# breaking API change together with an MSRV bump to 1.92, which took out
+# both this repo and cognee-cloud-rs: `ort::init().commit()` in
+# crates/embedding/src/onnx.rs no longer compiles (E0599), and the MSRV
+# alone also exceeded the 1.91.1 this workspace pins. rc.13 declares MSRV
+# 1.88 and builds clean. Raise this deliberately, with the call sites
+# updated in the same change.
+ort = { version = "=2.0.0-rc.13", features = ["ndarray"] }
 pbkdf2 = { version = "0.12", default-features = false }
 pdf-extract = "0.10"
 quick-xml = "0.39"
