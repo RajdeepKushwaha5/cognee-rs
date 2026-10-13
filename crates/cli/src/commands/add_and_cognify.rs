@@ -4,7 +4,6 @@ use cognee::add::AddPipeline;
 use cognee::cognify::{ChunkStrategy, CognifyConfig, cognify};
 use cognee::database::{IngestDb, PipelineRunRepository, SeaOrmPipelineRunRepository, ops};
 use cognee::models::DataInput;
-use cognee::ontology::{NoOpOntologyResolver, OntologyResolver, RdfLibOntologyResolver};
 use cognee::{ComponentManager, PipelineContext};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -27,7 +26,6 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         ))
     })?;
     let summarization_model = cm.settings().summarization_model.clone();
-    let settings_ontology_path = cm.settings().ontology_file_path.clone();
 
     match args.chunker {
         ChunkerArg::Text => {}
@@ -39,6 +37,13 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
     }
 
     crate::teardown::run_command(Arc::clone(&cm), async {
+        // `graph_extraction.backend`, resolved before the add: an unregistered
+        // kind must not get the documents ingested by a call that was always
+        // going to fail (nor silently fall back to the LLM extractor).
+        let graph_backend = cm.configured_graph_extractor().await.map_err(|error| {
+            CliError::Runtime(format!("Graph extractor initialization failed: {error}"))
+        })?;
+
         let database = cm
             .database()
             .await
@@ -129,19 +134,13 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let ontology_path = args.ontology_file.as_deref().or({
-            if settings_ontology_path.is_empty() {
-                None
-            } else {
-                Some(settings_ontology_path.as_str())
-            }
-        });
-        let ontology_resolver: Arc<dyn OntologyResolver> = match ontology_path {
-            Some(path) => Arc::new(RdfLibOntologyResolver::new(path).map_err(|error| {
+        // `--ontology-file` overrides `ontology.file_path`; neither means none.
+        let ontology_resolver = cm
+            .ontology_resolver(args.ontology_file.as_deref())
+            .await
+            .map_err(|error| {
                 CliError::Runtime(format!("Ontology initialization failed: {error}"))
-            })?),
-            None => Arc::new(NoOpOntologyResolver::new()),
-        };
+            })?;
 
         let chunk_strategy = match cm.settings().chunk_strategy.to_uppercase().as_str() {
             "RECURSIVE" => ChunkStrategy::Recursive,
@@ -154,6 +153,9 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
             .with_chunk_strategy(chunk_strategy)
             .with_max_parallel_extractions(effective_max_parallel)
             .with_summarization(!summarization_model.is_empty());
+        if let Some(backend) = graph_backend {
+            cognify_config = cognify_config.with_graph_backend(backend);
+        }
         if let Some(transcriber) = cm
             .transcriber()
             .await

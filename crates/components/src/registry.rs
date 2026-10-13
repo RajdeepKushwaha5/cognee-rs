@@ -4,17 +4,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cognee_cognify::graph_backend::ChunkGraphExtractor;
 use cognee_config_core::{ConfigSchema, SchemaError, SectionSchema};
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
 use cognee_llm::{Llm, Transcriber};
+use cognee_ontology::{NoOpOntologyResolver, OntologyResolver};
+use cognee_storage::StorageTrait;
 use cognee_vector::VectorDB;
 
 use crate::builtins::embedding::DefaultEmbeddingFactory;
 use crate::builtins::llm::{self, OpenAiCompatibleLlmFactory};
 use crate::context::BackendBuildContext;
 use crate::error::ComponentError;
-use crate::traits::{EmbeddingFactory, GraphDbFactory, LlmFactory, VectorDbFactory};
+use crate::sections::{OntologyConfig, StorageConfig};
+use crate::traits::{
+    EmbeddingFactory, GraphDbFactory, GraphExtractorFactory, LlmFactory, OntologyResolverFactory,
+    StorageFactory, VectorDbFactory,
+};
 
 /// Maps lowercase provider ids to adapter factories, per component kind.
 ///
@@ -32,6 +39,9 @@ pub struct ComponentRegistry {
     graph: HashMap<String, Arc<dyn GraphDbFactory>>,
     llm: HashMap<String, Arc<dyn LlmFactory>>,
     embedding: HashMap<String, Arc<dyn EmbeddingFactory>>,
+    storage: HashMap<String, Arc<dyn StorageFactory>>,
+    ontology: HashMap<String, Arc<dyn OntologyResolverFactory>>,
+    graph_extractor: HashMap<String, Arc<dyn GraphExtractorFactory>>,
     /// Config sections registered directly (not through a factory).
     config_sections: Vec<&'static SectionSchema>,
 }
@@ -49,6 +59,9 @@ impl ComponentRegistry {
             graph: HashMap::new(),
             llm: HashMap::new(),
             embedding: HashMap::new(),
+            storage: HashMap::new(),
+            ontology: HashMap::new(),
+            graph_extractor: HashMap::new(),
             config_sections: Vec::new(),
         }
     }
@@ -131,6 +144,14 @@ impl ComponentRegistry {
         #[cfg(feature = "bedrock")]
         reg.register_embedding(Arc::new(DefaultEmbeddingFactory::new("bedrock")));
 
+        // ── storage / ontology ────────────────────────────────────────────
+        reg.register_storage(Arc::new(crate::builtins::storage::LocalStorageFactory));
+        reg.register_ontology_resolver(Arc::new(crate::builtins::ontology::RdfLibOntologyFactory));
+
+        // ── graph extraction ──────────────────────────────────────────────
+        // None built in: `llm` is the cognify pipeline's own extractor, and
+        // alternatives (GLiNER, …) come from external crates.
+
         reg
     }
 
@@ -154,6 +175,36 @@ impl ComponentRegistry {
     /// Register (or override) an embedding factory under `f.provider()`.
     pub fn register_embedding(&mut self, f: Arc<dyn EmbeddingFactory>) {
         self.embedding.insert(f.provider().to_lowercase(), f);
+    }
+
+    /// Register (or override) a storage factory under `f.provider()`.
+    pub fn register_storage(&mut self, f: Arc<dyn StorageFactory>) {
+        self.storage.insert(f.provider().to_lowercase(), f);
+    }
+
+    /// Register (or override) an ontology resolver factory under
+    /// `f.provider()`.
+    pub fn register_ontology_resolver(&mut self, f: Arc<dyn OntologyResolverFactory>) {
+        self.ontology.insert(f.provider().to_lowercase(), f);
+    }
+
+    /// Register (or override) a graph-extraction backend under
+    /// `f.provider()`. The kind `llm` is reserved for the built-in extractor.
+    ///
+    /// # Errors
+    /// [`ComponentError::Config`] for the reserved kind `llm`.
+    pub fn register_graph_extractor(
+        &mut self,
+        f: Arc<dyn GraphExtractorFactory>,
+    ) -> Result<(), ComponentError> {
+        let kind = f.provider().to_lowercase();
+        if kind == LLM_GRAPH_EXTRACTOR {
+            return Err(ComponentError::Config(format!(
+                "graph extractor kind `{LLM_GRAPH_EXTRACTOR}` is reserved for the built-in extractor"
+            )));
+        }
+        self.graph_extractor.insert(kind, f);
+        Ok(())
     }
 
     /// Former single-slot setter; now the same as
@@ -191,6 +242,9 @@ impl ComponentRegistry {
             <crate::sections::EmbeddingConfig as cognee_config_core::ConfigSection>::schema(),
             <crate::sections::VectorConfig as cognee_config_core::ConfigSection>::schema(),
             <crate::sections::GraphConfig as cognee_config_core::ConfigSection>::schema(),
+            <crate::sections::StorageConfig as cognee_config_core::ConfigSection>::schema(),
+            <crate::sections::OntologyConfig as cognee_config_core::ConfigSection>::schema(),
+            <crate::sections::GraphExtractionConfig as cognee_config_core::ConfigSection>::schema(),
         ];
         for f in sorted(&self.vector) {
             sections.extend(f.config_sections());
@@ -202,6 +256,15 @@ impl ComponentRegistry {
             sections.extend(f.config_sections());
         }
         for f in sorted(&self.embedding) {
+            sections.extend(f.config_sections());
+        }
+        for f in sorted(&self.storage) {
+            sections.extend(f.config_sections());
+        }
+        for f in sorted(&self.ontology) {
+            sections.extend(f.config_sections());
+        }
+        for f in sorted(&self.graph_extractor) {
             sections.extend(f.config_sections());
         }
         sections.extend(self.config_sections.iter().copied());
@@ -453,7 +516,103 @@ impl ComponentRegistry {
         ids.sort();
         ids
     }
+
+    /// Build the file storage selected by `storage.backend`.
+    pub async fn build_storage(
+        &self,
+        ctx: &BackendBuildContext,
+    ) -> Result<Arc<dyn StorageTrait>, ComponentError> {
+        let backend = ctx.section::<StorageConfig>().backend;
+        let key = backend.trim().to_lowercase();
+        let key = if key.is_empty() {
+            "local".to_string()
+        } else {
+            key
+        };
+        let factory = self.storage.get(&key).ok_or_else(|| {
+            ComponentError::Config(unsupported_msg(
+                "storage_backend",
+                &backend,
+                &self.storage_providers(),
+            ))
+        })?;
+        factory.build(ctx).await
+    }
+
+    /// Provider ids with a registered storage factory (sorted).
+    pub fn storage_providers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.storage.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Build the ontology resolver selected by `ontology.resolver`, loading
+    /// `file_path` (or `ontology.file_path` when `None`). An empty path means
+    /// no ontology: the no-op resolver, whatever the resolver id.
+    pub async fn build_ontology_resolver(
+        &self,
+        ctx: &BackendBuildContext,
+        file_path: Option<&str>,
+    ) -> Result<Arc<dyn OntologyResolver>, ComponentError> {
+        let cfg = ctx.section::<OntologyConfig>();
+        let path = file_path.unwrap_or(&cfg.file_path).trim();
+        if path.is_empty() {
+            return Ok(Arc::new(NoOpOntologyResolver::new()));
+        }
+        let key = cfg.resolver.trim().to_lowercase();
+        let key = if key.is_empty() {
+            "rdflib".to_string()
+        } else {
+            key
+        };
+        let factory = self.ontology.get(&key).ok_or_else(|| {
+            ComponentError::Config(unsupported_msg(
+                "ontology_resolver",
+                &cfg.resolver,
+                &self.ontology_resolvers(),
+            ))
+        })?;
+        factory.build(ctx, path).await
+    }
+
+    /// Resolver ids with a registered ontology factory (sorted).
+    pub fn ontology_resolvers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.ontology.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Whether `kind` names a registered graph-extraction backend (`llm`, the
+    /// built-in extractor, is not one).
+    pub fn has_graph_extractor(&self, kind: &str) -> bool {
+        self.graph_extractor.contains_key(&kind.to_lowercase())
+    }
+
+    /// Build the graph-extraction backend registered under `kind` for one
+    /// cognify run; `spec` is the caller's selection (see
+    /// [`GraphExtractorFactory::build`]). `None` when no backend is
+    /// registered under `kind`.
+    pub async fn build_graph_extractor(
+        &self,
+        ctx: &BackendBuildContext,
+        kind: &str,
+        spec: &serde_json::Value,
+    ) -> Option<Result<Arc<dyn ChunkGraphExtractor>, ComponentError>> {
+        let factory = self.graph_extractor.get(&kind.to_lowercase())?;
+        Some(factory.build(ctx, spec).await)
+    }
+
+    /// Kinds with a registered graph-extraction backend (sorted).
+    pub fn graph_extractor_kinds(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.graph_extractor.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
 }
+
+/// The graph-extraction kind of cognify's own LLM extractor
+/// (`graph_extraction.backend`'s default).
+pub const LLM_GRAPH_EXTRACTOR: &str = "llm";
 
 impl Default for ComponentRegistry {
     fn default() -> Self {
@@ -1203,6 +1362,155 @@ mod tests {
             err.to_string()
                 .contains("unknown embedding provider 'opnai'")
         );
+    }
+
+    // ── storage selection ────────────────────────────────────────────────
+
+    fn storage_ctx(backend: &str, root: &std::path::Path) -> BackendBuildContext {
+        let mut ctx = test_ctx();
+        ctx.data_root_directory = root.to_path_buf();
+        ctx.sections
+            .insert("storage.backend".to_string(), serde_json::json!(backend));
+        ctx
+    }
+
+    // An empty backend is the default `local`, and the id is matched trimmed
+    // and case-insensitively, like every other provider id.
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    async fn build_storage_defaults_to_local_and_matches_case_insensitively() {
+        let reg = ComponentRegistry::with_builtins();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for backend in ["", "   ", "local", " LOCAL "] {
+            let storage = reg
+                .build_storage(&storage_ctx(backend, dir.path()))
+                .await
+                .unwrap_or_else(|e| panic!("backend {backend:?} must build local storage: {e}"));
+            assert!(
+                storage.get_full_path("x").starts_with(dir.path()),
+                "backend {backend:?} must be the local storage under data_root_directory"
+            );
+        }
+    }
+
+    // An unknown backend is a config error naming the key and the registered
+    // ids — never a silent fallback to local storage.
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    async fn build_storage_errors_on_an_unknown_backend() {
+        let reg = ComponentRegistry::with_builtins();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = match reg.build_storage(&storage_ctx("nope", dir.path())).await {
+            Ok(_) => panic!("an unknown storage backend must not build"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(matches!(err, ComponentError::Config(_)), "{err:?}");
+        assert!(msg.contains("storage_backend"), "{msg}");
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(
+            msg.contains("local"),
+            "the registered ids are listed: {msg}"
+        );
+    }
+
+    // ── ontology resolver selection ──────────────────────────────────────
+
+    fn ontology_fixture() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ontology/tests/fixtures/owl_terms.ttl")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn ontology_ctx(resolver: &str, file_path: &str) -> BackendBuildContext {
+        let mut ctx = test_ctx();
+        ctx.sections
+            .insert("ontology.resolver".to_string(), serde_json::json!(resolver));
+        ctx.sections.insert(
+            "ontology.file_path".to_string(),
+            serde_json::json!(file_path),
+        );
+        ctx
+    }
+
+    /// Whether `resolver` actually loaded the fixture: the no-op resolver
+    /// matches nothing, the RDF one knows the fixture's `Person` class.
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    fn knows_person(resolver: &Arc<dyn OntologyResolver>) -> bool {
+        resolver
+            .find_closest_match("Person", "classes")
+            .expect("lookup")
+            .is_some()
+    }
+
+    // No path means no ontology — the no-op resolver — whatever the resolver
+    // id says, because the short-circuit precedes the resolver lookup.
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    async fn build_ontology_resolver_without_a_path_is_the_noop_resolver() {
+        let reg = ComponentRegistry::with_builtins();
+        for (resolver, path) in [("rdflib", ""), ("bogus", ""), ("rdflib", "   ")] {
+            let built = reg
+                .build_ontology_resolver(&ontology_ctx(resolver, path), None)
+                .await
+                .unwrap_or_else(|e| panic!("{resolver:?}/{path:?} must be the no-op: {e}"));
+            assert!(!knows_person(&built), "{resolver:?}/{path:?}");
+        }
+    }
+
+    // A configured path loads through the resolver id, matched trimmed and
+    // case-insensitively.
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    async fn build_ontology_resolver_loads_the_configured_path() {
+        let reg = ComponentRegistry::with_builtins();
+        for resolver in ["rdflib", " RDFLIB ", ""] {
+            let built = reg
+                .build_ontology_resolver(&ontology_ctx(resolver, &ontology_fixture()), None)
+                .await
+                .unwrap_or_else(|e| panic!("resolver {resolver:?} must load: {e}"));
+            assert!(knows_person(&built), "resolver {resolver:?}");
+        }
+    }
+
+    // An unknown resolver id with a path is a config error naming the key.
+    #[tokio::test]
+    async fn build_ontology_resolver_errors_on_an_unknown_resolver() {
+        let reg = ComponentRegistry::with_builtins();
+        let err = match reg
+            .build_ontology_resolver(&ontology_ctx("bogus", &ontology_fixture()), None)
+            .await
+        {
+            Ok(_) => panic!("an unknown resolver id must not build"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(matches!(err, ComponentError::Config(_)), "{err:?}");
+        assert!(msg.contains("ontology_resolver"), "{msg}");
+        assert!(msg.contains("bogus"), "{msg}");
+    }
+
+    // The per-call path (the CLI's `--ontology-file`) overrides
+    // `ontology.file_path` both ways: a path loads with nothing configured,
+    // and an empty one turns a configured ontology off.
+    #[tokio::test]
+    #[allow(clippy::expect_used, reason = "test module: fail loudly")]
+    async fn build_ontology_resolver_per_call_path_overrides_the_configured_one() {
+        let reg = ComponentRegistry::with_builtins();
+        let fixture = ontology_fixture();
+
+        let built = reg
+            .build_ontology_resolver(&ontology_ctx("rdflib", ""), Some(&fixture))
+            .await
+            .expect("the per-call path loads");
+        assert!(knows_person(&built));
+
+        let built = reg
+            .build_ontology_resolver(&ontology_ctx("rdflib", &fixture), Some(""))
+            .await
+            .expect("an empty per-call path is the no-op");
+        assert!(!knows_person(&built));
     }
 
     fn test_ctx() -> BackendBuildContext {
