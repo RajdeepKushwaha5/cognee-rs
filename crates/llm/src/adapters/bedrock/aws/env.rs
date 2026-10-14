@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use cognee_config_core::Redacted;
+
 /// `aws_access_key_id`.
 pub const ENV_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
 /// `aws_secret_access_key`.
@@ -150,45 +152,69 @@ pub struct AwsSettings {
 /// be a secret-leak waiting to happen.
 impl fmt::Debug for AwsInputs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            profile_name,
+            role_name,
+            session_name,
+            web_identity_token,
+            sts_endpoint,
+            external_id,
+            bedrock_runtime_endpoint,
+            bearer_token,
+        } = self;
         f.debug_struct("AwsInputs")
-            .field("region", &self.region)
-            .field("access_key_id", &shown(&self.access_key_id))
-            .field("secret_access_key", &shown(&self.secret_access_key))
-            .field("session_token", &shown(&self.session_token))
-            .field("profile_name", &self.profile_name)
-            .field("role_name", &self.role_name)
-            .field("session_name", &self.session_name)
-            .field("web_identity_token", &shown(&self.web_identity_token))
-            .field("sts_endpoint", &self.sts_endpoint)
-            .field("external_id", &self.external_id)
-            .field("bedrock_runtime_endpoint", &self.bedrock_runtime_endpoint)
-            .field("bearer_token", &shown(&self.bearer_token))
+            .field("region", region)
+            .field("access_key_id", &Redacted(access_key_id))
+            .field("secret_access_key", &Redacted(secret_access_key))
+            .field("session_token", &Redacted(session_token))
+            .field("profile_name", profile_name)
+            .field("role_name", role_name)
+            .field("session_name", session_name)
+            .field("web_identity_token", &Redacted(web_identity_token))
+            .field("sts_endpoint", sts_endpoint)
+            .field("external_id", external_id)
+            .field("bedrock_runtime_endpoint", bedrock_runtime_endpoint)
+            .field("bearer_token", &Redacted(bearer_token))
             .finish()
     }
-}
-
-/// `"set"` / `"unset"`, so a secret's presence can be debugged without the
-/// secret itself reaching a log line.
-fn shown(value: &Option<String>) -> &'static str {
-    if value.is_some() { "set" } else { "unset" }
 }
 
 /// Hand-written so credentials never reach a log line through `{:?}`.
 impl fmt::Debug for AwsSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            profile_name,
+            role_name,
+            session_name,
+            web_identity_token,
+            sts_endpoint,
+            external_id,
+            bedrock_runtime_endpoint,
+            bedrock_bearer_token,
+        } = self;
         f.debug_struct("AwsSettings")
-            .field("region", &self.region)
-            .field("access_key_id", &shown(&self.access_key_id))
-            .field("secret_access_key", &shown(&self.secret_access_key))
-            .field("session_token", &shown(&self.session_token))
-            .field("profile_name", &self.profile_name)
-            .field("role_name", &self.role_name)
-            .field("session_name", &self.session_name)
-            .field("web_identity_token", &shown(&self.web_identity_token))
-            .field("sts_endpoint", &self.sts_endpoint)
-            .field("external_id", &self.external_id)
-            .field("bedrock_runtime_endpoint", &self.bedrock_runtime_endpoint)
-            .field("bedrock_bearer_token", &shown(&self.bedrock_bearer_token))
+            .field("region", region)
+            .field("access_key_id", &Redacted(access_key_id))
+            .field("secret_access_key", &Redacted(secret_access_key))
+            .field("session_token", &Redacted(session_token))
+            .field("profile_name", profile_name)
+            .field("role_name", role_name)
+            .field("session_name", session_name)
+            .field("web_identity_token", &Redacted(web_identity_token))
+            .field("sts_endpoint", sts_endpoint)
+            .field("external_id", external_id)
+            .field("bedrock_runtime_endpoint", bedrock_runtime_endpoint)
+            .field("bedrock_bearer_token", &Redacted(bedrock_bearer_token))
             .finish()
     }
 }
@@ -404,7 +430,7 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
         }
-        assert!(rendered.contains("secret_access_key: \"set\""));
+        assert!(rendered.contains("secret_access_key: ***REDACTED***"));
         assert!(
             rendered.contains("profile_name: Some(\"dev\")"),
             "non-secret fields stay readable: {rendered}"
@@ -425,6 +451,6 @@ mod tests {
         assert!(!rendered.contains("super-secret"));
         assert!(!rendered.contains("bearer-secret"));
         assert!(!rendered.contains("jwt-secret"));
-        assert!(rendered.contains("secret_access_key: \"set\""));
+        assert!(rendered.contains("secret_access_key: ***REDACTED***"));
     }
 }

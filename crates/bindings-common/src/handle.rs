@@ -154,6 +154,16 @@ impl HandleState {
         self
     }
 
+    /// Declare that the embedding application provides backend access
+    /// control (attaches its own `AclDb`), so `enable_access_control = true`
+    /// / `ENABLE_BACKEND_ACCESS_CONTROL=true` is accepted instead of failing
+    /// the first operation (builder). See
+    /// `ConfigManager::set_application_access_control`.
+    pub fn with_application_access_control(self) -> Self {
+        self.cm.config().set_application_access_control(true);
+        self
+    }
+
     /// The configured default-user bootstrap hook, if any.
     pub(crate) fn default_user_bootstrap(&self) -> Option<&Arc<dyn DefaultUserBootstrap>> {
         self.bootstrap.as_ref()
@@ -174,10 +184,10 @@ impl HandleState {
         // Strict mode: a key in the loaded configuration that no registered
         // component owns fails here, the first fallible step after the handle
         // learned its full schema.
-        self.cm
-            .config()
-            .check_strict()
-            .map_err(|e| SdkError::Validation(e.to_string()))?;
+        self.cm.config().check_strict().map_err(|e| match e {
+            cognee::config::ConfigError::Unsupported { .. } => SdkError::Unsupported(e.to_string()),
+            other => SdkError::Validation(other.to_string()),
+        })?;
         let current_ver = self.cm.config().version();
 
         // Fast path: cache hit at the current version.

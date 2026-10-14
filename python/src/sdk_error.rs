@@ -62,6 +62,7 @@ pub fn config_error_to_py(e: ConfigError) -> PyErr {
     match e {
         ConfigError::UnknownKey(_) => CogneeUnknownConfigKeyError::new_err(msg),
         ConfigError::TypeMismatch { .. } => CogneeConfigTypeMismatchError::new_err(msg),
+        ConfigError::Unsupported { .. } => CogneeUnsupportedError::new_err(msg),
     }
 }
 

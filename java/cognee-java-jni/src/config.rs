@@ -18,6 +18,7 @@ fn throw_config_error(env: &mut JNIEnv, err: ConfigError) {
     let code = match err {
         ConfigError::UnknownKey(_) => "UNKNOWN_CONFIG_KEY",
         ConfigError::TypeMismatch { .. } => "CONFIG_TYPE_MISMATCH",
+        ConfigError::Unsupported { .. } => "UNSUPPORTED",
     };
     throw_cognee_exception(env, code, &err.to_string());
 }

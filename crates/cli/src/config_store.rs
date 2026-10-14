@@ -276,7 +276,7 @@ fn reject_unpersisted(key: &str) -> Result<(), CliError> {
 
 fn cli_error(error: ConfigError) -> CliError {
     match error {
-        ConfigError::TypeMismatch { key, reason } => {
+        ConfigError::TypeMismatch { key, reason } | ConfigError::Unsupported { key, reason } => {
             CliError::Validation(format!("Config key '{key}': {reason}"))
         }
         ConfigError::UnknownKey(key) => CliError::Validation(format!(

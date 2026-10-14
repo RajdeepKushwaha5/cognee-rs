@@ -12,7 +12,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use cognee_config_core::{ConfigSection, ConfigValues};
+use cognee_config_core::{ConfigSection, ConfigValues, Redacted};
 use cognee_embedding::MockVectorMode;
 use cognee_llm::StructuredOutputMode;
 
@@ -357,19 +357,34 @@ pub struct AwsInputs {
 /// `cognee_llm::adapters::bedrock::aws::env::AwsInputs`.
 impl fmt::Debug for AwsInputs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            profile_name,
+            role_name,
+            session_name,
+            web_identity_token,
+            sts_endpoint,
+            external_id,
+            bedrock_runtime_endpoint,
+            bearer_token,
+        } = self;
         f.debug_struct("AwsInputs")
-            .field("region", &self.region)
-            .field("access_key_id", &shown(&self.access_key_id))
-            .field("secret_access_key", &shown(&self.secret_access_key))
-            .field("session_token", &shown(&self.session_token))
-            .field("profile_name", &self.profile_name)
-            .field("role_name", &self.role_name)
-            .field("session_name", &self.session_name)
-            .field("web_identity_token", &shown(&self.web_identity_token))
-            .field("sts_endpoint", &self.sts_endpoint)
-            .field("external_id", &self.external_id)
-            .field("bedrock_runtime_endpoint", &self.bedrock_runtime_endpoint)
-            .field("bearer_token", &shown(&self.bearer_token))
+            .field("region", region)
+            .field("access_key_id", &Redacted(access_key_id))
+            .field("secret_access_key", &Redacted(secret_access_key))
+            .field("session_token", &Redacted(session_token))
+            .field("profile_name", profile_name)
+            .field("role_name", role_name)
+            .field("session_name", session_name)
+            .field("web_identity_token", &Redacted(web_identity_token))
+            .field("sts_endpoint", sts_endpoint)
+            .field("external_id", external_id)
+            .field("bedrock_runtime_endpoint", bedrock_runtime_endpoint)
+            .field("bearer_token", &Redacted(bearer_token))
             .finish()
     }
 }
@@ -415,12 +430,6 @@ impl From<&AwsInputs> for cognee_llm::adapters::bedrock::aws::env::AwsInputs {
             bearer_token: bearer_token.clone(),
         }
     }
-}
-
-/// `"set"` / `"unset"`, so a secret's presence can be debugged without the
-/// secret itself reaching a log line.
-fn shown(value: &Option<String>) -> &'static str {
-    if value.is_some() { "set" } else { "unset" }
 }
 
 /// Parse the `LLM_REASONING` knob into a reasoning-detection override for
@@ -804,7 +813,7 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
         }
-        assert!(rendered.contains("secret_access_key: \"set\""));
+        assert!(rendered.contains("secret_access_key: ***REDACTED***"));
         assert!(
             rendered.contains("profile_name: Some(\"dev\")"),
             "non-secret fields stay readable: {rendered}"

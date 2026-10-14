@@ -14,7 +14,7 @@
 //! Setters are synchronous (config mutation is cheap, in-memory). The granular
 //! setters are infallible (`-> void`); the generic `set` and the bulk setters
 //! are fallible and **throw** the mapped [`ConfigError`]
-//! (`UnknownKey` / `TypeMismatch`) as a JS `Error` with a `code` field.
+//! (`UnknownKey` / `TypeMismatch` / `Unsupported` → `UNSUPPORTED`) as a JS `Error` with a `code` field.
 
 use std::collections::HashMap;
 
@@ -50,6 +50,7 @@ fn throw_config_error<'cx, T>(cx: &mut FunctionContext<'cx>, err: ConfigError) -
     let code = match err {
         ConfigError::UnknownKey(_) => "UNKNOWN_CONFIG_KEY",
         ConfigError::TypeMismatch { .. } => "CONFIG_TYPE_MISMATCH",
+        ConfigError::Unsupported { .. } => "UNSUPPORTED",
     };
     let msg = err.to_string();
     let js_err = cx.error(msg)?;

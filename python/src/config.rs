@@ -8,8 +8,9 @@
 //!
 //! `ConfigError::UnknownKey`   → `CogneeUnknownConfigKeyError`
 //! `ConfigError::TypeMismatch` → `CogneeConfigTypeMismatchError`
+//! `ConfigError::Unsupported`  → `CogneeUnsupportedError`
 //!
-//! Both exception classes are defined and registered in `sdk_error.rs`.
+//! The exception classes are defined and registered in `sdk_error.rs`.
 
 use std::sync::Arc;
 

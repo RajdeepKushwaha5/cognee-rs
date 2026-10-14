@@ -29,7 +29,7 @@ pub const SECRET_FIELDS: &[&str] = &[
     "otel_exporter_otlp_headers",
 ];
 
-const REDACTED: &str = "***REDACTED***";
+use cognee::config::REDACTED;
 
 /// The configuration a binding's `get()` returns: every `Settings` field and
 /// every setting of every known component section (canonical key, current or
@@ -46,14 +46,13 @@ pub fn config_snapshot(config: &cognee::config::ConfigManager) -> serde_json::Va
     value
 }
 
-/// Mask the non-null values of `keys` in a JSON object, in place.
+/// Mask the values of `keys` that are set (`cognee::config::secret_is_set`:
+/// not `null`, not `""`) in a JSON object, in place.
 fn redact_keys(value: &mut serde_json::Value, keys: &[&str]) {
     if let Some(obj) = value.as_object_mut() {
         for key in keys {
-            if let Some(v) = obj.get_mut(*key)
-                && !v.is_null()
-            {
-                *v = serde_json::Value::String(REDACTED.to_string());
+            if let Some(v) = obj.get_mut(*key) {
+                *v = cognee::config::mask_secret(std::mem::take(v), REDACTED);
             }
         }
     }
@@ -79,9 +78,10 @@ pub fn config_key_aliases(
 
 /// Redact secret values in a config JSON object in place.
 ///
-/// Every key in [`SECRET_FIELDS`] whose value is non-null is replaced with
-/// `"***REDACTED***"`. Null values are left null so the caller can distinguish
-/// "key exists but is unset" from "key was set to something".
+/// Every key in [`SECRET_FIELDS`] whose value is set (not `null`, not `""`)
+/// is replaced with `"***REDACTED***"`. Unset values are left as they are so
+/// the caller can distinguish "key exists but is unset" from "key was set to
+/// something".
 ///
 /// The function recurses into nested JSON objects so that both flat configs
 /// (`{"llm_api_key": "sk-…"}`) and structured sub-configs
@@ -213,6 +213,20 @@ mod tests {
             assert_eq!(value[*key], json!(REDACTED), "{key} leaked");
         }
         assert!(!value.to_string().contains("hunter2"));
+    }
+
+    /// An unset secret (`""`, or `null`) is shown as itself, not as the
+    /// marker: its emptiness reveals nothing, and the marker would claim it is
+    /// set.
+    #[test]
+    fn unset_secrets_are_shown_as_unset() {
+        let cm = cognee::config::ConfigManager::new(cognee::config::Settings::default());
+        let value = config_snapshot(&cm);
+        assert_eq!(value["default_user_password"], json!(""));
+        assert_eq!(value["llm.api_key"], json!(""));
+        let mut legacy = json!({ "llm_api_key": "", "db_password": null });
+        redact_config_json(&mut legacy);
+        assert_eq!(legacy, json!({ "llm_api_key": "", "db_password": null }));
     }
 
     cognee_config_core::config_section! {

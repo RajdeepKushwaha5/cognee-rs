@@ -82,7 +82,12 @@ pub(crate) const DEFAULT_TRACES_SAMPLER_ARG: &str = "";
 /// language bindings, an HTTP server) drive [`crate::init_telemetry`]:
 /// defaults, overlaid with the environment ([`EnvSettingsView::from_env`]),
 /// overlaid with explicit values from code ([`EnvSettingsView::set`]).
-#[derive(Debug, Clone)]
+///
+/// Its `Debug` never prints the OTLP headers (they usually carry an
+/// `authorization` token): they show as
+/// [`REDACTED`](cognee_config_core::REDACTED), as `otel_exporter_otlp_headers`
+/// does in `cognee::Settings`.
+#[derive(Clone)]
 pub struct EnvSettingsView {
     tracing_enabled: bool,
     service_name: String,
@@ -93,6 +98,24 @@ pub struct EnvSettingsView {
     traces_sampler: String,
     traces_sampler_arg: String,
     deployment_environment: String,
+}
+
+// Hand-written so the OTLP headers (a credential) never reach a log line.
+impl std::fmt::Debug for EnvSettingsView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use cognee_config_core::{CredentialSafe, Redacted};
+        f.debug_struct("EnvSettingsView")
+            .field("tracing_enabled", &self.tracing_enabled)
+            .field("service_name", &self.service_name)
+            .field("otlp_endpoint", &CredentialSafe(&self.otlp_endpoint))
+            .field("otlp_headers", &Redacted(&self.otlp_headers))
+            .field("otlp_protocol", &self.otlp_protocol)
+            .field("span_processor", &self.span_processor)
+            .field("traces_sampler", &self.traces_sampler)
+            .field("traces_sampler_arg", &self.traces_sampler_arg)
+            .field("deployment_environment", &self.deployment_environment)
+            .finish()
+    }
 }
 
 impl Default for EnvSettingsView {
@@ -337,6 +360,28 @@ mod tests {
         assert_eq!(view.traces_sampler_arg(), "0.5");
 
         clear_otel_env();
+    }
+
+    /// `{:?}` of the view masks the OTLP headers (a bearer token) and the
+    /// password of a credential-bearing endpoint.
+    #[test]
+    fn debug_redacts_otlp_headers() {
+        let env = cognee_config_core::MapEnv::new()
+            .with(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "authorization=Bearer tok-secret",
+            )
+            .with(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://u:pw-endpoint@otel:4317",
+            );
+        let view = EnvSettingsView::from_env_source(&env);
+        for out in [format!("{view:?}"), format!("{view:#?}")] {
+            assert!(!out.contains("tok-secret"), "{out}");
+            assert!(!out.contains("pw-endpoint"), "{out}");
+            assert!(out.contains(cognee_config_core::REDACTED), "{out}");
+            assert!(out.contains("otel:4317"), "{out}");
+        }
     }
 
     /// `from_env_source` reads only the source it is given, so it needs no

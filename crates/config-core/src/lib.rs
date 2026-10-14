@@ -26,10 +26,14 @@
 
 use std::collections::BTreeMap;
 
+pub mod redact;
 pub mod section;
+pub use redact::{
+    CredentialSafe, REDACTED, Redacted, mask_secret, redact_credentials, secret_is_set,
+};
 pub use section::{
     ConfigSchema, ConfigSection, ConfigValue, ConfigValues, KeyDef, KeyError, LenientReport,
-    SchemaError, SectionSchema, StrictBool, unknown_key,
+    SchemaError, SectionFieldDebug, SectionSchema, StrictBool, unknown_key,
 };
 
 /// Read-only view over an environment.

@@ -201,6 +201,23 @@ impl<T: ConfigValue> ConfigValue for Option<T> {
     }
 }
 
+/// The `Debug` of one [`config_section!`](crate::config_section) field:
+/// [`Redacted`](crate::Redacted) when it is a secret, otherwise its own `Debug`
+/// with any embedded credential (a URL password, `password=…`) masked by
+/// [`CredentialSafe`](crate::CredentialSafe).
+#[doc(hidden)]
+pub struct SectionFieldDebug<'a, T>(pub &'a T, pub bool);
+
+impl<T: ConfigValue + std::fmt::Debug> std::fmt::Debug for SectionFieldDebug<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.1 {
+            std::fmt::Debug::fmt(&crate::Redacted(self.0), f)
+        } else {
+            std::fmt::Debug::fmt(&crate::CredentialSafe(self.0), f)
+        }
+    }
+}
+
 /// One setting of a section.
 #[derive(Debug)]
 pub struct KeyDef {
@@ -560,16 +577,15 @@ impl ConfigSchema {
 
     /// Every registered setting with its current value (from `values`, else
     /// its default), keyed canonically. With `mask = Some(marker)`, every
-    /// non-null secret value (an empty one too, so its presence leaks
-    /// nothing) is replaced by `marker`.
+    /// secret that is set ([`secret_is_set`](crate::secret_is_set): not null
+    /// and not `""`) is replaced by `marker`; an unset one keeps its `null` or
+    /// `""`.
     pub fn snapshot(&self, values: &ConfigValues, mask: Option<&str>) -> ConfigValues {
         self.key_defs()
             .map(|def| {
                 let value = values.get(def.key).cloned().unwrap_or_else(def.default);
                 let shown = match mask {
-                    Some(marker) if def.secret && !value.is_null() => {
-                        Value::String(marker.to_string())
-                    }
+                    Some(marker) if def.secret => crate::mask_secret(value, marker),
                     _ => value,
                 };
                 (def.key.to_string(), shown)
@@ -610,7 +626,15 @@ impl ConfigSchema {
 /// Each field becomes the setting `"<section>.<field>"`, bound to `env` (in
 /// priority order) and reachable under each `alias` (use the Python SDK's flat
 /// name where there is one). The field type must implement
-/// [`ConfigValue`](crate::ConfigValue).
+/// [`ConfigValue`](crate::ConfigValue) and `Debug`.
+///
+/// The struct derives `Clone` and `PartialEq` and gets a hand-written `Debug`
+/// that never prints a `secret: true` field: such a field shows as the
+/// [`REDACTED`](crate::REDACTED) marker when set and as its own unset value
+/// (`None`, `""`) otherwise (see [`Redacted`](crate::Redacted)). Every other
+/// field prints its own `Debug` with embedded credentials masked (see
+/// [`redact_credentials`](crate::redact_credentials)), so a connection URL
+/// such as `postgres://user:pw@host/db` shows without its password.
 #[macro_export]
 macro_rules! config_section {
     (
@@ -627,12 +651,26 @@ macro_rules! config_section {
         }
     ) => {
         $(#[doc = $sdoc])*
-        #[derive(Debug, Clone, PartialEq)]
+        #[derive(Clone, PartialEq)]
         $vis struct $name {
             $(
                 $(#[doc = $doc])*
                 $fvis $field: $ty,
             )*
+        }
+
+        // Hand-written so a secret field never reaches a log line.
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.debug_struct(stringify!($name))
+                    $(
+                        .field(
+                            stringify!($field),
+                            &$crate::SectionFieldDebug(&self.$field, $secret),
+                        )
+                    )*
+                    .finish()
+            }
         }
 
         impl ::core::default::Default for $name {
@@ -730,6 +768,69 @@ mod tests {
         let mut schema = ConfigSchema::new();
         schema.add(Demo::schema()).unwrap();
         schema
+    }
+
+    /// `{:?}` of a section never prints a secret: a set secret shows as the
+    /// marker, an unset one as `None`, and non-secret fields as usual.
+    #[test]
+    fn section_debug_redacts_secrets() {
+        let demo = Demo {
+            size: 9,
+            token: Some("sk-super-secret-value".to_string()),
+            flag: true,
+        };
+        for out in [format!("{demo:?}"), format!("{demo:#?}")] {
+            assert!(!out.contains("sk-super-secret-value"), "{out}");
+            assert!(out.contains(crate::REDACTED), "{out}");
+            assert!(out.contains("size: 9"), "{out}");
+            assert!(out.contains("flag: true"), "{out}");
+        }
+        assert_eq!(
+            format!("{demo:?}"),
+            "Demo { size: 9, token: ***REDACTED***, flag: true }"
+        );
+        assert_eq!(
+            format!("{:?}", Demo::default()),
+            "Demo { size: 7, token: None, flag: false }"
+        );
+        // An empty secret is unset: it shows as itself, not as the marker.
+        let empty = Demo {
+            token: Some(String::new()),
+            ..Demo::default()
+        };
+        assert_eq!(
+            format!("{empty:?}"),
+            "Demo { size: 7, token: Some(\"\"), flag: false }"
+        );
+    }
+
+    crate::config_section! {
+        /// A connection section.
+        pub struct Conn in "conn" {
+            /// Connection URL; not a secret, but may embed one.
+            pub url: String = String::new() => { env: [], alias: [], secret: false },
+            /// Password.
+            pub password: String = String::new() => { env: [], alias: [], secret: true },
+        }
+    }
+
+    /// A non-secret field that embeds a credential (a connection URL) shows
+    /// without it; an unset string secret shows as `""`.
+    #[test]
+    fn section_debug_masks_credentials_in_urls() {
+        let conn = Conn {
+            url: "postgres://cognee:hunter2@db:5432/cognee?sslpassword=pw2".to_string(),
+            password: String::new(),
+        };
+        for out in [format!("{conn:?}"), format!("{conn:#?}")] {
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(!out.contains("pw2"), "{out}");
+            assert!(
+                out.contains("postgres://cognee:***REDACTED***@db:5432/cognee"),
+                "{out}"
+            );
+        }
+        assert!(format!("{conn:?}").contains("password: \"\""));
     }
 
     #[test]

@@ -253,6 +253,29 @@ macro_rules! row {
 
 use kind::{as_bool, as_string};
 
+/// The setting key of backend access control.
+pub(super) const ACCESS_CONTROL_KEY: &str = "enable_access_control";
+/// Its env var, the Python SDK's name.
+const ACCESS_CONTROL_ENV: &[&str] = &["ENABLE_BACKEND_ACCESS_CONTROL"];
+
+/// Why `enable_access_control = true` is refused when the application has not
+/// declared that it provides access control.
+const ACCESS_CONTROL_NOT_PROVIDED: &str = "cognee-rs does not enforce backend access \
+     control from configuration: it applies only when the embedding application supplies \
+     an AclDb (SearchBuilder/SearchOrchestrator::with_acl_db, the ingestion builder's \
+     with_acl_db, DatasetManager::with_acl), and this application has not declared that \
+     it does (ConfigManager::set_application_access_control). Unset \
+     ENABLE_BACKEND_ACCESS_CONTROL / enable_access_control or set it to false";
+
+/// The error for `enable_access_control = true` without an application that
+/// provides access control.
+pub(super) fn access_control_not_provided() -> ConfigError {
+    ConfigError::Unsupported {
+        key: ACCESS_CONTROL_KEY.to_string(),
+        reason: ACCESS_CONTROL_NOT_PROVIDED.to_string(),
+    }
+}
+
 /// The registry. Field order follows `Settings`.
 static KEYS: &[KeySpec] = &[
     // -- System paths, users & datasets -------------------------------------
@@ -331,7 +354,33 @@ static KEYS: &[KeySpec] = &[
     // -- Authentication / ACL -----------------------------------------------
     row!(default_user_email: str, env ["DEFAULT_USER_EMAIL"]),
     row!(default_user_password: str secret, env ["DEFAULT_USER_PASSWORD"]),
-    row!(enable_access_control: bool, env ["ENABLE_BACKEND_ACCESS_CONTROL"]),
+    // Reserved: cognee-rs itself never acts on it. It stays a known setting so
+    // the Python SDK's env var is not an unknown key (Python-parity configs
+    // carry `ENABLE_BACKEND_ACCESS_CONTROL=false`), but `true` is accepted only
+    // when the application declares that it provides access control
+    // (`ConfigManager::set_application_access_control`). This row's plain
+    // `set` cannot know that, so it refuses `true`; `ConfigManager::set` lets
+    // it through for such an application. A `true` from env or a loaded
+    // config is stored, and `ConfigManager::check_supported` reports it.
+    KeySpec {
+        key: ACCESS_CONTROL_KEY,
+        key_aliases: &[],
+        env: ACCESS_CONTROL_ENV,
+        secret: false,
+        persisted: true,
+        overlay: |s, env| {
+            kind::overlay_bool(&mut s.enable_access_control, env, ACCESS_CONTROL_ENV);
+        },
+        set: |s, key, v| {
+            if as_bool(key, &v)? {
+                return Err(access_control_not_provided());
+            }
+            s.enable_access_control = false;
+            Ok(())
+        },
+        get: |s| Value::Bool(s.enable_access_control),
+        reset: |s, d| s.enable_access_control = d.enable_access_control,
+    },
     // -- Logging ------------------------------------------------------------
     row!(log_level: str, env ["LOG_LEVEL"]),
     // -- Observability ------------------------------------------------------
@@ -387,6 +436,10 @@ static KEYS: &[KeySpec] = &[
     },
 ];
 
+/// [`builtin_schema`], once something has built it. `Settings`' `Debug` reads
+/// it with `get()`, so formatting never builds the component registry.
+static BUILTIN_SCHEMA: OnceLock<ConfigSchema> = OnceLock::new();
+
 /// The configuration schema of a default build: the `Settings` keys and env
 /// vars reserved, plus the sections of every factory
 /// `ComponentRegistry::with_builtins()` registers for the enabled features.
@@ -395,8 +448,7 @@ static KEYS: &[KeySpec] = &[
 /// with [`ConfigManager::extend_schema`](super::ConfigManager::extend_schema)
 /// (which `ComponentManager::with_registry` does).
 pub fn builtin_schema() -> &'static ConfigSchema {
-    static SCHEMA: OnceLock<ConfigSchema> = OnceLock::new();
-    SCHEMA.get_or_init(|| {
+    BUILTIN_SCHEMA.get_or_init(|| {
         let mut schema = core_schema();
         let builtins = cognee_components::ComponentRegistry::with_builtins()
             .config_schema()
@@ -455,6 +507,25 @@ impl Settings {
         cognee_config_core::unknown_key(key, self.strict_config).map_err(ConfigError::from)
     }
 
+    /// Fail if a setting holds a value cognee-rust accepts as a key but does
+    /// not support. Today that is `enable_access_control = true`
+    /// (`ENABLE_BACKEND_ACCESS_CONTROL`) when `application_access_control` is
+    /// `false`: cognee-rs applies dataset ACLs only through an `AclDb` the
+    /// embedding application attaches, so a configuration asking for access
+    /// control is an error unless the application declares that it provides
+    /// it. `false` (the default) is always accepted.
+    ///
+    /// [`ConfigManager::check_supported`](super::ConfigManager::check_supported)
+    /// calls this with the manager's
+    /// [`application_access_control`](super::ConfigManager::application_access_control)
+    /// switch.
+    pub fn check_supported(&self, application_access_control: bool) -> Result<(), ConfigError> {
+        if self.enable_access_control && !application_access_control {
+            return Err(access_control_not_provided());
+        }
+        Ok(())
+    }
+
     /// The current value of setting `key` (or an alias) as JSON, unmasked.
     /// `None` for an unknown key.
     pub fn get_key(&self, key: &str) -> Option<Value> {
@@ -502,6 +573,74 @@ impl Settings {
             (spec.overlay)(self, env);
         }
         schema.overlay_env(&mut self.sections, env);
+    }
+}
+
+/// One value of [`Settings`]' `Debug` output, as compact JSON: a secret by
+/// [`mask_secret`](cognee_config_core::mask_secret) (the marker when set,
+/// itself when `null` or `""`), any other value with embedded credentials
+/// masked by [`redact_credentials`](cognee_config_core::redact_credentials).
+struct ShownValue<'a> {
+    value: &'a Value,
+    secret: bool,
+}
+
+impl std::fmt::Debug for ShownValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.secret && cognee_config_core::secret_is_set(self.value) {
+            return f.write_str(cognee_config_core::REDACTED);
+        }
+        let json = self.value.to_string();
+        f.write_str(&cognee_config_core::redact_credentials(&json))
+    }
+}
+
+/// The `sections` map of [`Settings`]' `Debug` output, secrets masked.
+struct ShownSections<'a>(&'a cognee_config_core::ConfigValues);
+
+impl std::fmt::Debug for ShownSections<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only an already built schema: building it here would construct the
+        // component registry inside a formatter.
+        let schema = BUILTIN_SCHEMA.get();
+        let mut map = f.debug_map();
+        for (key, value) in self.0 {
+            // A key of a built-in section (or an alias of one) is masked by its
+            // `secret` flag. A key no built-in section owns (a custom
+            // registry's, a stale one, or any key before the built-in schema
+            // exists) may be a credential: a string is masked unless empty.
+            let secret = match schema.and_then(|schema| schema.key_def(key)) {
+                Some(def) => def.secret,
+                None => value.is_string(),
+            };
+            map.entry(&key, &ShownValue { value, secret });
+        }
+        map.finish()
+    }
+}
+
+/// Never prints a credential, and has no side effects: every setting is shown
+/// as JSON; a setting marked `secret` (a registry row, or a built-in section
+/// key) shows as [`REDACTED`](cognee_config_core::REDACTED) when set and as its
+/// `null` / `""` otherwise; any other value has embedded credentials (a URL
+/// password, `password=…`) masked. A `sections` entry no built-in section owns
+/// is masked when it is a non-empty string, since only the registry that owns
+/// it knows whether it is a secret.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("Settings");
+        for spec in KEYS {
+            let value = (spec.get)(self);
+            out.field(
+                spec.key,
+                &ShownValue {
+                    value: &value,
+                    secret: spec.secret,
+                },
+            );
+        }
+        out.field("sections", &ShownSections(&self.sections));
+        out.finish()
     }
 }
 
@@ -571,6 +710,212 @@ mod tests {
             .config_schema()
             .unwrap();
         schema.merge(&builtins).unwrap();
+    }
+
+    fn assert_access_control_rejected(result: Result<(), ConfigError>) {
+        match result {
+            Err(ConfigError::Unsupported { key, reason }) => {
+                assert_eq!(key, "enable_access_control");
+                assert!(reason.contains("AclDb"), "{reason}");
+                assert!(
+                    reason.contains("set_application_access_control"),
+                    "{reason}"
+                );
+                assert!(reason.contains("ENABLE_BACKEND_ACCESS_CONTROL"), "{reason}");
+            }
+            other => panic!("expected the access-control rejection, got {other:?}"),
+        }
+    }
+
+    fn env_settings(raw: &str) -> Settings {
+        let mut s = Settings::default();
+        s.overlay_from(&crate::config::MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+        s
+    }
+
+    /// `ENABLE_BACKEND_ACCESS_CONTROL=true` is an error at first use, without
+    /// `strict_config`; `false` and unset are accepted.
+    #[test]
+    fn access_control_from_env_true_is_rejected() {
+        use crate::config::ConfigManager;
+        for raw in ["true", "1", "yes", "ON"] {
+            let s = env_settings(raw);
+            assert!(!s.strict_config);
+            assert_access_control_rejected(s.check_supported(false));
+            let cm = ConfigManager::new(s);
+            assert_access_control_rejected(cm.check_supported());
+            assert_access_control_rejected(cm.check_strict());
+        }
+        for raw in ["false", "0", "no", ""] {
+            let s = env_settings(raw);
+            assert!(!s.enable_access_control, "{raw:?}");
+            ConfigManager::new(s).check_strict().unwrap();
+        }
+    }
+
+    /// `set` / `set_key` refuse `true` at once and accept `false`.
+    #[test]
+    fn access_control_set_true_is_rejected() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(Settings::default());
+        assert_access_control_rejected(cm.set("enable_access_control", Value::Bool(true)));
+        assert!(!cm.read().enable_access_control);
+        assert_eq!(cm.version(), 0, "a rejected set changes nothing");
+        cm.set("enable_access_control", Value::Bool(false)).unwrap();
+        cm.check_strict().unwrap();
+        // Still a boolean key: a wrong type is the usual type mismatch.
+        assert!(matches!(
+            cm.set("enable_access_control", Value::from("true")),
+            Err(ConfigError::TypeMismatch { reason, .. }) if reason == "expected a boolean"
+        ));
+
+        let mut s = Settings::default();
+        assert_access_control_rejected(s.set_key("enable_access_control", Value::Bool(true)));
+        s.set_key("enable_access_control", Value::Bool(false))
+            .unwrap();
+        assert!(!s.enable_access_control);
+    }
+
+    /// A config file or binding settings object carrying `true` fails at first
+    /// use (or at once through `apply_patch`); `false` loads.
+    #[test]
+    fn access_control_from_json_true_is_rejected() {
+        use crate::config::ConfigManager;
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({ "enable_access_control": true })).unwrap();
+        assert_access_control_rejected(ConfigManager::new(s).check_strict());
+
+        let s: Settings =
+            serde_json::from_value(serde_json::json!({ "enable_access_control": false })).unwrap();
+        ConfigManager::new(s).check_strict().unwrap();
+
+        let cm = ConfigManager::new(Settings::default());
+        let patch = serde_json::json!({ "enable_access_control": true });
+        assert_access_control_rejected(cm.apply_patch(patch.as_object().unwrap()));
+        let patch = serde_json::json!({ "enable_access_control": false });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        cm.check_strict().unwrap();
+    }
+
+    /// An application that provides access control owns the flag: `true` is
+    /// accepted from env, `set`, `apply_patch` and a loaded config, and can
+    /// be turned off again.
+    #[test]
+    fn access_control_true_is_accepted_when_the_application_provides_it() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(env_settings("true"));
+        assert_access_control_rejected(cm.check_strict());
+        cm.set_application_access_control(true);
+        assert!(cm.application_access_control());
+        cm.check_strict().unwrap();
+        cm.check_supported().unwrap();
+        assert!(cm.read().enable_access_control);
+        // Shared by clones.
+        assert!(cm.clone().application_access_control());
+
+        let cm = ConfigManager::new(Settings::default());
+        cm.set_application_access_control(true);
+        cm.set("enable_access_control", Value::Bool(true)).unwrap();
+        assert_eq!(cm.get("enable_access_control"), Some(Value::Bool(true)));
+        cm.set("enable_access_control", Value::Bool(false)).unwrap();
+        let patch = serde_json::json!({ "enable_access_control": true });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        assert!(cm.read().enable_access_control);
+        cm.check_strict().unwrap();
+        assert!(matches!(
+            cm.set("enable_access_control", Value::from("yes")),
+            Err(ConfigError::TypeMismatch { .. })
+        ));
+
+        // Withdrawn again: the stored `true` is reported.
+        cm.set_application_access_control(false);
+        assert_access_control_rejected(cm.check_strict());
+    }
+
+    /// `apply_patch` is atomic: a failing key leaves every other key of the
+    /// patch unapplied and the version unchanged.
+    #[test]
+    fn apply_patch_is_atomic() {
+        use crate::config::ConfigManager;
+        let cm = ConfigManager::new(Settings::default());
+        let before = cm.read().chunk_overlap;
+        let patch = serde_json::json!({
+            "chunk_overlap": before + 7,
+            "llm.model": "patched-model",
+            "custom.unknown": 1,
+            "enable_access_control": true,
+        });
+        assert_access_control_rejected(cm.apply_patch(patch.as_object().unwrap()));
+        assert_eq!(cm.version(), 0);
+        assert_eq!(cm.read().chunk_overlap, before);
+        assert_ne!(cm.read().llm().model, "patched-model");
+        assert!(!cm.read().sections.contains_key("custom.unknown"));
+
+        let patch = serde_json::json!({ "chunk_overlap": before + 7, "llm.model": "m" });
+        cm.apply_patch(patch.as_object().unwrap()).unwrap();
+        assert_eq!(cm.version(), 1, "one bump per patch");
+        assert_eq!(cm.read().chunk_overlap, before + 7);
+        assert_eq!(cm.read().llm().model, "m");
+    }
+
+    /// `{:?}` of `Settings` never prints a credential: a secret row, a
+    /// built-in section secret (canonical or alias), or a string under a key
+    /// no built-in section owns.
+    #[test]
+    fn settings_debug_redacts_secrets() {
+        let mut s = Settings {
+            default_user_password: "pw-row-secret".to_string(),
+            otel_exporter_otlp_headers: "authorization=hdr-row-secret".to_string(),
+            ..Settings::default()
+        };
+        s.sections
+            .insert("llm.api_key".into(), Value::from("sk-section-secret"));
+        s.sections
+            .insert("embedding_api_key".into(), Value::from("sk-alias-secret"));
+        s.sections
+            .insert("custom.api_key".into(), Value::from("sk-unknown-secret"));
+        s.sections
+            .insert("custom.enabled".into(), Value::Bool(true));
+        s.sections
+            .insert("llm.model".into(), Value::from("gpt-4o-mini"));
+        // Not secrets, but they embed one.
+        s.sections.insert(
+            "relational.url".into(),
+            Value::from("postgres://cognee:url-pw-secret@db:5432/cognee"),
+        );
+        s.sections.insert(
+            "graph.url".into(),
+            Value::from("host=db user=cognee password=dsn-pw-secret dbname=g"),
+        );
+        // Only an already built schema is consulted by `Debug`.
+        let _ = builtin_schema();
+
+        for out in [format!("{s:?}"), format!("{s:#?}")] {
+            for secret in [
+                "pw-row-secret",
+                "hdr-row-secret",
+                "sk-section-secret",
+                "sk-alias-secret",
+                "sk-unknown-secret",
+                "url-pw-secret",
+                "dsn-pw-secret",
+            ] {
+                assert!(!out.contains(secret), "{secret} leaked: {out}");
+            }
+            assert!(out.contains("gpt-4o-mini"), "non-secret shown: {out}");
+            assert!(out.contains(cognee_config_core::REDACTED), "{out}");
+        }
+        let out = format!("{s:?}");
+        assert!(out.contains("\"custom.enabled\": true"), "{out}");
+        assert!(out.contains("enable_access_control: false"), "{out}");
+        assert!(
+            out.contains("postgres://cognee:***REDACTED***@db:5432/cognee"),
+            "{out}"
+        );
+        // An unset (empty) string secret shows as itself, not as the marker.
+        let out = format!("{:?}", Settings::default());
+        assert!(out.contains("default_user_password: \"\""), "{out}");
+        assert!(!out.contains(cognee_config_core::REDACTED), "{out}");
     }
 
     /// Every row's get/set round-trips its default value.

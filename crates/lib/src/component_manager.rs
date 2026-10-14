@@ -156,21 +156,32 @@ impl ComponentManager {
     /// once per version (rather than once per component) avoids duplicated work
     /// and duplicated warnings. The returned owned context is `Send`, so binding
     /// it to a local before an `.await` keeps the delegating futures `Send`.
-    async fn build_context(&self) -> cognee_components::BackendBuildContext {
+    ///
+    /// Fails when the configuration holds a value this build does not support
+    /// ([`ConfigManager::check_supported`]: `enable_access_control = true`
+    /// without application-provided access control), so no component is ever
+    /// built from such a configuration, whether or not the caller ran
+    /// [`ConfigManager::check_strict`].
+    async fn build_context(
+        &self,
+    ) -> Result<cognee_components::BackendBuildContext, ComponentError> {
+        self.config
+            .check_supported()
+            .map_err(|e| ComponentError::Config(e.to_string()))?;
         let current_ver = self.config.version();
         {
             let guard = self.context.read().await;
             if let Some((ver, ctx)) = &*guard
                 && *ver == current_ver
             {
-                return ctx.clone();
+                return Ok(ctx.clone());
             }
         }
         let mut guard = self.context.write().await;
         if let Some((ver, ctx)) = &*guard
             && *ver == current_ver
         {
-            return ctx.clone();
+            return Ok(ctx.clone());
         }
         // No `.await` between the config read and storing the result, so the
         // (non-`Send`) settings guard never crosses an await point.
@@ -182,7 +193,7 @@ impl ComponentManager {
             settings.backend_context()
         };
         *guard = Some((current_ver, ctx.clone()));
-        ctx
+        Ok(ctx)
     }
 
     // Each `init_*` below carries an INFO span so that engine construction —
@@ -197,25 +208,25 @@ impl ComponentManager {
 
     #[instrument(name = "cognee.component.storage", level = "info", skip_all, err)]
     async fn init_storage(&self) -> Result<Arc<dyn StorageTrait>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_storage(&ctx).await
     }
 
     #[instrument(name = "cognee.component.database", level = "info", skip_all, err)]
     async fn init_database(&self) -> Result<Arc<dyn RelationalDb>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_database(&ctx).await
     }
 
     #[instrument(name = "cognee.component.graph_db", level = "info", skip_all, err)]
     async fn init_graph_db(&self) -> Result<Arc<dyn GraphDBTrait>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_graph(&ctx).await
     }
 
     #[instrument(name = "cognee.component.vector_db", level = "info", skip_all, err)]
     async fn init_vector_db(&self) -> Result<Arc<dyn VectorDB>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_vector(&ctx).await
     }
 
@@ -226,13 +237,13 @@ impl ComponentManager {
         err
     )]
     async fn init_embedding_engine(&self) -> Result<Arc<dyn EmbeddingEngine>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_embedding(&ctx).await
     }
 
     #[instrument(name = "cognee.component.llm", level = "info", skip_all, err)]
     async fn init_llm(&self) -> Result<Arc<dyn Llm>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_llm(&ctx).await
     }
 
@@ -244,7 +255,7 @@ impl ComponentManager {
         &self,
     ) -> Result<Arc<dyn cognee_session::SessionStore>, ComponentError> {
         let database = self.database().await?;
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_session_store(&ctx, database).await
     }
 
@@ -257,7 +268,7 @@ impl ComponentManager {
         &self,
         file_path: Option<&str>,
     ) -> Result<Arc<dyn cognee_ontology::OntologyResolver>, ComponentError> {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         self.registry.build_ontology_resolver(&ctx, file_path).await
     }
 
@@ -276,7 +287,7 @@ impl ComponentManager {
         spec: &serde_json::Value,
     ) -> Result<Option<Arc<dyn cognee_cognify::graph_backend::ChunkGraphExtractor>>, ComponentError>
     {
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         let kind = match kind {
             Some(k) => k.to_string(),
             None => {
@@ -341,7 +352,7 @@ impl ComponentManager {
         {
             return Ok(opt.clone());
         }
-        let ctx = self.build_context().await;
+        let ctx = self.build_context().await?;
         let new = self.registry.build_transcriber(&ctx).await?;
         *guard = Some((current_ver, new.clone()));
         Ok(new)
@@ -667,11 +678,35 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(cm.build_context());
+        rt.block_on(cm.build_context()).unwrap();
         assert_eq!(
             cm.telemetry_key.registered().as_deref(),
             Some("sk-from-code")
         );
+    }
+
+    /// An SDK user that never calls `check_strict` still cannot build a
+    /// component from `ENABLE_BACKEND_ACCESS_CONTROL=true`, unless the
+    /// application declared that it provides access control.
+    #[test]
+    fn components_are_not_built_with_unprovided_access_control() {
+        let mut settings = Settings::default();
+        settings.overlay_from(
+            &cognee_config_core::MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", "true"),
+        );
+        let cm = ComponentManager::new(ConfigManager::new(settings));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        match rt.block_on(cm.build_context()) {
+            Err(ComponentError::Config(msg)) => {
+                assert!(msg.contains("enable_access_control"), "{msg}");
+            }
+            Err(other) => panic!("expected a config error, got {other}"),
+            Ok(_) => panic!("expected a config error, got a context"),
+        }
+        cm.config().set_application_access_control(true);
+        rt.block_on(cm.build_context()).unwrap();
     }
 
     fn cm_with_provider(provider: &str) -> ComponentManager {

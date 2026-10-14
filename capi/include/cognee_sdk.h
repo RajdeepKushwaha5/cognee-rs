@@ -1070,6 +1070,9 @@ void cg_sdk_delete_notebook(const CgSdk*        sdk,
  * Error codes (R2):
  *   CG_ERR_UNKNOWN_CONFIG_KEY   (17) — unrecognised key
  *   CG_ERR_CONFIG_TYPE_MISMATCH (18) — JSON type does not match the field type
+ *   CG_ERR_UNSUPPORTED          (15) — value not supported by this build
+ *                                      (enable_access_control = true without
+ *                                      application-provided access control)
  *   CG_ERR_SDK_VALIDATION       (14) — malformed JSON
  *   CG_ERR_NULL_POINTER          (1) — null sdk / key / value pointer
  *   CG_ERR_UTF8                 (10) — non-UTF-8 input string

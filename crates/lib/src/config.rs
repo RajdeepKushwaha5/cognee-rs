@@ -5,7 +5,7 @@
 //! Shared configuration types for cognee-rust.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 pub use cognee_config_core::{EnvSource, MapEnv};
 
 mod keys;
-pub use cognee_config_core::{ConfigSchema, ConfigSection, ConfigValues, KeyDef, SectionSchema};
+pub use cognee_config_core::{
+    ConfigSchema, ConfigSection, ConfigValues, CredentialSafe, KeyDef, REDACTED, Redacted,
+    SectionSchema, mask_secret, redact_credentials, secret_is_set,
+};
 pub use keys::{KeySpec, builtin_schema, key_spec, keys, schema_with};
 
 pub const DEFAULT_SYSTEM_PROMPT_PATH: &str = "answer_simple_question.txt";
@@ -120,7 +123,9 @@ fn sslmode_from_connect_args(raw: &str) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` is hand-written (in `config/keys.rs`) so that `{:?}` never prints a
+/// credential: see the `impl Debug for Settings` there.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub default_user_id: String,
@@ -947,8 +952,15 @@ impl Default for Settings {
 pub enum ConfigError {
     #[error("Unknown config key: {0}")]
     UnknownKey(String),
+    /// The value is not one the key accepts: the wrong JSON type, or a value
+    /// that fails the key's validation. `reason` says which.
     #[error("Type mismatch for key '{key}': {reason}")]
     TypeMismatch { key: String, reason: String },
+    /// The value is well formed but this build does not support it, e.g.
+    /// `enable_access_control = true` when the application has not declared
+    /// that it provides access control. `reason` says why and what to do.
+    #[error("Unsupported value for key '{key}': {reason}")]
+    Unsupported { key: String, reason: String },
 }
 
 impl From<cognee_config_core::KeyError> for ConfigError {
@@ -998,6 +1010,10 @@ pub struct ConfigManager {
     /// `(canonical key, reason)`. They were dropped, and
     /// [`ConfigManager::check_strict`] reports them until the key is set again.
     invalid: Arc<Mutex<Vec<(String, String)>>>,
+    /// Whether the embedding application provides backend access control
+    /// (an `AclDb`), so `enable_access_control = true` is accepted. See
+    /// [`ConfigManager::set_application_access_control`].
+    application_access_control: Arc<AtomicBool>,
 }
 
 /// Bring settings that were loaded in bulk (deserialized from a config file or
@@ -1057,6 +1073,7 @@ impl ConfigManager {
             version: Arc::new(AtomicU64::new(0)),
             schema: Arc::new(RwLock::new(schema)),
             invalid: Arc::new(Mutex::new(invalid)),
+            application_access_control: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1114,8 +1131,13 @@ impl ConfigManager {
 
     /// Fail if the configuration that was loaded in bulk (a config file, a
     /// binding's settings object) held a value of the wrong type for a known
-    /// key, or, with `strict_config` on, a key that no registered setting
-    /// owns. Otherwise `Ok`: unknown keys were already reported as warnings.
+    /// key, if any setting holds an unsupported value
+    /// ([`ConfigManager::check_supported`]: `enable_access_control = true`,
+    /// from env too, without
+    /// [`set_application_access_control`](ConfigManager::set_application_access_control)),
+    /// or, with `strict_config` on, if a key no registered setting owns is
+    /// present. Otherwise `Ok`: unknown keys were already reported as
+    /// warnings.
     ///
     /// Explicit [`ConfigManager::set`] calls apply the policy themselves; this
     /// covers keys that arrived in bulk, which are checked when the
@@ -1134,6 +1156,10 @@ impl ConfigManager {
                 reason: reason.clone(),
             });
         }
+        // A value the key accepts but this build does not support (e.g.
+        // `enable_access_control = true` from env or a config file): always an
+        // error, like a wrongly typed one.
+        s.check_supported(self.application_access_control())?;
         if !s.strict_config {
             return Ok(());
         }
@@ -1141,6 +1167,43 @@ impl ConfigManager {
             Some(key) => Err(ConfigError::UnknownKey((*key).to_string())),
             None => Ok(()),
         }
+    }
+
+    /// Declare whether the embedding application provides backend access
+    /// control, i.e. attaches its own `AclDb`
+    /// (`SearchBuilder`/`SearchOrchestrator::with_acl_db`, the ingestion
+    /// builder's `with_acl_db`, `DatasetManager::with_acl`) and enforces it.
+    ///
+    /// cognee-rs never enforces access control from configuration, so by
+    /// default `enable_access_control = true` (`ENABLE_BACKEND_ACCESS_CONTROL`)
+    /// is a [`ConfigError::Unsupported`] error rather than a silently inert
+    /// flag. An application that does provide it calls this with `true`
+    /// before the configuration is validated ([`ConfigManager::check_strict`]
+    /// or the first component build): the setting is then accepted from env,
+    /// config files, [`ConfigManager::set`] and [`ConfigManager::apply_patch`],
+    /// and it is the application's to read and act on. Shared by every clone
+    /// of this manager. Through a binding handle, see
+    /// `HandleState::with_application_access_control`.
+    pub fn set_application_access_control(&self, provided: bool) {
+        self.application_access_control
+            .store(provided, Ordering::Release);
+    }
+
+    /// Whether the application declared that it provides backend access
+    /// control ([`ConfigManager::set_application_access_control`]).
+    pub fn application_access_control(&self) -> bool {
+        self.application_access_control.load(Ordering::Acquire)
+    }
+
+    /// Fail if the current configuration holds a value this build does not
+    /// support: [`Settings::check_supported`] with this manager's
+    /// [`application_access_control`](ConfigManager::application_access_control)
+    /// switch. Run by [`ConfigManager::check_strict`] and before every
+    /// component build of a `ComponentManager`, so an SDK user that never
+    /// calls `check_strict` cannot run with an unsupported setting either.
+    pub fn check_supported(&self) -> Result<(), ConfigError> {
+        self.read()
+            .check_supported(self.application_access_control())
     }
 
     /// Forget a reported wrongly typed bulk value of `key` (canonical): the
@@ -1211,8 +1274,83 @@ impl Clone for ConfigManager {
             version: Arc::clone(&self.version),
             schema: Arc::clone(&self.schema),
             invalid: Arc::clone(&self.invalid),
+            application_access_control: Arc::clone(&self.application_access_control),
         }
     }
+}
+
+/// Set `system_root_directory` to `path` and move the graph file path and
+/// vector URL derived from the old root (or still unset) along with it.
+fn cascade_system_root(s: &mut Settings, path: &str) {
+    let old_root = s.system_root_directory.clone();
+    s.system_root_directory = path.to_string();
+
+    // Cascade graph_file_path
+    if s.graph().file_path.is_empty() || s.graph().file_path.starts_with(&old_root) {
+        let suffix = if s.graph().file_path.is_empty() {
+            "/graph".to_string()
+        } else {
+            s.graph().file_path[old_root.len()..].to_string()
+        };
+        s.sections.insert(
+            "graph.file_path".to_string(),
+            serde_json::json!(format!("{path}{suffix}")),
+        );
+    }
+
+    // Cascade vector_db_url (only if it was using the default system root path)
+    if s.vector().url.is_empty() || s.vector().url.starts_with(&old_root) {
+        let suffix = if s.vector().url.is_empty() {
+            "/vectors".to_string()
+        } else {
+            s.vector().url[old_root.len()..].to_string()
+        };
+        s.sections.insert(
+            "vector.url".to_string(),
+            serde_json::json!(format!("{path}{suffix}")),
+        );
+    }
+}
+
+/// What [`apply_one`] did with a key.
+enum Applied {
+    /// A known setting was set; its canonical key.
+    Known(&'static str),
+    /// No registered setting owns the key; nothing changed.
+    Unknown,
+}
+
+/// Set `key` on `s` the way [`ConfigManager::set`] does, without touching the
+/// manager: `system_root_directory` cascades to the paths derived from it,
+/// and `enable_access_control = true` is accepted only with
+/// `application_access_control`.
+fn apply_one(
+    schema: &ConfigSchema,
+    s: &mut Settings,
+    key: &str,
+    value: serde_json::Value,
+    application_access_control: bool,
+) -> Result<Applied, ConfigError> {
+    if let Some(spec) = key_spec(key) {
+        if spec.key == "system_root_directory" {
+            cascade_system_root(s, as_string(key, &value)?.as_str());
+        } else if spec.key == keys::ACCESS_CONTROL_KEY && application_access_control {
+            s.enable_access_control = value.as_bool().ok_or_else(|| ConfigError::TypeMismatch {
+                key: key.to_string(),
+                reason: "expected a boolean".to_string(),
+            })?;
+        } else {
+            (spec.set)(s, key, value)?;
+        }
+        return Ok(Applied::Known(spec.key));
+    }
+    if schema.key_def(key).is_some() {
+        let canonical = schema
+            .set(&mut s.sections, key, &value)
+            .map_err(ConfigError::from)?;
+        return Ok(Applied::Known(canonical));
+    }
+    Ok(Applied::Unknown)
 }
 
 // -- Individual setter methods -----------------------------------------------
@@ -1578,35 +1716,7 @@ impl ConfigManager {
     /// - `vector_db_url` updated if it was under the old system root
     pub fn set_system_root_directory(&self, path: &str) {
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-        let old_root = s.system_root_directory.clone();
-        s.system_root_directory = path.to_string();
-
-        // Cascade graph_file_path
-        if s.graph().file_path.is_empty() || s.graph().file_path.starts_with(&old_root) {
-            let suffix = if s.graph().file_path.is_empty() {
-                "/graph".to_string()
-            } else {
-                s.graph().file_path[old_root.len()..].to_string()
-            };
-            s.sections.insert(
-                "graph.file_path".to_string(),
-                serde_json::json!(format!("{path}{suffix}")),
-            );
-        }
-
-        // Cascade vector_db_url (only if it was using the default system root path)
-        if s.vector().url.is_empty() || s.vector().url.starts_with(&old_root) {
-            let suffix = if s.vector().url.is_empty() {
-                "/vectors".to_string()
-            } else {
-                s.vector().url[old_root.len()..].to_string()
-            };
-            s.sections.insert(
-                "vector.url".to_string(),
-                serde_json::json!(format!("{path}{suffix}")),
-            );
-        }
-
+        cascade_system_root(&mut s, path);
         drop(s);
         self.bump_version();
     }
@@ -2220,33 +2330,25 @@ impl ConfigManager {
     /// [`ConfigManager::set_system_root_directory`], so the graph and vector
     /// paths derived from the old root move with it.
     pub fn set(&self, key: &str, value: serde_json::Value) -> Result<(), ConfigError> {
-        if let Some(spec) = key_spec(key) {
-            if spec.key == "system_root_directory" {
-                self.set_system_root_directory(as_string(key, &value)?.as_str());
-                return Ok(());
-            }
-            let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-            (spec.set)(&mut s, key, value)?;
-            drop(s);
-            self.clear_invalid(spec.key);
-            self.bump_version();
-            return Ok(());
-        }
+        let application_access_control = self.application_access_control();
+        // Lock order: `schema` before `inner` (see `ConfigManager`).
         let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
         let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-        if schema.key_def(key).is_some() {
-            let canonical = schema
-                .set(&mut s.sections, key, &value)
-                .map_err(ConfigError::from)?;
-            drop(s);
-            drop(schema);
-            self.clear_invalid(canonical);
-            self.bump_version();
-            return Ok(());
+        match apply_one(&schema, &mut s, key, value, application_access_control)? {
+            Applied::Known(canonical) => {
+                drop(s);
+                drop(schema);
+                self.clear_invalid(canonical);
+                self.bump_version();
+                Ok(())
+            }
+            Applied::Unknown => {
+                let strict = s.strict_config;
+                drop(s);
+                drop(schema);
+                cognee_config_core::unknown_key(key, strict).map_err(ConfigError::from)
+            }
         }
-        let strict = s.strict_config;
-        drop(s);
-        cognee_config_core::unknown_key(key, strict).map_err(ConfigError::from)
     }
 
     /// Apply a JSON object of settings in bulk, e.g. a binding's constructor
@@ -2259,29 +2361,46 @@ impl ConfigManager {
     /// registry added later with [`ConfigManager::extend_schema`], which
     /// checks it then. Strict mode is enforced by
     /// [`ConfigManager::check_strict`] once the full schema is known.
+    ///
+    /// Atomic: the whole patch is applied to a copy first, so when any key
+    /// fails nothing changes and the version does not move. A non-empty patch
+    /// bumps the version once.
     pub fn apply_patch(
         &self,
         patch: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), ConfigError> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let application_access_control = self.application_access_control();
+        // Lock order: `schema` before `inner` (see `ConfigManager`).
+        let schema = self.schema.read().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
+        let mut next = s.clone();
+        let mut applied = Vec::new();
         for (key, value) in patch {
-            let known = key_spec(key).is_some()
-                || self
-                    .schema
-                    .read()
-                    .expect("lock poison is unrecoverable") // lock poison is unrecoverable
-                    .key_def(key)
-                    .is_some();
-            if known {
-                self.set(key, value.clone())?;
-            } else {
-                // Lenient here even in strict mode: see the doc comment.
-                let _ = cognee_config_core::unknown_key(key, false);
-                let mut s = self.inner.write().expect("lock poison is unrecoverable"); // lock poison is unrecoverable
-                s.sections.insert(key.clone(), value.clone());
-                drop(s);
-                self.bump_version();
+            match apply_one(
+                &schema,
+                &mut next,
+                key,
+                value.clone(),
+                application_access_control,
+            )? {
+                Applied::Known(canonical) => applied.push(canonical),
+                Applied::Unknown => {
+                    // Lenient here even in strict mode: see the doc comment.
+                    let _ = cognee_config_core::unknown_key(key, false);
+                    next.sections.insert(key.clone(), value.clone());
+                }
             }
         }
+        *s = next;
+        drop(s);
+        drop(schema);
+        for canonical in applied {
+            self.clear_invalid(canonical);
+        }
+        self.bump_version();
         Ok(())
     }
 
@@ -3215,23 +3334,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn overlay_enable_backend_access_control() {
-        // SAFETY: test is serial — no other thread reads/writes env concurrently.
-        unsafe { std::env::set_var("ENABLE_BACKEND_ACCESS_CONTROL", "true") };
-        let mut s = Settings::default();
-        s.overlay_from_env();
-        unsafe { std::env::remove_var("ENABLE_BACKEND_ACCESS_CONTROL") };
-
-        assert!(s.enable_access_control);
-
-        // Also verify "1" works
-        unsafe { std::env::set_var("ENABLE_BACKEND_ACCESS_CONTROL", "1") };
-        let mut s2 = Settings::default();
-        s2.overlay_from_env();
-        unsafe { std::env::remove_var("ENABLE_BACKEND_ACCESS_CONTROL") };
-
-        assert!(s2.enable_access_control);
+        for raw in ["true", "1"] {
+            let mut s = Settings::default();
+            s.overlay_from(&MapEnv::new().with("ENABLE_BACKEND_ACCESS_CONTROL", raw));
+            assert!(s.enable_access_control, "{raw}");
+        }
     }
 
     #[test]

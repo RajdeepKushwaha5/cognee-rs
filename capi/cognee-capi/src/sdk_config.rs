@@ -39,6 +39,7 @@
 //!
 //! `ConfigError::UnknownKey`  → `CG_ERR_UNKNOWN_CONFIG_KEY`  (17)
 //! `ConfigError::TypeMismatch`→ `CG_ERR_CONFIG_TYPE_MISMATCH` (18)
+//! `ConfigError::Unsupported` → `CG_ERR_UNSUPPORTED`          (15)
 //! Malformed JSON             → `CG_ERR_SDK_VALIDATION`       (14)
 //!
 //! ## Version bump / services rebuild
@@ -79,6 +80,7 @@ fn config_error_to_code(e: ConfigError) -> CgErrorCode {
     let code = match &e {
         ConfigError::UnknownKey(_) => CgErrorCode::UnknownConfigKey,
         ConfigError::TypeMismatch { .. } => CgErrorCode::ConfigTypeMismatch,
+        ConfigError::Unsupported { .. } => CgErrorCode::Unsupported,
     };
     set_last_error(e.to_string());
     code

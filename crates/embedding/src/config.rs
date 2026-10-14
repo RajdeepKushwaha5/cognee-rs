@@ -291,7 +291,10 @@ impl OnnxEmbeddingConfig {
 /// - `EMBEDDING_BATCH_SIZE` — texts per embedding request (default: 36)
 /// - `EMBEDDING_ONNX_BATCH_SIZE` — ONNX inference batch size (default: 32; `onnx` feature only)
 /// - `HUGGINGFACE_TOKENIZER` — HuggingFace tokenizer identifier
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so `api_key` never reaches a log line: it prints as
+/// `***REDACTED***` when set and `None` when unset.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Which backend to use for embedding generation.
     pub provider: EmbeddingProvider,
@@ -356,6 +359,48 @@ pub struct EmbeddingConfig {
     #[cfg(feature = "bedrock")]
     #[serde(skip)]
     pub aws: cognee_llm::adapters::bedrock::aws::env::AwsInputs,
+}
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use cognee_config_core::{CredentialSafe, Redacted};
+        // Exhaustive: a new field fails to compile until it is shown here.
+        let Self {
+            provider,
+            model,
+            dimensions,
+            endpoint,
+            api_key,
+            api_version,
+            max_completion_tokens,
+            batch_size,
+            mock,
+            mock_mode,
+            #[cfg(feature = "onnx")]
+            onnx,
+            huggingface_tokenizer,
+            #[cfg(feature = "bedrock")]
+            aws,
+        } = self;
+        let mut out = f.debug_struct("EmbeddingConfig");
+        out.field("provider", provider)
+            .field("model", model)
+            .field("dimensions", dimensions)
+            .field("endpoint", &CredentialSafe(endpoint))
+            .field("api_key", &Redacted(api_key))
+            .field("api_version", api_version)
+            .field("max_completion_tokens", max_completion_tokens)
+            .field("batch_size", batch_size)
+            .field("mock", mock)
+            .field("mock_mode", mock_mode);
+        #[cfg(feature = "onnx")]
+        out.field("onnx", onnx);
+        out.field("huggingface_tokenizer", huggingface_tokenizer);
+        // `AwsInputs`' own `Debug` redacts its secrets.
+        #[cfg(feature = "bedrock")]
+        out.field("aws", aws);
+        out.finish()
+    }
 }
 
 impl Default for EmbeddingConfig {
@@ -686,6 +731,23 @@ impl EmbeddingConfig {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// `{:?}` never prints the API key.
+    #[test]
+    fn debug_redacts_api_key() {
+        let config = EmbeddingConfig {
+            api_key: Some("sk-embedding-secret".to_string()),
+            ..EmbeddingConfig::default()
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("sk-embedding-secret"), "{out}");
+        assert!(out.contains("api_key: ***REDACTED***"), "{out}");
+        let unset = EmbeddingConfig {
+            api_key: None,
+            ..EmbeddingConfig::default()
+        };
+        assert!(format!("{unset:?}").contains("api_key: None"));
+    }
 
     #[test]
     #[cfg(all(feature = "onnx", target_os = "android"))]

@@ -4954,9 +4954,7 @@
     "err": true
   },
   "set enable_access_control <- true": {
-    "ok": {
-      "enable_access_control": true
-    }
+    "err": true
   },
   "set enable_access_control <- {\"a\":1}": {
     "err": true

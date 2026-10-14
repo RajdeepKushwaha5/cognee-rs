@@ -164,6 +164,9 @@ pub fn set_outcome(key: &str, value: Value) -> Value {
         Err(ConfigError::TypeMismatch { key, .. }) => {
             json!({ "err": "TypeMismatch", "key": key })
         }
+        Err(ConfigError::Unsupported { key, .. }) => {
+            json!({ "err": "Unsupported", "key": key })
+        }
     }
 }
 

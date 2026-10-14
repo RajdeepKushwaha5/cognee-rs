@@ -57,6 +57,8 @@ bedrock      = ["dep:cognee-llm", "cognee-llm/bedrock"]
 [dependencies]
 async-trait = { workspace = true }
 cognee-utils = { path = "../utils", version = "0.2.0" }
+# `Redacted`: the redacting `Debug` of `EmbeddingConfig::api_key`.
+cognee-config-core = { path = "../config-core", version = "0.2.0" }
 # Only for the Bedrock engine's shared AWS plumbing (feature `bedrock`).
 cognee-llm  = { path = "../llm", version = "0.2.0", optional = true }
 futures     = { workspace = true }

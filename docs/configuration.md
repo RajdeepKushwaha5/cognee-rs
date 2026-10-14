@@ -137,7 +137,37 @@ as `embedding_model`); those are applied as the setting they name, not treated a
 unknown.
 
 A setting marked `secret` (a registry row or a section key) is masked as
-`***REDACTED***` in every binding's `config.get()` output.
+`***REDACTED***` (`cognee_config_core::REDACTED`) in every binding's
+`config.get()` output when it is set. An unset secret (`null`, or `""` for a
+string-typed one) is shown as itself: its emptiness reveals nothing, and the
+marker would claim it is set (`cognee_config_core::secret_is_set` /
+`mask_secret`).
+
+`Debug` output follows the same rule, so `{:?}` of a configuration does not
+print credentials:
+
+* a `config_section!` struct prints a set secret field as `***REDACTED***` and an
+  unset one as itself (`None`, `""`). Every other field prints its own `Debug`
+  with embedded credentials masked (`cognee_config_core::redact_credentials`):
+  the password of a URL (`postgres://cognee:***REDACTED***@db/cognee`) and the
+  value of a password-like `key=value` pair (a query parameter such as
+  `sslpassword=`, or a libpq keyword DSN such as `host=db password=…`). This
+  covers the connection URLs (`relational.url` / `DATABASE_URL`,
+  `relational.migration_url`, `vector.url`, `graph.url`), which are not marked
+  `secret` because they are mostly not credentials;
+* `Settings` prints every setting as JSON with the same masking. A `sections`
+  entry no built-in section owns (a custom registry's, or a stale one) is
+  masked when it is a non-empty string, because only its owner knows whether it
+  is a credential. Formatting has no side effects: it consults the built-in
+  schema only once something else has built it;
+* `LlmConfig` and `EmbeddingConfig` mask their API keys and their endpoint's
+  credentials; `AwsInputs` / `AwsSettings` mask their credentials;
+* `cognee_observability::EnvSettingsView` (the process-level OTEL settings every
+  binding builds) masks its OTLP headers, like `otel_exporter_otlp_headers` in
+  `Settings`, and its endpoint's credentials.
+
+The masking is best effort for the shapes above; a credential in a free-form
+value of some other shape is not recognised.
 
 ### How the rule is enforced
 
@@ -1421,10 +1451,58 @@ themselves get the configured backend from
 | `COGNEE_DEFAULT_USER_ID` | `default_user_id` | nil UUID |
 | `COGNEE_DEFAULT_DATASET_NAME` | `default_dataset_name` | `main_dataset` |
 | `DEFAULT_USER_EMAIL` / `DEFAULT_USER_PASSWORD` | … | `default_user@example.com` / _(empty)_ |
-| `ENABLE_BACKEND_ACCESS_CONTROL` | `enable_access_control` | `false` |
+| `ENABLE_BACKEND_ACCESS_CONTROL` | `enable_access_control` | `false`; `true` only with application-provided access control (below) |
 
 Setting `system_root_directory` cascades to the default `graph_file_path` and
 `vector_db_url` unless those are set explicitly.
+
+**`ENABLE_BACKEND_ACCESS_CONTROL` / `enable_access_control` is reserved.**
+cognee-rust never enforces access control from configuration: dataset ACLs
+apply only when the embedding application attaches its own `AclDb`
+(`SearchBuilder` / `SearchOrchestrator::with_acl_db`, the ingestion builder's
+`with_acl_db`, `DatasetManager::with_acl`). So by default `true` is a
+configuration error (`ConfigError::Unsupported`), whatever `strict_config` says,
+instead of a flag that would silently change nothing. `false` and unset are
+always accepted, and the key stays known, so a Python-parity configuration
+carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` loads without a warning. Python
+defaults the flag to `true`; this is a deliberate divergence. Every truthy
+spelling (`true`, `1`, `yes`, `on`, any case) counts as `true`.
+
+> **Migrating from Python:** Python's `.env.template` ships an uncommented
+> `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads
+> `.env` automatically) makes every CLI command, every binding operation and
+> every `ComponentManager` component build fail until that line is changed to
+> `False` or removed. `cognee-cli config unset` cannot override a value that
+> comes from the environment.
+
+* `ConfigManager::set` / `Settings::set_key`, every binding's `set`, a binding's
+  constructor settings object (`apply_patch`, which is atomic: nothing of a
+  failing patch is applied) and `cognee-cli config set` fail at once.
+* A `true` from the environment or a loaded config file is kept and reported by
+  `ConfigManager::check_supported`: from `ConfigManager::check_strict` (the CLI
+  command, a binding handle's first operation) and before every component
+  build of a `ComponentManager`, so a Rust SDK user who never calls
+  `check_strict` cannot run with it either. `cognee-cli config set
+  enable_access_control false` or `config unset enable_access_control` repairs a
+  saved config.
+* Bindings report it with their existing "unsupported" error: C
+  `CG_ERR_UNSUPPORTED`, Python `CogneeUnsupportedError`, TS/Java `UNSUPPORTED`.
+
+**An application that provides access control owns the flag.** It declares so on
+its `ConfigManager` before the configuration is validated:
+
+```rust
+let config = ConfigManager::from_env_with_schema(&registry.config_schema()?)?;
+config.set_application_access_control(true);
+config.check_strict()?; // `ENABLE_BACKEND_ACCESS_CONTROL=true` is accepted now
+let acl_on = config.read().enable_access_control; // the application acts on it
+```
+
+A binding handle does the same with
+`HandleState::with_application_access_control()`. The switch is shared by every
+clone of the manager. With it, `true` is accepted from env, config files, `set`
+and `apply_patch`; reading the value and attaching the `AclDb` remain the
+application's job.
 
 ## Session / cache & rate limiting
 

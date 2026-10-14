@@ -67,11 +67,12 @@ describe("Phase-2 config surface", () => {
       native.configSetVectorDbKey(handle, "vector-secret");
 
       const cfg = native.getConfig(handle) as Record<string, unknown>;
-      // Secret fields must be redacted, never echoed back verbatim.
+      // Secret fields that are set must be redacted, never echoed back verbatim.
+      for (const field of ["llm.api_key", "embedding.api_key", "vector.key"]) {
+        expect(cfg[field]).toBe("***REDACTED***");
+      }
+      // Unset (empty) secrets read back as empty, not as the marker.
       for (const field of [
-        "llm.api_key",
-        "embedding.api_key",
-        "vector.key",
         "vector.password",
         "graph.key",
         "graph.password",
@@ -79,7 +80,7 @@ describe("Phase-2 config surface", () => {
         "default_user_password",
         "otel_exporter_otlp_headers",
       ]) {
-        expect(cfg[field]).toBe("***REDACTED***");
+        expect(cfg[field]).toBe("");
       }
       // Spot-check the values we set are NOT present.
       const serialized = JSON.stringify(cfg);
