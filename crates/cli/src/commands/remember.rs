@@ -15,6 +15,12 @@ use crate::cli::RememberArgs;
 use crate::error::CliError;
 
 pub fn run(args: RememberArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
+    // `--dataset-name`, else the `default_dataset_name` setting (`main_dataset`
+    // when it is blank).
+    let dataset_name = args
+        .dataset_name
+        .clone()
+        .unwrap_or_else(|| cm.settings().effective_default_dataset_name().to_owned());
     let settings = cm.settings();
     let owner_id = Uuid::parse_str(&settings.default_user_id).map_err(|error| {
         CliError::Validation(format!(
@@ -109,7 +115,7 @@ pub fn run(args: RememberArgs, cm: Arc<ComponentManager>) -> Result<(), CliError
 
         let result = remember(
             inputs,
-            &args.dataset_name,
+            &dataset_name,
             args.session_id.as_deref(),
             self_improvement,
             owner_id,

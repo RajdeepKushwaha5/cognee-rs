@@ -32,7 +32,7 @@ use cognee_graph::{GraphDBTrait, LadybugAdapter};
 use cognee_ingestion::AddPipeline;
 use cognee_models::DataInput;
 use cognee_ontology::NoOpOntologyResolver;
-use cognee_search::{SearchBuilder, SearchRequest, SearchType};
+use cognee_search::{SearchBuilder, SearchRequest, SearchTuning, SearchType};
 use cognee_storage::{LocalStorage, StorageTrait};
 use cognee_test_utils::MockVectorDB;
 use cognee_vector::VectorDB;
@@ -163,15 +163,25 @@ async fn test_search_updates_last_accessed_timestamp() {
     let before_search = Utc::now();
 
     // ── First search: Chunks with only_context=true ──────────────────────────
-    let orchestrator = SearchBuilder::new(
-        Arc::clone(&vector_db),
-        Arc::clone(&embedding_engine),
-        Arc::clone(&graph_db),
-        Arc::clone(&llm),
-        database.clone() as Arc<dyn SearchHistoryDb>,
-    )
-    .with_dataset_resolver(database.clone() as Arc<dyn IngestDb>)
-    .build();
+    // Access tracking is the `enable_last_accessed` setting
+    // (`ENABLE_LAST_ACCESSED`), off by default as in Python.
+    let build = |access_tracking: bool| {
+        SearchBuilder::new(
+            Arc::clone(&vector_db),
+            Arc::clone(&embedding_engine),
+            Arc::clone(&graph_db),
+            Arc::clone(&llm),
+            database.clone() as Arc<dyn SearchHistoryDb>,
+        )
+        .with_tuning(SearchTuning {
+            access_tracking,
+            ..SearchTuning::default()
+        })
+        .with_dataset_resolver(database.clone() as Arc<dyn IngestDb>)
+        .build()
+    };
+    let untracked = build(false);
+    let orchestrator = build(true);
 
     let search_request = SearchRequest {
         query_text: "artificial intelligence".to_string(),
@@ -202,6 +212,20 @@ async fn test_search_updates_last_accessed_timestamp() {
         neighborhood_seed_top_k: None,
         summarize_context: None,
     };
+
+    // With tracking off, a search leaves `last_accessed` alone.
+    untracked
+        .search(&search_request)
+        .await
+        .expect("untracked search should succeed");
+    let after_untracked = ops::data::get_data(&database, data_id)
+        .await
+        .expect("get_data after untracked search")
+        .expect("data should exist");
+    assert_eq!(
+        after_untracked.last_accessed, initial_last_accessed,
+        "access tracking is off unless enabled"
+    );
 
     orchestrator
         .search(&search_request)
@@ -264,5 +288,30 @@ async fn test_search_updates_last_accessed_timestamp() {
     );
 
     println!("Monotonic check passed: {second_last_accessed} >= {first_ts}");
+
+    // ── Third search: the default path (no only_context, no datasets) ────────
+    // The orchestrator does not fetch the context for scoping here, so it
+    // must fetch it for tracking (Python tracks on every retrieval).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let before_default_search = Utc::now();
+    orchestrator
+        .search(&SearchRequest {
+            only_context: Some(false),
+            ..search_request.clone()
+        })
+        .await
+        .expect("default-path search should succeed");
+    let third_last_accessed = ops::data::get_data(&database, data_id)
+        .await
+        .expect("get_data after default-path search")
+        .expect("data should exist")
+        .last_accessed
+        .expect("last_accessed should be set after default-path search");
+    assert!(
+        third_last_accessed >= before_default_search,
+        "a default-path search must update last_accessed: \
+         {third_last_accessed} >= {before_default_search}"
+    );
+
     println!("test_search_updates_last_accessed_timestamp PASSED");
 }

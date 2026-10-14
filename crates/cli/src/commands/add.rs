@@ -12,6 +12,12 @@ use crate::cli::AddArgs;
 use crate::error::CliError;
 
 pub fn run(args: AddArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
+    // `--dataset-name`, else the `default_dataset_name` setting (`main_dataset`
+    // when it is blank).
+    let dataset_name = args
+        .dataset_name
+        .clone()
+        .unwrap_or_else(|| cm.settings().effective_default_dataset_name().to_owned());
     let owner_id = Uuid::parse_str(&cm.settings().default_user_id).map_err(|error| {
         CliError::Validation(format!(
             "Invalid default_user_id '{}': {error}",
@@ -70,14 +76,14 @@ pub fn run(args: AddArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
             .collect::<Vec<_>>();
 
         let results = pipeline
-            .add(inputs, &args.dataset_name, owner_id, tenant_id)
+            .add(inputs, &dataset_name, owner_id, tenant_id)
             .await
             .map_err(|error| CliError::Runtime(format!("Add operation failed: {error}")))?;
 
         info!(
             "Success: Added {} item(s) to dataset '{}'.",
             results.len(),
-            args.dataset_name
+            dataset_name
         );
 
         Ok(())

@@ -1137,6 +1137,36 @@
   "CACHING=\"{\\\"ssl\\\":true}\"": {
     "enable_caching": false
   },
+  "CHUNKS_PER_BATCH=\"  \"": {},
+  "CHUNKS_PER_BATCH=\"\"": {},
+  "CHUNKS_PER_BATCH=\"-1\"": {},
+  "CHUNKS_PER_BATCH=\"0\"": {
+    "cognify.chunks_per_batch": 0
+  },
+  "CHUNKS_PER_BATCH=\"1\"": {
+    "cognify.chunks_per_batch": 1
+  },
+  "CHUNKS_PER_BATCH=\"1.5\"": {},
+  "CHUNKS_PER_BATCH=\"42\"": {
+    "cognify.chunks_per_batch": 42
+  },
+  "CHUNKS_PER_BATCH=\"5000000000\"": {},
+  "CHUNKS_PER_BATCH=\"70000\"": {
+    "cognify.chunks_per_batch": 70000
+  },
+  "CHUNKS_PER_BATCH=\"TRUE\"": {},
+  "CHUNKS_PER_BATCH=\"[1]\"": {},
+  "CHUNKS_PER_BATCH=\"abc\"": {},
+  "CHUNKS_PER_BATCH=\"false\"": {},
+  "CHUNKS_PER_BATCH=\"no\"": {},
+  "CHUNKS_PER_BATCH=\"on\"": {},
+  "CHUNKS_PER_BATCH=\"require\"": {},
+  "CHUNKS_PER_BATCH=\"true\"": {},
+  "CHUNKS_PER_BATCH=\"v\"": {},
+  "CHUNKS_PER_BATCH=\"yes\"": {},
+  "CHUNKS_PER_BATCH=\"{\\\"a\\\":1}\"": {},
+  "CHUNKS_PER_BATCH=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
+  "CHUNKS_PER_BATCH=\"{\\\"ssl\\\":true}\"": {},
   "CHUNK_OVERLAP=\"  \"": {},
   "CHUNK_OVERLAP=\"\"": {},
   "CHUNK_OVERLAP=\"-1\"": {},
@@ -1433,6 +1463,36 @@
   "COGNEE_COGNIFY_TOLERATE_SUMMARIZATION_FAILURES=\"{\\\"a\\\":1}\"": {},
   "COGNEE_COGNIFY_TOLERATE_SUMMARIZATION_FAILURES=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
   "COGNEE_COGNIFY_TOLERATE_SUMMARIZATION_FAILURES=\"{\\\"ssl\\\":true}\"": {},
+  "COGNEE_DATA_PER_BATCH=\"  \"": {},
+  "COGNEE_DATA_PER_BATCH=\"\"": {},
+  "COGNEE_DATA_PER_BATCH=\"-1\"": {},
+  "COGNEE_DATA_PER_BATCH=\"0\"": {
+    "cognify.data_per_batch": 0
+  },
+  "COGNEE_DATA_PER_BATCH=\"1\"": {
+    "cognify.data_per_batch": 1
+  },
+  "COGNEE_DATA_PER_BATCH=\"1.5\"": {},
+  "COGNEE_DATA_PER_BATCH=\"42\"": {
+    "cognify.data_per_batch": 42
+  },
+  "COGNEE_DATA_PER_BATCH=\"5000000000\"": {},
+  "COGNEE_DATA_PER_BATCH=\"70000\"": {
+    "cognify.data_per_batch": 70000
+  },
+  "COGNEE_DATA_PER_BATCH=\"TRUE\"": {},
+  "COGNEE_DATA_PER_BATCH=\"[1]\"": {},
+  "COGNEE_DATA_PER_BATCH=\"abc\"": {},
+  "COGNEE_DATA_PER_BATCH=\"false\"": {},
+  "COGNEE_DATA_PER_BATCH=\"no\"": {},
+  "COGNEE_DATA_PER_BATCH=\"on\"": {},
+  "COGNEE_DATA_PER_BATCH=\"require\"": {},
+  "COGNEE_DATA_PER_BATCH=\"true\"": {},
+  "COGNEE_DATA_PER_BATCH=\"v\"": {},
+  "COGNEE_DATA_PER_BATCH=\"yes\"": {},
+  "COGNEE_DATA_PER_BATCH=\"{\\\"a\\\":1}\"": {},
+  "COGNEE_DATA_PER_BATCH=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
+  "COGNEE_DATA_PER_BATCH=\"{\\\"ssl\\\":true}\"": {},
   "COGNEE_DATA_ROOT_DIRECTORY=\"  \"": {
     "data_root_directory": "  "
   },
@@ -4766,6 +4826,70 @@
   "GRAPH_MAX_DB_SIZE=\"{\\\"a\\\":1}\"": {},
   "GRAPH_MAX_DB_SIZE=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
   "GRAPH_MAX_DB_SIZE=\"{\\\"ssl\\\":true}\"": {},
+  "GRAPH_PROMPT_PATH=\"  \"": {
+    "graph_prompt_path": "  "
+  },
+  "GRAPH_PROMPT_PATH=\"\"": {},
+  "GRAPH_PROMPT_PATH=\"-1\"": {
+    "graph_prompt_path": "-1"
+  },
+  "GRAPH_PROMPT_PATH=\"0\"": {
+    "graph_prompt_path": "0"
+  },
+  "GRAPH_PROMPT_PATH=\"1\"": {
+    "graph_prompt_path": "1"
+  },
+  "GRAPH_PROMPT_PATH=\"1.5\"": {
+    "graph_prompt_path": "1.5"
+  },
+  "GRAPH_PROMPT_PATH=\"42\"": {
+    "graph_prompt_path": "42"
+  },
+  "GRAPH_PROMPT_PATH=\"5000000000\"": {
+    "graph_prompt_path": "5000000000"
+  },
+  "GRAPH_PROMPT_PATH=\"70000\"": {
+    "graph_prompt_path": "70000"
+  },
+  "GRAPH_PROMPT_PATH=\"TRUE\"": {
+    "graph_prompt_path": "TRUE"
+  },
+  "GRAPH_PROMPT_PATH=\"[1]\"": {
+    "graph_prompt_path": "[1]"
+  },
+  "GRAPH_PROMPT_PATH=\"abc\"": {
+    "graph_prompt_path": "abc"
+  },
+  "GRAPH_PROMPT_PATH=\"false\"": {
+    "graph_prompt_path": "false"
+  },
+  "GRAPH_PROMPT_PATH=\"no\"": {
+    "graph_prompt_path": "no"
+  },
+  "GRAPH_PROMPT_PATH=\"on\"": {
+    "graph_prompt_path": "on"
+  },
+  "GRAPH_PROMPT_PATH=\"require\"": {
+    "graph_prompt_path": "require"
+  },
+  "GRAPH_PROMPT_PATH=\"true\"": {
+    "graph_prompt_path": "true"
+  },
+  "GRAPH_PROMPT_PATH=\"v\"": {
+    "graph_prompt_path": "v"
+  },
+  "GRAPH_PROMPT_PATH=\"yes\"": {
+    "graph_prompt_path": "yes"
+  },
+  "GRAPH_PROMPT_PATH=\"{\\\"a\\\":1}\"": {
+    "graph_prompt_path": "{\"a\":1}"
+  },
+  "GRAPH_PROMPT_PATH=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {
+    "graph_prompt_path": "{\"ssl\":\"verify-full\"}"
+  },
+  "GRAPH_PROMPT_PATH=\"{\\\"ssl\\\":true}\"": {
+    "graph_prompt_path": "{\"ssl\":true}"
+  },
   "HUGGINGFACE_TOKENIZER=\"  \"": {
     "embedding.ollama.huggingface_tokenizer": "  "
   },

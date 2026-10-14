@@ -12,6 +12,12 @@ use crate::cli::{AddAndCognifyArgs, ChunkerArg};
 use crate::error::CliError;
 
 pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> {
+    // `--dataset-name`, else the `default_dataset_name` setting (`main_dataset`
+    // when it is blank).
+    let dataset_name = args
+        .dataset_name
+        .clone()
+        .unwrap_or_else(|| cm.settings().effective_default_dataset_name().to_owned());
     let settings = cm.settings();
     // `None` all the way down selects the auto-calculation (Python `chunk_size=None`).
     let effective_chunk_size = args.chunk_size.or(settings.chunk_size);
@@ -85,14 +91,14 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
             .collect::<Vec<_>>();
 
         let added_data = ingest
-            .add(inputs, &args.dataset_name, owner_id, None)
+            .add(inputs, &dataset_name, owner_id, None)
             .await
             .map_err(|error| CliError::Runtime(format!("Add operation failed: {error}")))?;
 
         info!(
             "Success: Added {} item(s) to dataset '{}'.",
             added_data.len(),
-            args.dataset_name
+            dataset_name
         );
 
         if added_data.is_empty() {
@@ -103,7 +109,7 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         // ── Cognify only the newly-added items ──────────────────────────────
         let dataset = cognee::database::IngestDb::get_dataset_by_name(
             &*database,
-            &args.dataset_name,
+            &dataset_name,
             owner_id,
             None,
         )
@@ -111,13 +117,13 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         .map_err(|error| {
             CliError::Runtime(format!(
                 "Failed to resolve dataset '{}': {error}",
-                args.dataset_name
+                dataset_name
             ))
         })?
         .ok_or_else(|| {
             CliError::Validation(format!(
                 "Dataset '{}' was not found for owner {}",
-                args.dataset_name, owner_id
+                dataset_name, owner_id
             ))
         })?;
 
@@ -165,7 +171,7 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         info!(
             "Cognifying {} new data item(s) in dataset '{}'",
             added_data.len(),
-            args.dataset_name
+            dataset_name
         );
 
         // OSS build has no DB-backed user lookup (there is no `users`
@@ -199,7 +205,7 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         .map_err(|error| {
             CliError::Runtime(format!(
                 "Cognify execution failed for dataset '{}': {error}",
-                args.dataset_name
+                dataset_name
             ))
         })?;
 
