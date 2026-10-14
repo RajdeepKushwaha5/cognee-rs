@@ -39,7 +39,12 @@ So: `defaults < config.json < .env < env < code`.
 Parsing notes:
 * Booleans accept `true|1|yes|on` and `false|0|no` (`cognee_utils::parse_env_bool`).
 * Empty env values are treated as unset.
-* Numeric vars that fail to parse are ignored.
+* Numeric vars that fail to parse are ignored, and the previous value (usually
+  the default) stays in effect. A value outside the field's integer type counts
+  as a parse failure, so a port of `70000`, `-1` or `5000000000` keeps the
+  default. Any in-range value is accepted as-is, `0` included. Every port key
+  (`VECTOR_DB_PORT`, `GRAPH_DATABASE_PORT`, `DB_PORT`, `CACHE_PORT`) behaves this
+  way, as does every other integer key; the config goldens pin it.
 
 ### Two scopes
 
@@ -512,8 +517,30 @@ mode fails the call rather than falling through — the error names the pin, so 
 mode the endpoint cannot actually speak is diagnosable rather than silent. An
 unrecognised value falls back to `auto`.
 
-This is the counterpart of Python cognee's `llm_instructor_mode`; Python picks
-one mode per provider from a static table and has no cascade to bound.
+**Python's `LLM_INSTRUCTOR_MODE` is not an alias for this.** It covers similar
+ground but does not mean the same thing, so Rust does not read it. If a shared
+`.env` sets `LLM_INSTRUCTOR_MODE`, translate it to `LLM_STRUCTURED_OUTPUT_MODE`
+yourself. The two differ in four ways:
+
+- **When it applies.** Python reads `llm_instructor_mode` only on its
+  `instructor` structured-output framework (`STRUCTURED_OUTPUT_FRAMEWORK=instructor`).
+  The default framework, `litellm_native`, ignores it. Aliasing it would make a
+  value that does nothing in Python change behaviour in Rust.
+- **Values.** Python takes an `instructor.Mode` value: `json_schema_mode`,
+  `tool_call`, `tools_strict`, `markdown_json_mode`, `anthropic_tools`,
+  `mistral_tools` and so on, many of them specific to one provider. Only
+  `json_mode` and `function_call` are also spelled the same in Rust; anything
+  else falls back to `auto` here.
+- **Empty value.** Empty means the provider's entry in Python's static table
+  (`instructor_modes.py`, for example `json_schema_mode` for OpenAI). In Rust,
+  `auto` means the cascade.
+- **Scope and pinning.** Python's mode applies to every adapter, and
+  `json_schema_mode` is a pin. Rust's knob applies only to the OpenAI-compatible
+  adapter, and `json_schema` is not a pin (see below).
+
+Rough translation: `json_schema_mode` → `json_schema`; `tool_call` /
+`tools_strict` / `parallel_tool_call` → `tools`; `function_call` → `functions`;
+`json_mode` / `markdown_json_mode` → `json`.
 
 #### `json_schema` — constrained decoding
 
@@ -1428,9 +1455,9 @@ store id is an error.
 | Env var | Key (alias) | Default |
 |---|---|---|
 | `COGNEE_SESSION_STORE` | `session.store` (`session_store`) | `relational` |
-| `COGNEE_SESSION_DIR` | `session.fs.directory` (`session_directory`; `fs` builds) | `<system_root>/sessions` |
-| `CACHE_HOST` / `CACHE_PORT` | `session.redis.host` / `.port` (`cache_host` / `cache_port`; `redis` builds) | `localhost` / `6379` |
-| `CACHE_USERNAME` / `CACHE_PASSWORD` | `session.redis.username` / `.password` (`cache_*`; `redis` builds) | _(empty)_ |
+| `COGNEE_SESSION_DIR` | `session.fs.directory` (`session_directory`; `session-fs` builds only) | `<system_root>/sessions` |
+| `CACHE_HOST` / `CACHE_PORT` | `session.redis.host` / `.port` (`cache_host` / `cache_port`; `session-redis` builds only) | `localhost` / `6379` |
+| `CACHE_USERNAME` / `CACHE_PASSWORD` | `session.redis.username` / `.password` (`cache_*`; `session-redis` builds only) | _(empty)_ |
 | `COGNEE_FEEDBACK_LLM_TIMEOUT_MS` | `session.feedback_llm_timeout_ms` | `8000` (trace-step feedback LLM call) |
 | `SESSION_ABANDON_AFTER_SECONDS` | `session.abandon_after_seconds` (`session_abandon_after_seconds`) | `1800` (idle running session reads as `abandoned`) |
 | `CACHE_BACKEND` | `cache_backend` | `fs` (Python parity; not read — use `session.store`) |
@@ -1464,7 +1491,8 @@ These knobs form one resilience stack, matching Python cognee's:
   8s doubling to a 128s ceiling, and a `Retry-After` header is honoured (capped
   at 60s) when the provider sends one. Set `LLM_MIN_RETRY_SECONDS=0` to fail
   fast on attempts alone. The elapsed time measured against this floor excludes
-  time spent queued for an `LLM_MAX_IN_FLIGHT` slot: the floor is a "keep
+  time spent queued for an in-flight slot (the
+  `LLM_MAX_PARALLEL_REQUESTS` ceiling): the floor is a "keep
   retrying for at least this long" guarantee, so counting queue time against it
   could only ever end the ladder earlier, and a call that waited minutes for a
   slot would give up having barely retried at all.
