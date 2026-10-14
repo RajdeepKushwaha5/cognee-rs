@@ -483,6 +483,8 @@ pub struct AddAndCognifyArgs {
 pub enum QueryTypeArg {
     #[value(name = "GRAPH_COMPLETION")]
     GraphCompletion,
+    #[value(name = "HYBRID_COMPLETION")]
+    HybridCompletion,
     #[value(name = "RAG_COMPLETION")]
     RagCompletion,
     #[value(name = "CHUNKS")]
@@ -585,7 +587,7 @@ pub fn console_stream_for(command: &Commands) -> cognee_logging::ConsoleStream {
 pub struct SearchArgs {
     pub query_text: String,
 
-    #[arg(long = "query-type", short = 't', default_value = "GRAPH_COMPLETION")]
+    #[arg(long = "query-type", short = 't', default_value = "HYBRID_COMPLETION")]
     pub query_type: QueryTypeArg,
 
     #[arg(long = "datasets", short = 'd')]
