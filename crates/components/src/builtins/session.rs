@@ -12,7 +12,10 @@ use crate::error::ComponentError;
 use crate::traits::SessionStoreFactory;
 
 /// Sessions in the relational database the other components share
-/// (`session_qa_entries`, …). Registered as `relational` and `seaorm`.
+/// (`session_qa_entries`, …). Registered as `relational` and `seaorm`, and as
+/// `sqlite` and `postgres`, Python's `CACHE_BACKEND` values for its SQL
+/// session cache. It does not expire sessions: `session.ttl_seconds` applies
+/// to the `redis` and `fs` stores only.
 pub struct RelationalSessionFactory {
     provider: &'static str,
 }
@@ -68,7 +71,12 @@ impl SessionStoreFactory for FsSessionFactory {
         } else {
             std::path::PathBuf::from(configured)
         };
-        Ok(Arc::new(cognee_session::FsSessionStore::new(directory)))
+        let ttl = ctx
+            .section::<crate::sections::SessionConfig>()
+            .effective_ttl_seconds();
+        Ok(Arc::new(
+            cognee_session::FsSessionStore::new(directory).with_session_ttl_seconds(ttl),
+        ))
     }
 }
 
@@ -103,7 +111,11 @@ impl SessionStoreFactory for RedisSessionFactory {
             &cfg.password,
         )
         .await
-        .map_err(|e| ComponentError::SessionStore(e.to_string()))?;
+        .map_err(|e| ComponentError::SessionStore(e.to_string()))?
+        .with_session_ttl_seconds(
+            ctx.section::<crate::sections::SessionConfig>()
+                .effective_ttl_seconds(),
+        );
         Ok(Arc::new(store))
     }
 }

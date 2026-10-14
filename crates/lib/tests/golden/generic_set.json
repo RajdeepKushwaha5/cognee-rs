@@ -1755,23 +1755,21 @@
     "key": "aws_web_identity_token"
   },
   "cache_backend <- \"\"": {
-    "ok": {
-      "cache_backend": ""
-    }
+    "ok": {}
   },
   "cache_backend <- \"1\"": {
     "ok": {
-      "cache_backend": "1"
+      "session.cache_backend": "1"
     }
   },
   "cache_backend <- \"s\"": {
     "ok": {
-      "cache_backend": "s"
+      "session.cache_backend": "s"
     }
   },
   "cache_backend <- \"true\"": {
     "ok": {
-      "cache_backend": "true"
+      "session.cache_backend": "true"
     }
   },
   "cache_backend <- -1": {
@@ -1881,6 +1879,66 @@
   "cache_root_directory <- {\"a\":1}": {
     "err": "TypeMismatch",
     "key": "cache_root_directory"
+  },
+  "caching <- \"\"": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- \"1\"": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- \"s\"": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- \"true\"": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- -1": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- 0": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- 1": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- 5000000000": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- 70000": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- [1]": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- false": {
+    "ok": {
+      "session.caching": false
+    }
+  },
+  "caching <- null": {
+    "err": "TypeMismatch",
+    "key": "caching"
+  },
+  "caching <- true": {
+    "ok": {}
+  },
+  "caching <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "caching"
   },
   "chunk_engine <- \"\"": {
     "ok": {
@@ -4394,9 +4452,7 @@
     "key": "embedding.onnx.batch_size"
   },
   "embedding.onnx.model_path <- \"\"": {
-    "ok": {
-      "embedding.onnx.model_path": ""
-    }
+    "ok": {}
   },
   "embedding.onnx.model_path <- \"1\"": {
     "ok": {
@@ -4458,9 +4514,7 @@
     "key": "embedding.onnx.model_path"
   },
   "embedding.onnx.tokenizer_path <- \"\"": {
-    "ok": {
-      "embedding.onnx.tokenizer_path": ""
-    }
+    "ok": {}
   },
   "embedding.onnx.tokenizer_path <- \"1\"": {
     "ok": {
@@ -5402,9 +5456,7 @@
     "key": "embedding_model_name"
   },
   "embedding_model_path <- \"\"": {
-    "ok": {
-      "embedding.onnx.model_path": ""
-    }
+    "ok": {}
   },
   "embedding_model_path <- \"1\"": {
     "ok": {
@@ -5779,9 +5831,7 @@
     "key": "embedding_rate_limit_requests"
   },
   "embedding_tokenizer_path <- \"\"": {
-    "ok": {
-      "embedding.onnx.tokenizer_path": ""
-    }
+    "ok": {}
   },
   "embedding_tokenizer_path <- \"1\"": {
     "ok": {
@@ -5947,7 +5997,7 @@
   },
   "enable_caching <- false": {
     "ok": {
-      "enable_caching": false
+      "session.caching": false
     }
   },
   "enable_caching <- null": {
@@ -11775,24 +11825,19 @@
     "key": "mock_embedding"
   },
   "monitoring_tool <- \"\"": {
-    "ok": {
-      "monitoring_tool": ""
-    }
+    "ok": {}
   },
   "monitoring_tool <- \"1\"": {
-    "ok": {
-      "monitoring_tool": "1"
-    }
+    "err": "TypeMismatch",
+    "key": "monitoring_tool"
   },
   "monitoring_tool <- \"s\"": {
-    "ok": {
-      "monitoring_tool": "s"
-    }
+    "err": "TypeMismatch",
+    "key": "monitoring_tool"
   },
   "monitoring_tool <- \"true\"": {
-    "ok": {
-      "monitoring_tool": "true"
-    }
+    "err": "TypeMismatch",
+    "key": "monitoring_tool"
   },
   "monitoring_tool <- -1": {
     "err": "TypeMismatch",
@@ -14082,6 +14127,128 @@
     "err": "TypeMismatch",
     "key": "session.abandon_after_seconds"
   },
+  "session.cache_backend <- \"\"": {
+    "ok": {}
+  },
+  "session.cache_backend <- \"1\"": {
+    "ok": {
+      "session.cache_backend": "1"
+    }
+  },
+  "session.cache_backend <- \"s\"": {
+    "ok": {
+      "session.cache_backend": "s"
+    }
+  },
+  "session.cache_backend <- \"true\"": {
+    "ok": {
+      "session.cache_backend": "true"
+    }
+  },
+  "session.cache_backend <- -1": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- 0": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- 1": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- 5000000000": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- 70000": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- [1]": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- false": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- null": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- true": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.cache_backend <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "session.cache_backend"
+  },
+  "session.caching <- \"\"": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- \"1\"": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- \"s\"": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- \"true\"": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- -1": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- 0": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- 1": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- 5000000000": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- 70000": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- [1]": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- false": {
+    "ok": {
+      "session.caching": false
+    }
+  },
+  "session.caching <- null": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
+  "session.caching <- true": {
+    "ok": {}
+  },
+  "session.caching <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "session.caching"
+  },
   "session.feedback_llm_timeout_ms <- \"\"": {
     "err": "TypeMismatch",
     "key": "session.feedback_llm_timeout_ms"
@@ -14147,9 +14314,7 @@
     "key": "session.feedback_llm_timeout_ms"
   },
   "session.store <- \"\"": {
-    "ok": {
-      "session.store": ""
-    }
+    "ok": {}
   },
   "session.store <- \"1\"": {
     "ok": {
@@ -14209,6 +14374,71 @@
   "session.store <- {\"a\":1}": {
     "err": "TypeMismatch",
     "key": "session.store"
+  },
+  "session.ttl_seconds <- \"\"": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- \"1\"": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- \"s\"": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- \"true\"": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- -1": {
+    "ok": {
+      "session.ttl_seconds": -1
+    }
+  },
+  "session.ttl_seconds <- 0": {
+    "ok": {
+      "session.ttl_seconds": 0
+    }
+  },
+  "session.ttl_seconds <- 1": {
+    "ok": {
+      "session.ttl_seconds": 1
+    }
+  },
+  "session.ttl_seconds <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- 5000000000": {
+    "ok": {
+      "session.ttl_seconds": 5000000000
+    }
+  },
+  "session.ttl_seconds <- 70000": {
+    "ok": {
+      "session.ttl_seconds": 70000
+    }
+  },
+  "session.ttl_seconds <- [1]": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- false": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- null": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- true": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
+  },
+  "session.ttl_seconds <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "session.ttl_seconds"
   },
   "session_abandon_after_seconds <- \"\"": {
     "err": "TypeMismatch",
@@ -14275,9 +14505,7 @@
     "key": "session_abandon_after_seconds"
   },
   "session_store <- \"\"": {
-    "ok": {
-      "session.store": ""
-    }
+    "ok": {}
   },
   "session_store <- \"1\"": {
     "ok": {
@@ -14355,17 +14583,18 @@
     "key": "session_ttl_seconds"
   },
   "session_ttl_seconds <- -1": {
-    "err": "TypeMismatch",
-    "key": "session_ttl_seconds"
+    "ok": {
+      "session.ttl_seconds": -1
+    }
   },
   "session_ttl_seconds <- 0": {
     "ok": {
-      "session_ttl_seconds": 0
+      "session.ttl_seconds": 0
     }
   },
   "session_ttl_seconds <- 1": {
     "ok": {
-      "session_ttl_seconds": 1
+      "session.ttl_seconds": 1
     }
   },
   "session_ttl_seconds <- 1.5": {
@@ -14374,12 +14603,12 @@
   },
   "session_ttl_seconds <- 5000000000": {
     "ok": {
-      "session_ttl_seconds": 5000000000
+      "session.ttl_seconds": 5000000000
     }
   },
   "session_ttl_seconds <- 70000": {
     "ok": {
-      "session_ttl_seconds": 70000
+      "session.ttl_seconds": 70000
     }
   },
   "session_ttl_seconds <- [1]": {

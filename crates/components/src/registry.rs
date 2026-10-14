@@ -163,8 +163,10 @@ impl ComponentRegistry {
         }
 
         // ── session store ─────────────────────────────────────────────────
-        // `seaorm` is the HTTP server's historical id for the same store.
-        for id in ["relational", "seaorm"] {
+        // `seaorm` is the HTTP server's historical id for the same store;
+        // `sqlite` and `postgres` are Python's `CACHE_BACKEND` values for its
+        // SQL session cache, which is the relational store here.
+        for id in ["relational", "seaorm", "sqlite", "postgres"] {
             reg.register_session_store(Arc::new(
                 crate::builtins::session::RelationalSessionFactory::new(id),
             ));
@@ -611,13 +613,13 @@ impl ComponentRegistry {
         ctx: &BackendBuildContext,
         database: Arc<dyn RelationalDb>,
     ) -> Result<Arc<dyn SessionStore>, ComponentError> {
-        let store = ctx.section::<SessionConfig>().store;
-        let key = store.trim().to_lowercase();
-        let key = if key.is_empty() {
-            "relational".to_string()
-        } else {
-            key
-        };
+        let session = ctx.section::<SessionConfig>();
+        if !session.caching {
+            // Python's `CACHING=false`: no cache engine at all, whatever
+            // `CACHE_BACKEND` names.
+            return Ok(Arc::new(cognee_session::DisabledSessionStore));
+        }
+        let key = self.selected_session_store(&session);
         let factory = self.session_store.get(&key).ok_or_else(|| {
             ComponentError::Config(unsupported_msg(
                 "session_store",
@@ -626,6 +628,35 @@ impl ComponentRegistry {
             ))
         })?;
         factory.build(ctx, database).await
+    }
+
+    /// The session-store id to build: `session.store` when set (an
+    /// unregistered id then fails the build), else Python's `CACHE_BACKEND`
+    /// (`session.cache_backend`) when a factory is registered for it, else
+    /// `relational`. An unregistered `CACHE_BACKEND` value is only warned
+    /// about: it is a Python setting picked up implicitly, often from a
+    /// shared `.env`, and naming a store this build lacks (`turso`, `tapes`,
+    /// or `redis` / `fs` without their feature) must not take down entry
+    /// points that never use a session.
+    fn selected_session_store(&self, session: &SessionConfig) -> String {
+        let store = session.store.trim().to_lowercase();
+        if !store.is_empty() {
+            return store;
+        }
+        let fallback = session.cache_backend.trim().to_lowercase();
+        if fallback.is_empty() {
+            return "relational".to_string();
+        }
+        if self.session_store.contains_key(&fallback) {
+            return fallback;
+        }
+        tracing::warn!(
+            cache_backend = %fallback,
+            "CACHE_BACKEND names a session store this build does not provide; using the \
+             `relational` store instead. {}",
+            unsupported_msg("session_store", &fallback, &self.session_store_providers())
+        );
+        "relational".to_string()
     }
 
     /// Store ids with a registered session-store factory (sorted).
@@ -1753,6 +1784,97 @@ pub(crate) mod tests {
             .expect("seaorm is the relational store");
     }
 
+    /// Python's `CACHE_BACKEND` values for its SQL session cache select the
+    /// relational store.
+    #[tokio::test]
+    async fn python_sql_cache_backends_are_the_relational_store() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        for id in ["sqlite", "postgres"] {
+            ctx.sections
+                .insert("session.store".to_string(), serde_json::json!(id));
+            reg.build_session_store(&ctx, Arc::clone(&db))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+    }
+
+    /// `session.caching = false` (Python's `CACHING=false`) keeps nothing,
+    /// whatever store is selected: reads are empty and storing a Q&A entry
+    /// reports that session memory is off.
+    #[tokio::test]
+    async fn caching_off_selects_the_disabled_store() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        ctx.sections
+            .insert("session.caching".to_string(), serde_json::json!(false));
+        // Not even an unregistered store id is looked up.
+        ctx.sections
+            .insert("session.store".to_string(), serde_json::json!("nowhere"));
+        let store = reg
+            .build_session_store(&ctx, db)
+            .await
+            .expect("the disabled store builds");
+        assert!(matches!(
+            store.create_qa_entry("s", None, "q", "a", None).await,
+            Err(cognee_session::SessionError::Disabled)
+        ));
+        assert!(
+            store
+                .get_all_qa_entries("s", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Python's `CACHE_BACKEND` (`session.cache_backend`) is only a fallback:
+    /// a value naming a store this build lacks selects the relational store
+    /// instead of failing, so a `.env` shared with Python cannot take down
+    /// every entry point; an explicit `session.store` still wins and still
+    /// fails when unregistered.
+    #[tokio::test]
+    async fn an_unregistered_cache_backend_falls_back_to_the_relational_store() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        let mut unregistered = vec!["turso", "tapes"];
+        if cfg!(not(feature = "session-redis")) {
+            unregistered.push("redis");
+        }
+        if cfg!(not(feature = "session-fs")) {
+            unregistered.push("fs");
+        }
+        for id in unregistered {
+            ctx.sections
+                .insert("session.cache_backend".to_string(), serde_json::json!(id));
+            assert_eq!(reg.selected_session_store(&ctx.section()), "relational");
+            let store = reg
+                .build_session_store(&ctx, Arc::clone(&db))
+                .await
+                .unwrap_or_else(|e| panic!("CACHE_BACKEND={id} must not fail: {e}"));
+            store
+                .create_qa_entry("s", None, "q", "a", None)
+                .await
+                .unwrap_or_else(|e| panic!("{id}: the relational store keeps entries: {e}"));
+        }
+
+        // A registered CACHE_BACKEND value is used.
+        ctx.sections.insert(
+            "session.cache_backend".to_string(),
+            serde_json::json!("SQLite"),
+        );
+        assert_eq!(reg.selected_session_store(&ctx.section()), "sqlite");
+
+        // An explicit session.store wins over it, and an unregistered one is
+        // still an error.
+        ctx.sections
+            .insert("session.store".to_string(), serde_json::json!("nowhere"));
+        assert!(reg.build_session_store(&ctx, db).await.is_err());
+    }
+
     #[cfg(not(feature = "session-redis"))]
     #[tokio::test]
     async fn a_compiled_out_session_store_points_at_its_feature() {
@@ -1771,6 +1893,157 @@ pub(crate) mod tests {
         // Its settings are not registered either.
         let schema = reg.config_schema().expect("schema");
         assert!(schema.key_def("cache_host").is_none());
+    }
+
+    /// `session.ttl_seconds` reaches the `fs` store: a session file not
+    /// written within it reads as gone.
+    #[cfg(feature = "session-fs")]
+    #[tokio::test]
+    async fn the_fs_session_store_applies_the_session_ttl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        for (key, value) in [
+            ("session.store", serde_json::json!("fs")),
+            (
+                "session.fs.directory",
+                serde_json::json!(dir.path().to_string_lossy()),
+            ),
+            ("session.ttl_seconds", serde_json::json!(60)),
+        ] {
+            ctx.sections.insert(key.to_string(), value);
+        }
+        let store = reg.build_session_store(&ctx, db).await.expect("fs builds");
+        store
+            .create_qa_entry("s1", Some("u"), "q", "a", None)
+            .await
+            .expect("write");
+        let file = dir.path().join("u").join("s1.json");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("session file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .expect("age the file");
+        assert!(
+            store
+                .get_all_qa_entries("s1", Some("u"))
+                .await
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// `session.ttl_seconds` reaches the `redis` store: an entry written with
+    /// a one-second TTL is gone a little later. Needs a Redis server:
+    /// `REDIS_TEST_URL=redis://<host>:<port>`; skipped when unset. CI runs it
+    /// in the `redis-session` lane.
+    #[cfg(feature = "session-redis")]
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the Redis server under test is named by the process env"
+    )]
+    async fn the_redis_session_store_applies_the_session_ttl() {
+        let Some(url) = std::env::var("REDIS_TEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
+            eprintln!(
+                "REDIS_TEST_URL not set — skipping the_redis_session_store_applies_the_session_ttl"
+            );
+            return;
+        };
+        let authority = url.trim_start_matches("redis://").trim_end_matches('/');
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse::<u16>().expect("REDIS_TEST_URL port")),
+            None => (authority, 6379),
+        };
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        for (key, value) in [
+            ("session.store", serde_json::json!("redis")),
+            ("session.redis.host", serde_json::json!(host)),
+            ("session.redis.port", serde_json::json!(port)),
+            ("session.ttl_seconds", serde_json::json!(1)),
+        ] {
+            ctx.sections.insert(key.to_string(), value);
+        }
+        let store = reg
+            .build_session_store(&ctx, db)
+            .await
+            .expect("redis builds");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        let session = format!("registry-ttl-{nanos}");
+        store
+            .create_qa_entry(&session, Some("u"), "q", "a", None)
+            .await
+            .expect("write");
+        assert_eq!(
+            store
+                .get_all_qa_entries(&session, Some("u"))
+                .await
+                .expect("read")
+                .len(),
+            1
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            store
+                .get_all_qa_entries(&session, Some("u"))
+                .await
+                .expect("read")
+                .is_empty(),
+            "the entry outlived session.ttl_seconds"
+        );
+    }
+
+    /// A negative `session.ttl_seconds` (Python's `SESSION_TTL_SECONDS=-1`)
+    /// never expires: an old session file is still read back.
+    #[cfg(feature = "session-fs")]
+    #[tokio::test]
+    async fn a_negative_session_ttl_never_expires_fs_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        let db = reg.build_database(&ctx).await.expect("sqlite builds");
+        for (key, value) in [
+            ("session.store", serde_json::json!("fs")),
+            (
+                "session.fs.directory",
+                serde_json::json!(dir.path().to_string_lossy()),
+            ),
+            ("session.ttl_seconds", serde_json::json!(-1)),
+        ] {
+            ctx.sections.insert(key.to_string(), value);
+        }
+        let store = reg.build_session_store(&ctx, db).await.expect("fs builds");
+        store
+            .create_qa_entry("s1", Some("u"), "q", "a", None)
+            .await
+            .expect("write");
+        let file = dir.path().join("u").join("s1.json");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("session file")
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600),
+            )
+            .expect("age the file");
+        assert_eq!(
+            store
+                .get_all_qa_entries("s1", Some("u"))
+                .await
+                .expect("read")
+                .len(),
+            1
+        );
     }
 
     #[cfg(feature = "session-fs")]
@@ -1799,6 +2072,7 @@ pub(crate) mod tests {
             sections: Default::default(),
             data_root_directory: std::path::PathBuf::from("/tmp/cognee-test-data"),
             system_root_directory: std::path::PathBuf::from("/tmp/cognee-test-system"),
+            cache_root_directory: std::path::PathBuf::from("/tmp/cognee-test-cache"),
             relational_db_url: "sqlite::memory:".to_string(),
             graph_provider: "ladybug".to_string(),
             graph_file_path: String::new(),
