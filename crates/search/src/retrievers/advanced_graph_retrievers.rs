@@ -138,6 +138,10 @@ impl SearchRetriever for GraphSummaryCompletionRetriever {
         SearchType::GraphSummaryCompletion
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
@@ -155,7 +159,12 @@ impl SearchRetriever for GraphSummaryCompletionRetriever {
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
         self.core.ensure_graph_not_empty().await?;
-        self.core.search(query, params).await
+        // Scoped here, not only by the orchestrator: `get_completion` calls
+        // this again for follow-up retrievals the orchestrator never sees.
+        Ok(crate::orchestration::filter_context_to_params(
+            self.core.search(query, params).await?,
+            params,
+        ))
     }
 
     async fn completion_messages(
@@ -331,6 +340,10 @@ impl SearchRetriever for GraphCompletionContextExtensionRetriever {
         SearchType::GraphCompletionContextExtension
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
@@ -347,7 +360,12 @@ impl SearchRetriever for GraphCompletionContextExtensionRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        self.core.search(query, params).await
+        // Scoped here, not only by the orchestrator: `get_completion` calls
+        // this again for follow-up retrievals the orchestrator never sees.
+        Ok(crate::orchestration::filter_context_to_params(
+            self.core.search(query, params).await?,
+            params,
+        ))
     }
 
     /// The final prompt over the extended context. The extension rounds call
@@ -581,6 +599,10 @@ impl SearchRetriever for GraphCompletionCotRetriever {
         SearchType::GraphCompletionCot
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
@@ -597,7 +619,12 @@ impl SearchRetriever for GraphCompletionCotRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        self.core.search(query, params).await
+        // Scoped here, not only by the orchestrator: `get_completion` calls
+        // this again for follow-up retrievals the orchestrator never sees.
+        Ok(crate::orchestration::filter_context_to_params(
+            self.core.search(query, params).await?,
+            params,
+        ))
     }
 
     /// The final prompt over the context the reasoning ended with. The

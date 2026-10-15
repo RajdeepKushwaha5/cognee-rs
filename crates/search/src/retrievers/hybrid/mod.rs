@@ -744,27 +744,26 @@ fn tag_chunk_item(mut item: SearchItem, chunk_summaries: &HashMap<String, String
     item
 }
 
-/// Stamp the resolved dataset scope onto a graph-derived item's payload so
-/// dataset-scope bucketing retains it.
+/// Stamp an entity's or fact's own dataset membership onto its item, so the
+/// dataset scope filter
+/// ([`filter_context_to_datasets`](crate::orchestration::filter_context_to_datasets))
+/// can decide on it like on a chunk.
 ///
-/// Entities and facts come from the knowledge graph and — unlike vector chunks,
-/// which carry their real `dataset_ids` membership from the store — have no
-/// per-item dataset membership of their own. Without a dataset key,
-/// [`scope_context_by_datasets`](crate::orchestration::scope_context_by_datasets)
-/// buckets them nowhere and silently discards them under any dataset scope,
-/// leaving a scoped hybrid completion to answer from chunks alone. Python's
-/// hybrid retriever flows entity/fact context regardless of scope, so we mirror
-/// that by stamping the full resolved scope (`scope`) onto every such item:
-/// the bucketer's authoritative `dataset_ids` array then assigns the item to
-/// every requested dataset. A no-op when `scope` is empty (unscoped request).
-fn stamp_scope(mut item: SearchItem, scope: &[String]) -> SearchItem {
-    if scope.is_empty() {
+/// `membership` is what the item's own vector row records (`Entity_name` for
+/// an entity, `EdgeType` for a fact; see
+/// [`dataset_membership`](results::dataset_membership)). It used to be the
+/// request's whole scope instead, which admitted every entity and fact under
+/// any scope, so a scoped search could answer from datasets outside it — with
+/// access control, datasets the caller may not read. An item whose row carries
+/// no membership gets no key and is dropped under a scope (fail closed).
+fn stamp_membership(mut item: SearchItem, membership: &[String]) -> SearchItem {
+    if membership.is_empty() {
         return item;
     }
     if let Value::Object(map) = &mut item.payload {
         map.insert(
             "dataset_ids".to_string(),
-            Value::Array(scope.iter().cloned().map(Value::String).collect()),
+            Value::Array(membership.iter().cloned().map(Value::String).collect()),
         );
     }
     item
@@ -772,9 +771,9 @@ fn stamp_scope(mut item: SearchItem, scope: &[String]) -> SearchItem {
 
 /// Convert an [`EntityResult`] into a `"kind": "entity"` tagged [`SearchItem`],
 /// nesting the edge bullets as a JSON array so downstream consumers can walk
-/// them without a second schema. `scope` is the resolved dataset scope stamped
-/// on so the item survives dataset bucketing (see [`stamp_scope`]).
-fn entity_to_item(entity: &EntityResult, scope: &[String]) -> SearchItem {
+/// them without a second schema, stamped with the entity's own dataset
+/// membership (see [`stamp_membership`]).
+fn entity_to_item(entity: &EntityResult) -> SearchItem {
     let edges: Vec<Value> = entity
         .edges
         .iter()
@@ -791,7 +790,7 @@ fn entity_to_item(entity: &EntityResult, scope: &[String]) -> SearchItem {
         })
         .collect();
 
-    stamp_scope(
+    stamp_membership(
         SearchItem {
             id: Uuid::parse_str(&entity.id).ok(),
             score: None,
@@ -804,16 +803,16 @@ fn entity_to_item(entity: &EntityResult, scope: &[String]) -> SearchItem {
                 "edges": edges,
             }),
         },
-        scope,
+        &entity.dataset_ids,
     )
 }
 
 /// Convert a [`FactResult`] into a `"kind": "fact"` tagged [`SearchItem`]. No
 /// `source_id`/`target_id`/`edges` — the field-level contract that lets a
-/// kind-aware id extractor skip facts. `scope` is the resolved dataset scope
-/// stamped on so the item survives dataset bucketing (see [`stamp_scope`]).
-fn fact_to_item(fact: &FactResult, scope: &[String]) -> SearchItem {
-    stamp_scope(
+/// kind-aware id extractor skip facts. Stamped with the fact's own dataset
+/// membership (see [`stamp_membership`]).
+fn fact_to_item(fact: &FactResult) -> SearchItem {
+    stamp_membership(
         SearchItem {
             id: Uuid::parse_str(&fact.id).ok(),
             score: None,
@@ -823,7 +822,7 @@ fn fact_to_item(fact: &FactResult, scope: &[String]) -> SearchItem {
                 "text": fact.text,
             }),
         },
-        scope,
+        &fact.dataset_ids,
     )
 }
 
@@ -869,6 +868,7 @@ fn item_to_entity(item: &SearchItem) -> EntityResult {
         edges,
         // Only fact selection reads it, and that runs before serialization.
         covered_edge_type_ids: vec![],
+        dataset_ids: payload_str_array(payload, "dataset_ids"),
     }
 }
 
@@ -877,13 +877,32 @@ fn item_to_fact(item: &SearchItem) -> FactResult {
     FactResult {
         id: payload_str(&item.payload, "id"),
         text: payload_str(&item.payload, "text"),
+        dataset_ids: payload_str_array(&item.payload, "dataset_ids"),
     }
+}
+
+fn payload_str_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[async_trait]
 impl SearchRetriever for HybridRetriever {
     fn search_type(&self) -> SearchType {
         SearchType::HybridCompletion
+    }
+
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
     }
 
     #[cfg(test)]
@@ -983,27 +1002,16 @@ impl SearchRetriever for HybridRetriever {
             chunk_summaries,
         } = chunk_result;
 
-        // Resolved dataset scope stamped onto graph-derived entity/fact items so
-        // they survive `scope_context_by_datasets` bucketing (chunks already
-        // carry their real `dataset_ids` membership from the vector store).
-        let scope_dataset_ids: Vec<String> = params
-            .dataset_ids
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(Uuid::to_string)
-            .collect();
-
         let mut context: SearchContext =
             Vec::with_capacity(chunks.len() + entities.len() + facts.len());
         for chunk in chunks {
             context.push(tag_chunk_item(chunk, &chunk_summaries));
         }
         for entity in &entities {
-            context.push(entity_to_item(entity, &scope_dataset_ids));
+            context.push(entity_to_item(entity));
         }
         for fact in &facts {
-            context.push(fact_to_item(fact, &scope_dataset_ids));
+            context.push(fact_to_item(fact));
         }
         Ok(context)
     }
@@ -1356,50 +1364,80 @@ mod retriever_tests {
         assert_eq!(fact.payload["text"], json!(FACT_TEXT));
     }
 
+    /// Entity and fact items carry their **own** dataset membership, read
+    /// from their vector rows — not the request's scope. They used to be
+    /// stamped with the whole scope, which admitted every entity and fact under
+    /// any scope: with access control, a search scoped to the caller's
+    /// readable datasets answered from datasets outside it.
+    ///
+    /// Setup: the entity's `Entity_name` row belongs to dataset A, the fact's
+    /// `EdgeType` row to dataset B. Expected: each item is stamped with its own
+    /// dataset whatever the scope, so a scope of {A} keeps the entity and drops
+    /// the fact, {A, B} keeps both, and an unrelated scope keeps neither.
     #[tokio::test]
-    async fn dataset_scoped_context_retains_entity_and_fact_sections() {
-        // Graph-derived entity/fact items carry no per-item dataset membership,
-        // so before the fix `scope_context_by_datasets` bucketed them nowhere
-        // and discarded them under scope. With the resolved scope stamped onto
-        // their payloads they must survive bucketing alongside chunks — matching
-        // Python, which flows entity/fact context regardless of scope.
-        let (vector_db, graph_db, _alice) = populated_dbs().await;
+    async fn entity_and_fact_items_carry_their_own_dataset_membership() {
+        let (vector_db, graph_db, alice) = populated_dbs().await;
+        let dataset_a = Uuid::new_v4();
+        let dataset_b = Uuid::new_v4();
+        vector_db
+            .index_points(
+                "Entity",
+                "name",
+                &[VectorPoint::new(alice, vec![1.0, 0.0])
+                    .with_metadata("id", json!(alice.to_string()))
+                    .with_metadata("name", json!(ENTITY_NAME))
+                    .with_metadata("dataset_id", json!(dataset_a.to_string()))],
+            )
+            .await
+            .unwrap();
+        let fact_edge_id = EdgeType::deterministic_id(FACT_TEXT);
+        vector_db
+            .index_points(
+                "EdgeType",
+                "relationship_name",
+                &[VectorPoint::new(fact_edge_id, vec![1.0, 0.0])
+                    .with_metadata("id", json!(fact_edge_id.to_string()))
+                    .with_metadata("text", json!(FACT_TEXT))
+                    .with_metadata("dataset_id", json!(dataset_b.to_string()))],
+            )
+            .await
+            .unwrap();
         let llm = Arc::new(CapturingLlm::default());
         let retriever = retriever(vector_db, graph_db, llm);
 
-        let dataset_a = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
         let params = SearchParams {
-            dataset_ids: Some(vec![dataset_a]),
+            dataset_ids: Some(vec![unrelated]),
             ..SearchParams::default()
         };
-
         let context = retriever.get_context("query", &params).await.unwrap();
-
-        // The retriever stamped the resolved scope onto entity/fact items.
         for item in &context {
             match item.payload.get("kind").and_then(Value::as_str) {
-                Some("entity") | Some("fact") => {
-                    assert_eq!(
-                        item.payload["dataset_ids"],
-                        json!([dataset_a.to_string()]),
-                        "entity/fact items must carry the resolved dataset scope"
-                    );
+                Some("entity") => {
+                    assert_eq!(item.payload["dataset_ids"], json!([dataset_a.to_string()]))
+                }
+                Some("fact") => {
+                    assert_eq!(item.payload["dataset_ids"], json!([dataset_b.to_string()]))
                 }
                 _ => {}
             }
         }
 
-        // The bucketer must retain entity + fact under the scoped dataset.
-        let scoped = crate::orchestration::scope_context_by_datasets(&context, &[dataset_a]);
-        let bucket = scoped.get(&dataset_a.to_string()).expect("scoped bucket");
-        let bucket_kinds = kinds(bucket);
+        let kinds_in = |scope: &[Uuid]| {
+            kinds(&crate::orchestration::filter_context_to_datasets(
+                &context, scope,
+            ))
+        };
+        let only_a = kinds_in(&[dataset_a]);
+        assert!(only_a.iter().any(|k| k == "entity"), "{only_a:?}");
+        assert!(!only_a.iter().any(|k| k == "fact"), "{only_a:?}");
+        let both = kinds_in(&[dataset_a, dataset_b]);
+        assert!(both.iter().any(|k| k == "entity"), "{both:?}");
+        assert!(both.iter().any(|k| k == "fact"), "{both:?}");
+        let neither = kinds_in(&[unrelated]);
         assert!(
-            bucket_kinds.iter().any(|k| k == "entity"),
-            "entity section must survive dataset scoping, got {bucket_kinds:?}"
-        );
-        assert!(
-            bucket_kinds.iter().any(|k| k == "fact"),
-            "fact section must survive dataset scoping, got {bucket_kinds:?}"
+            !neither.iter().any(|k| k == "entity" || k == "fact"),
+            "an unrelated scope must admit no entity or fact: {neither:?}"
         );
     }
 

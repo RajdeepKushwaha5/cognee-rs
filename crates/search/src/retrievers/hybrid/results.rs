@@ -21,6 +21,25 @@ pub(crate) fn payload(item: &SearchItem) -> &Value {
     &item.payload
 }
 
+/// The datasets a vector hit belongs to, as stored on its row: the
+/// `dataset_ids` union array when present, else the legacy scalar
+/// `dataset_id`. Empty when the row carries neither.
+pub(crate) fn dataset_membership(item: &SearchItem) -> Vec<String> {
+    let payload = payload(item);
+    match payload.get("dataset_ids").and_then(Value::as_array) {
+        Some(ids) => ids
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        None => payload
+            .get("dataset_id")
+            .and_then(Value::as_str)
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
 /// Render a scalar JSON value as a trimmed display string, or `None`.
 ///
 /// Port of `results.py:12-18`: `Null` → `None`; `String`/`Number`/`Bool` →

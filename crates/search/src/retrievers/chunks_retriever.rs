@@ -39,6 +39,10 @@ impl SearchRetriever for ChunksRetriever {
         SearchType::Chunks
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     #[tracing::instrument(
         name = "cognee.retrieval.get_context",
         skip(self, params),

@@ -93,6 +93,10 @@ impl SearchRetriever for GraphCompletionRetriever {
         SearchType::GraphCompletion
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {

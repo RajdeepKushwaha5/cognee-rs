@@ -169,11 +169,20 @@ impl DatasetManager {
     ) -> Result<DeleteResult, DatasetError> {
         let dataset = self.require_dataset(dataset_id).await?;
         self.check_delete_permission(owner_id, dataset_id).await?;
-        let request = DeleteRequest {
-            scope: DeleteScope::Dataset {
+        // With an ACL the `delete` grant just checked is the authorization,
+        // so the dataset is deleted by id whoever owns it (Python
+        // `empty_dataset`, `datasets.py:184-215` at f154b32; SDK-936).
+        // Without one, ownership is the authorization: the owner-scoped form.
+        let scope = if self.acl_db.is_some() {
+            DeleteScope::DatasetById { dataset_id }
+        } else {
+            DeleteScope::Dataset {
                 owner_id,
                 dataset_name: dataset.name,
-            },
+            }
+        };
+        let request = DeleteRequest {
+            scope,
             mode: DeleteMode::Hard,
             memory_only: false,
         };
@@ -194,13 +203,24 @@ impl DatasetManager {
     ) -> Result<DeleteResult, DatasetError> {
         let dataset = self.require_dataset(dataset_id).await?;
         self.check_delete_permission(owner_id, dataset_id).await?;
-        let request = DeleteRequest {
-            scope: DeleteScope::Data {
+        // As in `empty_dataset`: by id under an ACL (Python `delete_data`,
+        // `datasets.py:218-313` at f154b32), owner-scoped without one.
+        let scope = if self.acl_db.is_some() {
+            DeleteScope::DataInDataset {
+                dataset_id,
+                data_id,
+                delete_dataset_if_empty,
+            }
+        } else {
+            DeleteScope::Data {
                 owner_id,
                 data_id,
                 dataset_name: Some(dataset.name),
                 delete_dataset_if_empty,
-            },
+            }
+        };
+        let request = DeleteRequest {
+            scope,
             mode,
             memory_only: false,
         };
@@ -866,5 +886,136 @@ mod tests {
         mgr.empty_dataset(ds.id, member, &delete_service)
             .await
             .expect("a role-held delete grant must authorize empty_dataset");
+    }
+
+    /// SDK-936. Scenario: Alice owns a dataset with one data item; Bob holds
+    /// a direct `delete` grant on it, Carol holds only `read`.
+    /// Expected (Python `datasets.delete_data` / `empty_dataset`, which
+    /// authorize by `delete` grant on the dataset id, not ownership —
+    /// `datasets.py:184-313` at f154b32): Carol is `PermissionDenied`; Bob
+    /// can delete the item and then empty the dataset. Before the fix both
+    /// of Bob's calls passed the gate and then failed resolving the dataset by
+    /// `(name, Bob)` — the grant could never be used.
+    #[tokio::test]
+    async fn acl_delete_grant_lets_a_non_owner_delete() {
+        use cognee_database::DeleteDb;
+        let db = fresh_db().await;
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+        let ds = make_dataset(alice);
+        let data = make_data(alice);
+        let ingest: &dyn IngestDb = db.as_ref();
+        ingest
+            .create_dataset(ds.clone())
+            .await
+            .expect("create_dataset");
+        ingest.create_data(data.clone()).await.expect("create_data");
+        ingest
+            .attach_data_to_dataset(ds.id, data.id)
+            .await
+            .expect("attach_data");
+        let second = make_data(alice);
+        ingest
+            .create_data(second.clone())
+            .await
+            .expect("create_data");
+        ingest
+            .attach_data_to_dataset(ds.id, second.id)
+            .await
+            .expect("attach_data");
+
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(bob, ds.id, "delete")
+            .await
+            .expect("grant");
+        acl.grant_permission(carol, ds.id, "read")
+            .await
+            .expect("grant");
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn cognee_storage::StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+        let mgr =
+            DatasetManager::new(db.clone() as Arc<dyn DatasetDb>).with_acl(acl as Arc<dyn AclDb>);
+
+        let err = mgr
+            .delete_data(
+                ds.id,
+                data.id,
+                carol,
+                DeleteMode::Soft,
+                false,
+                &delete_service,
+            )
+            .await
+            .expect_err("read is not delete");
+        assert!(matches!(err, DatasetError::PermissionDenied), "{err:?}");
+
+        mgr.delete_data(
+            ds.id,
+            data.id,
+            bob,
+            DeleteMode::Soft,
+            false,
+            &delete_service,
+        )
+        .await
+        .expect("a delete grant must let a non-owner delete a data item");
+        let remaining: Vec<Uuid> = DeleteDb::get_dataset_data(db.as_ref(), ds.id)
+            .await
+            .expect("dataset data")
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(remaining, vec![second.id]);
+
+        mgr.empty_dataset(ds.id, bob, &delete_service)
+            .await
+            .expect("a delete grant must let a non-owner empty the dataset");
+        assert!(
+            ingest.get_dataset(ds.id).await.expect("lookup").is_none(),
+            "the dataset must be gone"
+        );
+    }
+
+    /// SDK-936 guard: without an ACL nothing changes — ownership is the
+    /// authorization, so a non-owner's delete resolves the dataset by
+    /// `(name, caller)` and fails, and the owner's succeeds.
+    #[tokio::test]
+    async fn without_acl_delete_stays_owner_scoped() {
+        use cognee_database::DeleteDb;
+        let db = fresh_db().await;
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let ds = make_dataset(alice);
+        let ingest: &dyn IngestDb = db.as_ref();
+        ingest
+            .create_dataset(ds.clone())
+            .await
+            .expect("create_dataset");
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn cognee_storage::StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+        let mgr = DatasetManager::new(db.clone() as Arc<dyn DatasetDb>);
+
+        let err = mgr
+            .empty_dataset(ds.id, bob, &delete_service)
+            .await
+            .expect_err("a non-owner must not delete without an ACL");
+        assert!(
+            matches!(
+                err,
+                DatasetError::Delete(cognee_delete::DeleteError::Validation(_))
+            ),
+            "{err:?}"
+        );
+        assert!(ingest.get_dataset(ds.id).await.expect("lookup").is_some());
+
+        mgr.empty_dataset(ds.id, alice, &delete_service)
+            .await
+            .expect("the owner deletes");
+        assert!(ingest.get_dataset(ds.id).await.expect("lookup").is_none());
     }
 }

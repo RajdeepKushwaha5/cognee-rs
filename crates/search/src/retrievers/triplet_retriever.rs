@@ -145,6 +145,10 @@ impl SearchRetriever for TripletRetriever {
         SearchType::TripletCompletion
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     async fn get_context(
         &self,
         query: &str,

@@ -109,6 +109,10 @@ impl SearchRetriever for CompletionRetriever {
         SearchType::RagCompletion
     }
 
+    fn dataset_scoping(&self) -> super::DatasetScoping {
+        super::DatasetScoping::Membership
+    }
+
     async fn get_context(
         &self,
         query: &str,

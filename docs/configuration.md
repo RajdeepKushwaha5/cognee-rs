@@ -1506,6 +1506,30 @@ carrying `ENABLE_BACKEND_ACCESS_CONTROL=false` loads without a warning. Python
 defaults the flag to `true`; this is a deliberate divergence. Every truthy
 spelling (`true`, `1`, `yes`, `on`, any case) counts as `true`.
 
+What an attached `AclDb` changes for search and recall:
+
+- Explicit `dataset_ids` and dataset names are authorized against the caller's
+  `read` grants (direct, tenant and role), counting only datasets in the
+  caller's tenant (`SearchRequest::tenant_id`, strict equality: no tenant
+  reads only tenant-less datasets), as Python's
+  `get_all_user_permission_datasets` does.
+- A request that names no dataset is scoped to every dataset the caller may
+  read, and returns an empty result when there is none (Python's ACL mode,
+  where `dataset_ids=None` means "all readable datasets"). Every search then
+  needs the caller's user id; recall with an unknown caller gets no graph
+  results.
+- Scoping filters results on their dataset membership, because all datasets
+  share one graph and vector store (Python instead runs the search inside each
+  dataset's own databases). Search types whose results carry no membership —
+  `TEMPORAL`, `CYPHER`, `NATURAL_LANGUAGE`, `CHUNKS_LEXICAL`, `FEELING_LUCKY`,
+  `CODING_RULES` and community retrievers that do not declare
+  `DatasetScoping::Membership` — are refused with an invalid-input error
+  rather than answered empty or across datasets the caller may not read.
+  `FEEDBACK` is not dataset data and is not scoped.
+
+Without an `AclDb`, an unfiltered search stays unscoped and every type runs, as
+in Python's non-ACL mode.
+
 > **Migrating from Python:** Python's `.env.template` ships an uncommented
 > `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads
 > `.env` automatically) makes every CLI command, every binding operation and

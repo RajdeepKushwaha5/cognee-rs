@@ -14,39 +14,74 @@ pub fn scope_context_by_datasets(
         .collect();
 
     for item in context {
-        // A content-addressed point can belong to several datasets; its full
-        // membership lives in the `dataset_ids` array (unioned on upsert). When
-        // present it is authoritative — assign the item to every requested
-        // dataset it belongs to. Fall back to the scalar `dataset_id` only for
-        // points written before the array existed (back-compat).
-        let member_ids: Option<Vec<&str>> = item
-            .payload
-            .get("dataset_ids")
-            .and_then(|value| value.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
-
-        match member_ids {
-            Some(ids) => {
-                for dataset_id in ids {
-                    if let Some(scoped_items) = scoped_contexts.get_mut(dataset_id) {
-                        scoped_items.push(item.clone());
-                    }
-                }
-            }
-            None => {
-                if let Some(dataset_id) = item
-                    .payload
-                    .get("dataset_id")
-                    .and_then(|value| value.as_str())
-                    && let Some(scoped_items) = scoped_contexts.get_mut(dataset_id)
-                {
-                    scoped_items.push(item.clone());
-                }
+        for dataset_id in item_dataset_ids(item) {
+            if let Some(scoped_items) = scoped_contexts.get_mut(dataset_id) {
+                scoped_items.push(item.clone());
             }
         }
     }
 
     scoped_contexts
+}
+
+/// The datasets a context item belongs to.
+///
+/// A content-addressed point can belong to several datasets; its full
+/// membership lives in the `dataset_ids` array (unioned on upsert). When
+/// present it is authoritative. Fall back to the scalar `dataset_id` only for
+/// points written before the array existed (back-compat). An item carrying
+/// neither belongs to no dataset, so no dataset scope admits it.
+fn item_dataset_ids(item: &SearchItem) -> Vec<&str> {
+    match item
+        .payload
+        .get("dataset_ids")
+        .and_then(|value| value.as_array())
+    {
+        Some(ids) => ids.iter().filter_map(|v| v.as_str()).collect(),
+        None => item
+            .payload
+            .get("dataset_id")
+            .and_then(|value| value.as_str())
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// `context` narrowed to the items that belong to at least one of
+/// `dataset_ids`, in the retriever's original (ranked) order, each item once.
+///
+/// The order-preserving counterpart of `merge_scoped_contexts(
+/// &scope_context_by_datasets(context, dataset_ids))`, whose `HashMap`
+/// iteration loses the ranking. Membership is decided exactly as
+/// [`scope_context_by_datasets`] decides it.
+pub fn filter_context_to_datasets(context: &SearchContext, dataset_ids: &[Uuid]) -> SearchContext {
+    let allowed: HashSet<String> = dataset_ids.iter().map(Uuid::to_string).collect();
+    context
+        .iter()
+        .filter(|item| {
+            item_dataset_ids(item)
+                .into_iter()
+                .any(|id| allowed.contains(id))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `context` narrowed to `params.dataset_ids` when the request has a dataset
+/// scope; unchanged otherwise.
+///
+/// For retrievers that fetch **more** context inside `get_completion`
+/// (context extension, chain-of-thought follow-ups): the orchestrator filters
+/// only the context it fetches itself, so a follow-up retrieval must apply the
+/// scope on its own or the answer draws on datasets outside it.
+pub(crate) fn filter_context_to_params(
+    context: SearchContext,
+    params: &crate::types::SearchParams,
+) -> SearchContext {
+    match params.dataset_ids.as_deref() {
+        Some(scope) if !scope.is_empty() => filter_context_to_datasets(&context, scope),
+        _ => context,
+    }
 }
 
 pub fn merge_scoped_contexts(scoped_contexts: &HashMap<String, SearchContext>) -> SearchContext {
@@ -166,5 +201,70 @@ mod tests {
         ]));
 
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn filter_context_to_datasets_keeps_ranked_order_and_membership() {
+        let dataset_a = Uuid::new_v4();
+        let dataset_b = Uuid::new_v4();
+        let dataset_c = Uuid::new_v4();
+        let item = |payload| SearchItem {
+            id: None,
+            score: None,
+            payload,
+        };
+        let context = vec![
+            item(json!({"dataset_id": dataset_b.to_string(), "text": "B"})),
+            item(json!({"dataset_id": dataset_c.to_string(), "text": "C"})),
+            item(
+                json!({"dataset_ids": [dataset_c.to_string(), dataset_a.to_string()], "text": "CA"}),
+            ),
+            item(json!({"text": "none"})),
+            item(json!({"dataset_id": dataset_a.to_string(), "text": "A"})),
+        ];
+
+        let filtered = super::filter_context_to_datasets(&context, &[dataset_a, dataset_b]);
+        let texts: Vec<&str> = filtered
+            .iter()
+            .map(|i| i.payload["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["B", "CA", "A"]);
+    }
+
+    #[test]
+    fn filter_context_to_params_applies_only_a_non_empty_scope() {
+        let dataset_a = Uuid::new_v4();
+        let context = vec![
+            SearchItem {
+                id: None,
+                score: None,
+                payload: json!({"dataset_id": dataset_a.to_string(), "text": "A"}),
+            },
+            SearchItem {
+                id: None,
+                score: None,
+                payload: json!({"dataset_id": Uuid::new_v4().to_string(), "text": "other"}),
+            },
+        ];
+        let scoped = crate::types::SearchParams {
+            dataset_ids: Some(vec![dataset_a]),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::filter_context_to_params(context.clone(), &scoped).len(),
+            1
+        );
+        for unscoped in [
+            crate::types::SearchParams::default(),
+            crate::types::SearchParams {
+                dataset_ids: Some(vec![]),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                super::filter_context_to_params(context.clone(), &unscoped).len(),
+                2
+            );
+        }
     }
 }

@@ -54,10 +54,14 @@ pub(crate) struct EdgeLite {
 /// A single selected fact: its source id and its display text.
 ///
 /// Port of the Python `{"id": ..., "text": ...}` fact dict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FactResult {
     pub id: String,
     pub text: String,
+    /// The datasets the fact's own `EdgeType` vector row belongs to
+    /// ([`super::results::dataset_membership`]). Rust-only, for the dataset
+    /// scope filter.
+    pub dataset_ids: Vec<String>,
 }
 
 /// Recompute the `EdgeType` vector-row id for a graph connection edge.
@@ -217,6 +221,7 @@ pub(crate) fn select_facts(
         facts.push(FactResult {
             id: hit_id,
             text: fact_display_text(&text),
+            dataset_ids: super::results::dataset_membership(hit),
         });
     }
     facts
@@ -306,6 +311,7 @@ mod tests {
 
     fn entity_with_bullet(edge_type_id: &str) -> EntityResult {
         EntityResult {
+            dataset_ids: vec![],
             id: "e1".to_string(),
             name: "Alice".to_string(),
             description: None,
@@ -539,10 +545,12 @@ mod tests {
         assert_eq!(format_facts(&[]), "");
         let facts = vec![
             FactResult {
+                dataset_ids: vec![],
                 id: "fact-1".to_string(),
                 text: "Alice works at Acme.".to_string(),
             },
             FactResult {
+                dataset_ids: vec![],
                 id: "fact-2".to_string(),
                 text: "Bob founded Initech.".to_string(),
             },

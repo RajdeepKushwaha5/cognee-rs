@@ -36,12 +36,22 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+impl DeleteScope {
+    /// Whether this removes a single data item (`Data` / `DataInDataset`).
+    pub fn is_data_item(&self) -> bool {
+        matches!(
+            self,
+            DeleteScope::Data { .. } | DeleteScope::DataInDataset { .. }
+        )
+    }
+}
+
 /// Map a `DeleteScope` variant to a human-readable label matching Python's
 /// `COGNEE_FORGET_TARGET` values.
 fn scope_label(scope: &DeleteScope) -> &'static str {
     match scope {
-        DeleteScope::Data { .. } => "data_item",
-        DeleteScope::Dataset { .. } => "dataset",
+        DeleteScope::Data { .. } | DeleteScope::DataInDataset { .. } => "data_item",
+        DeleteScope::Dataset { .. } | DeleteScope::DatasetById { .. } => "dataset",
         DeleteScope::User { .. } => "user",
         DeleteScope::All => "everything",
     }
@@ -67,6 +77,21 @@ const FALLBACK_VECTOR_COLLECTIONS: &[(&str, &str)] = &[
     ("Event", "name"),
 ];
 
+/// What a delete removes.
+///
+/// `Data` and `Dataset` name their target through an **owner**: the dataset
+/// is resolved by `(name, owner)` and data links are limited to datasets that
+/// owner owns. They are the owner-scoped forms, right where ownership is the
+/// authorization (no ACL wired).
+///
+/// `DataInDataset` and `DatasetById` name the dataset **by id**, whoever owns
+/// it — Python's `datasets.delete_data(dataset_id, data_id)` and
+/// `datasets.empty_dataset(dataset_id)`
+/// (`cognee/api/v1/datasets/datasets.py:184-215, 218-313` at f154b32), which
+/// authorize with `get_authorized_dataset(user, dataset_id, "delete")`, i.e. a
+/// `delete` grant, not ownership. `DeleteService` does **not** authorize them:
+/// the caller checks `delete` on `dataset_id` first, or uses
+/// [`AuthorizedDeleteService`], which does (SDK-936).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeleteScope {
     Data {
@@ -82,6 +107,20 @@ pub enum DeleteScope {
     Dataset {
         owner_id: Uuid,
         dataset_name: String,
+    },
+    /// One data item of the dataset `dataset_id`, whoever owns either. The item
+    /// must be attached to that dataset; only that link is detached.
+    DataInDataset {
+        dataset_id: Uuid,
+        data_id: Uuid,
+        /// Delete the dataset too when this was its last data item (Python's
+        /// `delete_dataset_if_empty`).
+        #[serde(default)]
+        delete_dataset_if_empty: bool,
+    },
+    /// The dataset `dataset_id` and everything in it, whoever owns it.
+    DatasetById {
+        dataset_id: Uuid,
     },
     User {
         owner_id: Uuid,
@@ -254,7 +293,10 @@ impl DeleteService {
                 .map_err(|e| {
                     DeleteError::Runtime(format!("Failed to count all search history: {e}"))
                 })? as usize,
-            DeleteScope::Data { .. } | DeleteScope::Dataset { .. } => 0,
+            DeleteScope::Data { .. }
+            | DeleteScope::Dataset { .. }
+            | DeleteScope::DataInDataset { .. }
+            | DeleteScope::DatasetById { .. } => 0,
         };
 
         tracing::Span::current().record("cognee.result.count", data_to_delete);
@@ -360,7 +402,7 @@ impl DeleteService {
 
         // For data-scoped deletion, clear pipeline_status for each affected
         // dataset (the data item's pipeline_status entries keyed by dataset_id).
-        if matches!(request.scope, DeleteScope::Data { .. }) {
+        if request.scope.is_data_item() {
             // Collect unique dataset IDs from links_to_detach (that are NOT in
             // datasets_to_delete, which were already handled above).
             let already_handled: HashSet<Uuid> =
@@ -412,7 +454,7 @@ impl DeleteService {
             }
 
             // Data-scoped cleanup (for single data item deletion)
-            if matches!(request.scope, DeleteScope::Data { .. }) {
+            if request.scope.is_data_item() {
                 // Compute which data IDs will actually be deleted
                 let deletable_data_ids = self.compute_deletable_data_ids(&targets).await?;
 
@@ -459,7 +501,7 @@ impl DeleteService {
         // For data-scoped deletion, invalidate the pipeline cache for each
         // affected dataset after detaching. This ensures re-running cognify
         // will reprocess the dataset since its data composition has changed.
-        if matches!(request.scope, DeleteScope::Data { .. }) {
+        if request.scope.is_data_item() {
             let mut invalidated_datasets: HashSet<Uuid> = HashSet::new();
             for (dataset_id, _) in &targets.links_to_detach {
                 if invalidated_datasets.insert(*dataset_id) {
@@ -603,7 +645,10 @@ impl DeleteService {
                     DeleteError::Runtime(format!("Failed to delete all search history: {e}"))
                 })? as usize,
             // Data/Dataset scopes: no-op (no dataset_id on queries table)
-            DeleteScope::Data { .. } | DeleteScope::Dataset { .. } => 0,
+            DeleteScope::Data { .. }
+            | DeleteScope::Dataset { .. }
+            | DeleteScope::DataInDataset { .. }
+            | DeleteScope::DatasetById { .. } => 0,
         };
 
         // ------------------------------------------------------------------
@@ -691,7 +736,7 @@ impl DeleteService {
                 warnings.extend(gv_warnings);
             }
 
-            if matches!(request.scope, DeleteScope::Data { .. }) {
+            if request.scope.is_data_item() {
                 let deletable_data_ids = self.compute_deletable_data_ids(targets).await?;
                 for data_id in &deletable_data_ids {
                     for (dataset_id, did) in &targets.links_to_detach {
@@ -722,7 +767,7 @@ impl DeleteService {
         // * Data-item variant (Python `_forget_data_memory`, forget.py:331-351):
         //   remove only the `cognify_pipeline` entry for `(data_id, dataset_id)`
         //   on that single Data record; NO dataset-level run-status reset.
-        if matches!(request.scope, DeleteScope::Data { .. }) {
+        if request.scope.is_data_item() {
             // Data-item: surgically clear cognify status for the single data
             // record in each affected (dataset_id, data_id) pair.
             for (dataset_id, data_id) in &targets.links_to_detach {
@@ -1436,6 +1481,18 @@ impl DeleteService {
                 owner_id,
                 dataset_name,
             } => self.resolve_dataset_scope(*owner_id, dataset_name).await,
+            DeleteScope::DataInDataset {
+                dataset_id,
+                data_id,
+                delete_dataset_if_empty,
+            } => {
+                self.resolve_data_in_dataset_scope(*dataset_id, *data_id, *delete_dataset_if_empty)
+                    .await
+            }
+            DeleteScope::DatasetById { dataset_id } => {
+                let dataset = self.dataset_by_id(*dataset_id).await?;
+                self.resolve_dataset_list(vec![dataset]).await
+            }
             DeleteScope::User { owner_id } => self.resolve_user_scope(*owner_id).await,
             DeleteScope::All => self.resolve_all_scope().await,
         }
@@ -1571,6 +1628,79 @@ impl DeleteService {
         Ok(ResolvedDeleteTargets {
             datasets_to_delete,
             links_to_detach,
+            candidate_data_ids: vec![data_id],
+        })
+    }
+
+    /// The dataset `dataset_id`, or a validation error naming it.
+    async fn dataset_by_id(&self, dataset_id: Uuid) -> Result<Dataset, DeleteError> {
+        self.database
+            .get_dataset_by_id(dataset_id)
+            .await
+            .map_err(|error| {
+                DeleteError::Runtime(format!("Failed to resolve dataset {dataset_id}: {error}"))
+            })?
+            .ok_or_else(|| DeleteError::Validation(format!("Dataset {dataset_id} was not found")))
+    }
+
+    /// Python `datasets.delete_data(dataset_id, data_id)`
+    /// (`datasets.py:218-313` at f154b32): the dataset by id, the item looked up
+    /// among *that dataset's* data, and only that link detached.
+    ///
+    /// A missing `Data` row is the custom-graph-model case and gets the same
+    /// orphan cleanup as [`DeleteScope::Data`]. An existing item that is not
+    /// in the dataset is refused: Python then cleans up graph nodes inside that
+    /// dataset's own databases, which cannot reach other datasets, but here
+    /// the graph and vector stores are shared and the cleanup would reach every
+    /// dataset the item belongs to.
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn resolve_data_in_dataset_scope(
+        &self,
+        dataset_id: Uuid,
+        data_id: Uuid,
+        delete_dataset_if_empty: bool,
+    ) -> Result<ResolvedDeleteTargets, DeleteError> {
+        let dataset = self.dataset_by_id(dataset_id).await?;
+        let data = self.database.get_data(data_id).await.map_err(|error| {
+            DeleteError::Runtime(format!("Failed to fetch data {data_id}: {error}"))
+        })?;
+        if data.is_none() {
+            tracing::warn!(
+                data_id = %data_id,
+                "Data row not found — assuming custom graph model; attempting orphan cleanup"
+            );
+            return Ok(ResolvedDeleteTargets {
+                datasets_to_delete: Vec::new(),
+                links_to_detach: Vec::new(),
+                candidate_data_ids: vec![data_id],
+            });
+        }
+
+        let data_items = self
+            .database
+            .get_dataset_data(dataset.id)
+            .await
+            .map_err(|error| {
+                DeleteError::Runtime(format!(
+                    "Failed to load data for dataset '{}': {}",
+                    dataset.name, error
+                ))
+            })?;
+        if !data_items.iter().any(|item| item.id == data_id) {
+            return Err(DeleteError::Validation(format!(
+                "Data {} is not attached to dataset '{}'",
+                data_id, dataset.name
+            )));
+        }
+
+        let last_item = data_items.len() == 1;
+        Ok(ResolvedDeleteTargets {
+            datasets_to_delete: if delete_dataset_if_empty && last_item {
+                vec![dataset.clone()]
+            } else {
+                Vec::new()
+            },
+            links_to_detach: vec![(dataset.id, data_id)],
             candidate_data_ids: vec![data_id],
         })
     }
@@ -3576,6 +3706,86 @@ mod tests {
 
         assert_eq!(result.deleted_datasets, 1);
         assert_eq!(result.deleted_data, 1);
+    }
+
+    /// SDK-936. Scenario: Bob holds only a `delete` grant on Alice's
+    /// dataset. Expected (Python authorizes delete by grant on the dataset
+    /// id, `datasets.py:184-313` at f154b32): the by-id scopes let Bob delete
+    /// a data item and then the dataset; a principal without the grant is
+    /// `PermissionDenied` before anything is touched.
+    #[tokio::test]
+    async fn authorized_by_id_scopes_honour_a_non_owner_delete_grant() {
+        use cognee_database::AclDb;
+        let (svc, storage, db, acl) = make_authorized_service().await;
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let mallory = Uuid::new_v4();
+        let (dataset_id, data_id) =
+            seed_dataset_with_data(&db, &storage, alice, "shared_delete").await;
+        let acl_dyn: &dyn AclDb = acl.as_ref();
+        acl_dyn
+            .grant_permission(bob, dataset_id, "delete")
+            .await
+            .unwrap();
+
+        let by_id = |scope| DeleteRequest {
+            scope,
+            mode: DeleteMode::Soft,
+            memory_only: false,
+        };
+        let err = svc
+            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), mallory)
+            .await
+            .expect_err("no grant, no delete");
+        assert!(matches!(err, DeleteError::PermissionDenied(_)), "{err:?}");
+
+        let result = svc
+            .execute(
+                &by_id(DeleteScope::DataInDataset {
+                    dataset_id,
+                    data_id,
+                    delete_dataset_if_empty: false,
+                }),
+                bob,
+            )
+            .await
+            .expect("a delete grant must let a non-owner delete a data item");
+        assert_eq!(result.deleted_dataset_links, 1);
+
+        let result = svc
+            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), bob)
+            .await
+            .expect("a delete grant must let a non-owner delete the dataset");
+        assert_eq!(result.deleted_datasets, 1);
+    }
+
+    /// `DataInDataset` refuses an item that exists but is not in the dataset:
+    /// the shared stores would otherwise clean it up in every dataset it
+    /// belongs to.
+    #[tokio::test]
+    async fn data_in_dataset_refuses_an_item_of_another_dataset() {
+        let (svc, storage, db, acl) = make_authorized_service().await;
+        let owner = Uuid::new_v4();
+        let (dataset_a, _) = seed_dataset_with_data(&db, &storage, owner, "a_ds").await;
+        let (_, data_b) = seed_dataset_with_data(&db, &storage, owner, "b_ds").await;
+        mock_grant_all_perms(&acl, owner, dataset_a).await;
+
+        let err = svc
+            .execute(
+                &DeleteRequest {
+                    scope: DeleteScope::DataInDataset {
+                        dataset_id: dataset_a,
+                        data_id: data_b,
+                        delete_dataset_if_empty: false,
+                    },
+                    mode: DeleteMode::Soft,
+                    memory_only: false,
+                },
+                owner,
+            )
+            .await
+            .expect_err("an item outside the dataset must be refused");
+        assert!(matches!(err, DeleteError::Validation(_)), "{err:?}");
     }
 
     #[tokio::test]

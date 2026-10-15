@@ -23,9 +23,43 @@ pub struct AppliedTuning {
     pub hybrid: Option<super::HybridBudget>,
 }
 
+/// How a retriever's results can be restricted to a set of datasets.
+///
+/// Every dataset shares one graph and one vector store here, so a dataset
+/// scope is applied by filtering what a retriever returns on each item's
+/// dataset membership (`dataset_ids` / `dataset_id` in the payload; see
+/// [`crate::orchestration::filter_context_to_datasets`]). Python instead runs
+/// the retriever once per dataset inside that dataset's own database context
+/// (`set_database_global_context_variables`, `search.py:330` at f154b32), which
+/// scopes every search type. A retriever whose items carry no membership
+/// cannot be scoped by filtering: every item would be dropped (an empty
+/// answer) or, unfiltered, every dataset would be read. It must say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetScoping {
+    /// Every context item carries its dataset membership, and the completion
+    /// reads only the context it is handed, plus follow-up retrievals that
+    /// apply `SearchParams::dataset_ids` themselves. The orchestrator's
+    /// membership filter scopes it.
+    Membership,
+    /// The results are not dataset data (the feedback analysis of the user's
+    /// own message), so a dataset scope does not apply to them.
+    NotDatasetData,
+    /// The results cannot be attributed to datasets. With access control
+    /// wired, a dataset-scoped search of this type is refused rather than
+    /// answered empty or from datasets the caller may not read.
+    Unsupported,
+}
+
 #[async_trait]
 pub trait SearchRetriever: Send + Sync {
     fn search_type(&self) -> SearchType;
+
+    /// How this retriever's results can be restricted to datasets. Defaults
+    /// to [`DatasetScoping::Unsupported`], the safe answer for a retriever
+    /// (a community one, say) that has not been checked.
+    fn dataset_scoping(&self) -> DatasetScoping {
+        DatasetScoping::Unsupported
+    }
 
     /// The tuning knobs this retriever was built with (test-only
     /// introspection; see [`AppliedTuning`]).

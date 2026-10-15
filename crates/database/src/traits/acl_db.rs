@@ -76,4 +76,26 @@ pub trait AclDb: Send + Sync {
         user_id: Uuid,
         permission_name: &str,
     ) -> Result<Vec<Uuid>, DatabaseError>;
+
+    /// [`Self::authorized_dataset_ids_with_roles`] restricted to datasets
+    /// whose `tenant_id` equals `tenant_id` — **strict equality**, so `None`
+    /// admits only datasets that have no tenant. Deduplicated.
+    ///
+    /// This is the answer to "which datasets may this user read" in Python:
+    /// `get_all_user_permission_datasets` unions the direct, tenant and role
+    /// grants and then keeps only `dataset.tenant_id == user.tenant_id`
+    /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-55`
+    /// at f154b32). `authorized_dataset_ids_with_roles` deliberately spans every
+    /// tenant the user belongs to, so a caller that authorizes data access must
+    /// use this variant (SDK-689).
+    ///
+    /// Required rather than defaulted: the tenant lives on the dataset row,
+    /// which only the implementation can see, and a default that skipped the
+    /// filter would silently reopen the cross-tenant read.
+    async fn authorized_dataset_ids_in_tenant(
+        &self,
+        user_id: Uuid,
+        permission_name: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, DatabaseError>;
 }

@@ -28,7 +28,8 @@ use serde_json::{Map, Value};
 
 use super::facts::{CONTAINS_FACT_PREFIX, EdgeLite, connection_edge_type_id};
 use super::results::{
-    display_value, first_display_value, payload, payload_matches_node_filter, result_id,
+    dataset_membership, display_value, first_display_value, payload, payload_matches_node_filter,
+    result_id,
 };
 use crate::types::SearchItem;
 
@@ -39,7 +40,7 @@ type NodeLite = Value;
 /// A resolved entity plus its ranked edge bullets.
 ///
 /// Port of the Python entity dict (`_entity_from_result`, `entities.py:165-177`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct EntityResult {
     pub id: String,
     pub name: String,
@@ -51,6 +52,10 @@ pub(crate) struct EntityResult {
     /// facts lane excludes them like the bullets' ids
     /// ([`super::facts::select_facts_for_entities`]). Rust-only.
     pub covered_edge_type_ids: Vec<String>,
+    /// The datasets the entity's own vector row belongs to
+    /// ([`super::results::dataset_membership`]). Rust-only: the dataset scope
+    /// filter admits the entity on this membership and nothing else.
+    pub dataset_ids: Vec<String>,
 }
 
 /// A single rendered edge bullet for an entity.
@@ -227,6 +232,7 @@ fn entity_from_result(item: &SearchItem) -> EntityResult {
         entity_type: entity_type(result_payload),
         edges: vec![],
         covered_edge_type_ids: vec![],
+        dataset_ids: dataset_membership(item),
     }
 }
 
@@ -1452,6 +1458,7 @@ mod tests {
         assert_eq!(
             entities,
             vec![EntityResult {
+                dataset_ids: vec![],
                 id: "entity-1".to_string(),
                 name: "Alice".to_string(),
                 description: None,
@@ -1595,6 +1602,7 @@ mod tests {
     fn format_entities_renders_minimal_blocks() {
         // No optional fields -> header only.
         let minimal = EntityResult {
+            dataset_ids: vec![],
             id: "entity-1".to_string(),
             name: "Entity".to_string(),
             description: None,
@@ -1609,6 +1617,7 @@ mod tests {
 
         // IndexSchema type is suppressed from the header.
         let index_schema = EntityResult {
+            dataset_ids: vec![],
             id: "entity-1".to_string(),
             name: "lisbon office logistics intelligence project".to_string(),
             description: None,
@@ -1623,6 +1632,7 @@ mod tests {
 
         // Domain type + a description + an edge bullet.
         let full = EntityResult {
+            dataset_ids: vec![],
             id: "entity-1".to_string(),
             name: "Alice".to_string(),
             description: Some("An engineer.".to_string()),
@@ -1647,6 +1657,7 @@ mod tests {
 
         // A blank-name entity yields no block, so the whole section is empty.
         let blank = EntityResult {
+            dataset_ids: vec![],
             id: String::new(),
             name: "   ".to_string(),
             description: None,

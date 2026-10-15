@@ -105,6 +105,14 @@ impl AuthorizedDeleteService {
                 self.require_delete_permission(principal_id, dataset_id)
                     .await?;
             }
+            // By id: Python's `get_authorized_dataset(user, dataset_id,
+            // "delete")` — a `delete` grant on that dataset, not ownership
+            // (SDK-936).
+            DeleteScope::DataInDataset { dataset_id, .. }
+            | DeleteScope::DatasetById { dataset_id } => {
+                self.require_delete_permission(principal_id, *dataset_id)
+                    .await?;
+            }
             DeleteScope::User { owner_id } => {
                 // For user-scoped deletion, verify the principal has delete
                 // on all datasets that would be affected. The inner service

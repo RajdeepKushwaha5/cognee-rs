@@ -40,6 +40,13 @@ pub struct SearchRequest {
     /// tenant the owner id appears in. `None` means "no tenant filter" and is
     /// correct for single-tenant callers (the CLI, OSS single-user mode),
     /// where every row carries `tenant_id = NULL` anyway.
+    ///
+    /// With an `AclDb` wired it also bounds the readable set (explicit ids,
+    /// resolved names and the no-filter scope) to datasets whose
+    /// `tenant_id` **equals** this value, `None` included: a caller with no
+    /// tenant reads only datasets with no tenant, as in Python's
+    /// `get_all_user_permission_datasets` (`dataset.tenant_id ==
+    /// user.tenant_id`).
     #[serde(default)]
     pub tenant_id: Option<Uuid>,
     pub verbose: Option<bool>,

@@ -454,9 +454,9 @@ pub async fn run_graph(
     // `authorized_search(dataset_ids=...)`), so it needs the caller's identity
     // on the request. Recall's `user_id` is a string because the session
     // helpers key on strings; the graph side needs the UUID form. A non-UUID
-    // caller id only matters when a dataset filter is in play -- without one
-    // the graph search has no owner scope to apply and the value is simply not
-    // forwarded, as before.
+    // caller id with a dataset filter is the caller's mistake and is reported
+    // as such. Without a filter the graph search has no owner scope to apply
+    // and the value is simply not forwarded, as before.
     let has_dataset_filter = datasets.as_ref().is_some_and(|d| !d.is_empty())
         || dataset_ids.as_ref().is_some_and(|d| !d.is_empty());
     let owner_id: Option<Uuid> = match user_id {
@@ -495,6 +495,28 @@ pub async fn run_graph(
     };
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
+
+    // With access control wired, an unfiltered graph search covers the
+    // datasets the caller may read, which needs a caller. With none (or one
+    // that is not a UUID) there is nothing the caller can be shown to read, so
+    // the graph source contributes nothing — the same answer as a caller who
+    // may read no dataset (Python: zero per-dataset tasks, `[]`). It is not an
+    // error: recall's other sources (session, trace, graph context) and its
+    // auto-mode fall-through still run. Python has no such case, since
+    // `recall()` resolves a missing user to the default user first.
+    if search_orchestrator.has_acl_db() && owner_id.is_none() && !has_dataset_filter {
+        debug!("recall: access control is wired and the caller is unknown; no graph results");
+        let response = crate::orchestration::prepare_search_result(
+            search_type,
+            crate::SearchOutput::Items(Vec::new()),
+            None,
+            Some(Vec::new()),
+            false,
+            false,
+            false,
+        );
+        return Ok((Vec::new(), search_type, auto_routed, response));
+    }
 
     let request = SearchRequest {
         query_text: query_text.to_string(),
@@ -754,7 +776,7 @@ mod tests {
     use crate::types::{SearchContext, SearchOutput, SearchParams};
     use async_trait::async_trait;
     use cognee_database::ops as db_ops;
-    use cognee_database::{IngestDb, connect, initialize};
+    use cognee_database::{AclDb, IngestDb, connect, initialize};
     use cognee_models::Dataset;
     use cognee_session::SessionContext;
     use std::sync::Arc;
@@ -769,6 +791,11 @@ mod tests {
     impl SearchRetriever for RecordingRetriever {
         fn search_type(&self) -> SearchType {
             SearchType::Chunks
+        }
+
+        fn dataset_scoping(&self) -> crate::retrievers::DatasetScoping {
+            // Fixture items carry `dataset_id`.
+            crate::retrievers::DatasetScoping::Membership
         }
 
         async fn get_context(
@@ -1016,5 +1043,112 @@ mod tests {
             retriever.seen.lock().expect("test mutex").is_none(),
             "retriever must not run for a denied id"
         );
+    }
+
+    /// SDK-687, recall side: `/v1/recall` reaches the orchestrator through
+    /// `run_graph`, so with an ACL wired an unfiltered recall must be scoped
+    /// to the caller's readable datasets like an unfiltered search, and an
+    /// unreadable dataset must never reach the retriever's scope.
+    #[tokio::test]
+    async fn run_graph_unfiltered_with_acl_is_scoped_to_readable_datasets() {
+        let owner = Uuid::new_v4();
+        let (orchestrator, retriever, dataset_id) =
+            orchestrator_with_seeded_dataset("notes", owner).await;
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(owner, dataset_id, "read")
+            .await
+            .expect("grant");
+        // A dataset someone else may read, which the caller may not.
+        acl.grant_permission(Uuid::new_v4(), Uuid::new_v4(), "read")
+            .await
+            .expect("grant");
+        let orchestrator = orchestrator.with_acl_db(acl as Arc<dyn AclDb>);
+        let owner_str = owner.to_string();
+        let span = tracing::Span::none();
+
+        run_graph(
+            "anything",
+            Some(SearchType::Chunks),
+            None,
+            None,
+            5,
+            false,
+            None,
+            Some(owner_str.as_str()),
+            &orchestrator,
+            &span,
+            None,
+        )
+        .await
+        .expect("an unfiltered recall with a readable dataset must succeed");
+
+        let seen = retriever
+            .seen
+            .lock()
+            .expect("test mutex")
+            .clone()
+            .expect("retriever must have been invoked");
+        assert_eq!(
+            seen.dataset_ids.as_deref(),
+            Some([dataset_id].as_slice()),
+            "the scope must be exactly the caller's readable set"
+        );
+    }
+
+    /// With an ACL wired, an unfiltered recall by a caller who may read
+    /// nothing returns no graph items and never runs the retriever. An unknown
+    /// caller (no id, or one that is not a UUID) gets the same empty graph
+    /// result, not an error, so recall's other sources and its auto-mode
+    /// fall-through keep working.
+    #[tokio::test]
+    async fn run_graph_unfiltered_with_acl_and_nothing_readable_is_empty() {
+        let owner = Uuid::new_v4();
+        let (orchestrator, retriever, _dataset_id) =
+            orchestrator_with_seeded_dataset("notes", owner).await;
+        let orchestrator = orchestrator
+            .with_acl_db(Arc::new(cognee_test_utils::MockAclDb::new()) as Arc<dyn AclDb>);
+        let owner_str = owner.to_string();
+        let span = tracing::Span::none();
+
+        let (items, _used, _auto, _response) = run_graph(
+            "anything",
+            Some(SearchType::Chunks),
+            None,
+            None,
+            5,
+            false,
+            None,
+            Some(owner_str.as_str()),
+            &orchestrator,
+            &span,
+            None,
+        )
+        .await
+        .expect("nothing readable is an empty result, not an error");
+        assert!(items.is_empty(), "got {items:?}");
+        assert!(
+            retriever.seen.lock().expect("test mutex").is_none(),
+            "retriever must not run when the caller may read no dataset"
+        );
+
+        for caller in [None, Some("user-1")] {
+            let (items, _used, _auto, _response) = run_graph(
+                "anything",
+                Some(SearchType::Chunks),
+                None,
+                None,
+                5,
+                false,
+                None,
+                caller,
+                &orchestrator,
+                &span,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unknown caller {caller:?}: {e:?}"));
+            assert!(items.is_empty(), "caller {caller:?}: {items:?}");
+        }
+        assert!(retriever.seen.lock().expect("test mutex").is_none());
     }
 }

@@ -30,10 +30,11 @@ pub use query_router_stats::{clear_override_counts, override_counts_snapshot, re
 pub use recall_scope::{RecallItem, RecallScope, RecallSource, ScopeInput, normalize_scope};
 pub use retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,
-    FeedbackRetriever, FeelingLuckyRetriever, GraphCompletionContextExtensionRetriever,
-    GraphCompletionCotRetriever, GraphCompletionRetriever, GraphSummaryCompletionRetriever,
-    HybridBudget, HybridRetriever, LexicalRetriever, LexicalScorer, NaturalLanguageRetriever,
-    SearchRetriever, SearchRetrieverRef, SummariesRetriever, TemporalRetriever, TripletRetriever,
+    DatasetScoping, FeedbackRetriever, FeelingLuckyRetriever,
+    GraphCompletionContextExtensionRetriever, GraphCompletionCotRetriever,
+    GraphCompletionRetriever, GraphSummaryCompletionRetriever, HybridBudget, HybridRetriever,
+    LexicalRetriever, LexicalScorer, NaturalLanguageRetriever, SearchRetriever, SearchRetrieverRef,
+    SummariesRetriever, TemporalRetriever, TripletRetriever,
 };
 pub use types::{
     FeedbackDetectionResult, Rule, SearchContext, SearchError, SearchGraph, SearchGraphEdge,

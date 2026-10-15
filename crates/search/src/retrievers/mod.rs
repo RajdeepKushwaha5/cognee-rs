@@ -19,7 +19,7 @@ pub use advanced_graph_retrievers::{
 };
 #[cfg(test)]
 pub(crate) use base_retriever::AppliedTuning;
-pub use base_retriever::{SearchRetriever, SearchRetrieverRef};
+pub use base_retriever::{DatasetScoping, SearchRetriever, SearchRetrieverRef};
 #[allow(
     unused_imports,
     reason = "internal API for the later hybrid-assembly task (P1-07/P1-09)"

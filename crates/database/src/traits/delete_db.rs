@@ -24,6 +24,16 @@ pub trait DeleteDb: Send + Sync {
     async fn count_dataset_data(&self, dataset_id: Uuid) -> Result<usize, DatabaseError>;
     async fn list_datasets_by_owner(&self, owner_id: Uuid) -> Result<Vec<Dataset>, DatabaseError>;
     async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError>;
+    /// A dataset by id, whoever owns it. Defaults to scanning
+    /// [`Self::list_datasets`]; implementations with an indexed lookup
+    /// override it.
+    async fn get_dataset_by_id(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError> {
+        Ok(self
+            .list_datasets()
+            .await?
+            .into_iter()
+            .find(|dataset| dataset.id == id))
+    }
     async fn delete_dataset(&self, id: Uuid) -> Result<(), DatabaseError>;
     async fn detach_data_from_dataset(
         &self,
@@ -189,6 +199,10 @@ impl DeleteDb for DatabaseConnection {
 
     async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
         datasets::list_datasets(self).await
+    }
+
+    async fn get_dataset_by_id(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError> {
+        datasets::get_dataset(self, id).await
     }
 
     async fn delete_dataset(&self, id: Uuid) -> Result<(), DatabaseError> {

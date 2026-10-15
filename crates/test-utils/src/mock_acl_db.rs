@@ -39,7 +39,10 @@ use uuid::Uuid;
 ///   tenants gets no role grants at all. Here role membership counts on
 ///   its own.
 /// - Python drops every result whose `dataset.tenant_id != user.tenant_id`.
-///   The mock cannot see dataset tenancy and applies no such filter.
+///   The mock has no dataset rows: [`AclDb::authorized_dataset_ids_in_tenant`]
+///   applies that filter against tenants registered with
+///   [`MockAclDb::set_dataset_tenant`]; a dataset never registered has no
+///   tenant. The other methods apply no tenant filter.
 pub struct MockAclDb {
     /// Set of granted permissions: (principal_id, dataset_id, permission_name).
     grants: Mutex<HashSet<(Uuid, Uuid, String)>>,
@@ -49,6 +52,8 @@ pub struct MockAclDb {
     tenant_memberships: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
     /// user_id → role ids the user holds.
     role_memberships: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
+    /// dataset_id → the dataset's tenant, for the tenant-aware listing.
+    dataset_tenants: Mutex<HashMap<Uuid, Uuid>>,
     /// When set, [`AclDb::grant_permission`] returns this error instead of
     /// recording the grant. See [`MockAclDb::failing_grants`].
     grant_failure: Option<String>,
@@ -109,6 +114,7 @@ impl MockAclDb {
             principals: Mutex::new(HashSet::new()),
             tenant_memberships: Mutex::new(HashMap::new()),
             role_memberships: Mutex::new(HashMap::new()),
+            dataset_tenants: Mutex::new(HashMap::new()),
             grant_failure: None,
             grant_failure_only: None,
             revokes_fail: false,
@@ -212,6 +218,16 @@ impl MockAclDb {
     /// role id as the principal) become visible to `user_id` through the
     /// `_with_roles` variants only. Also registers `role_id` as a `"role"`
     /// principal.
+    /// Record that `dataset_id` belongs to `tenant_id`, for
+    /// [`AclDb::authorized_dataset_ids_in_tenant`]. Datasets never registered
+    /// have no tenant.
+    pub fn set_dataset_tenant(&self, dataset_id: Uuid, tenant_id: Uuid) {
+        self.dataset_tenants
+            .lock()
+            .unwrap() // lock poison is unrecoverable
+            .insert(dataset_id, tenant_id);
+    }
+
     pub fn add_user_to_role(&self, user_id: Uuid, role_id: Uuid) {
         {
             let mut principals = self.principals.lock().unwrap(); // lock poison is unrecoverable
@@ -371,6 +387,22 @@ impl AclDb for MockAclDb {
             .filter(|ds_id| seen.insert(*ds_id))
             .collect();
         Ok(ids)
+    }
+
+    async fn authorized_dataset_ids_in_tenant(
+        &self,
+        user_id: Uuid,
+        permission_name: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, DatabaseError> {
+        let ids = self
+            .authorized_dataset_ids_with_roles(user_id, permission_name)
+            .await?;
+        let tenants = self.dataset_tenants.lock().unwrap(); // lock poison is unrecoverable
+        Ok(ids
+            .into_iter()
+            .filter(|id| tenants.get(id).copied() == tenant_id)
+            .collect())
     }
 }
 
@@ -548,5 +580,33 @@ mod tests {
         let mut expected = vec![shared, role_only];
         expected.sort();
         assert_eq!(got, expected, "each id exactly once, role grants included");
+    }
+
+    #[tokio::test]
+    async fn the_tenant_variant_keeps_only_datasets_of_that_exact_tenant() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let tenant = Uuid::new_v4();
+        let in_tenant = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+        let untenanted = Uuid::new_v4();
+        for dataset in [in_tenant, elsewhere, untenanted] {
+            acl.grant_permission(user, dataset, "read").await.unwrap();
+        }
+        acl.set_dataset_tenant(in_tenant, tenant);
+        acl.set_dataset_tenant(elsewhere, Uuid::new_v4());
+
+        assert_eq!(
+            acl.authorized_dataset_ids_in_tenant(user, "read", Some(tenant))
+                .await
+                .unwrap(),
+            vec![in_tenant]
+        );
+        assert_eq!(
+            acl.authorized_dataset_ids_in_tenant(user, "read", None)
+                .await
+                .unwrap(),
+            vec![untenanted]
+        );
     }
 }
