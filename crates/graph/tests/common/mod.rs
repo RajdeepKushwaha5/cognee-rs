@@ -146,6 +146,127 @@ pub async fn test_node_upsert_same_id(db: &dyn GraphDBTrait) {
     assert_eq!(metrics.get("node_count").unwrap().as_i64().unwrap(), 1);
 }
 
+/// One id repeated inside a single batch write must behave like the same
+/// writes issued one by one (last wins) and touch no other node. Ladybug's
+/// batched `UNWIND … MERGE` used to stamp the repeated row's type onto an
+/// unrelated existing node — default cognify writes one EntityType per entity,
+/// so two entities of one type turned a third into an EntityType.
+pub async fn test_add_nodes_repeated_id_in_one_batch(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    let entities: Vec<TestNode> = (0..3)
+        .map(|i| TestNode::new(&format!("rn_e{i}"), &format!("Entity {i}"), "Entity", i))
+        .collect();
+    db.add_nodes(&entities.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+
+    let person = TestNode::new("rn_t1", "person", "EntityType", 0);
+    let timestamp = TestNode::new("rn_t2", "timestamp", "EntityType", 0);
+    let person_again = TestNode::new("rn_t1", "person (last)", "EntityType", 1);
+    db.add_nodes(&[&person, &timestamp, &person_again])
+        .await
+        .unwrap();
+
+    // Every node, not just the entities' type: the corruption also moved the
+    // repeated row's name and properties, and it could land on rn_t2 (already
+    // an EntityType) without changing any type at all.
+    let (nodes, _) = db.get_graph_data().await.unwrap();
+    assert_eq!(
+        nodes.len(),
+        5,
+        "{:?}",
+        nodes.iter().map(|n| &n.0).collect::<Vec<_>>()
+    );
+    let expected: HashMap<String, (&str, String, i64)> = (0..3)
+        .map(|i| {
+            (
+                format!("rn_e{i}"),
+                ("Entity", format!("Entity {i}"), i64::from(i)),
+            )
+        })
+        .chain([
+            (
+                "rn_t1".to_string(),
+                ("EntityType", "person (last)".to_string(), 1),
+            ),
+            (
+                "rn_t2".to_string(),
+                ("EntityType", "timestamp".to_string(), 0),
+            ),
+        ])
+        .collect();
+    for (id, props) in &nodes {
+        let (node_type, name, value) = expected
+            .get(id)
+            .unwrap_or_else(|| panic!("unexpected node {id}: {props:?}"));
+        assert_eq!(
+            props.get("type").and_then(|v| v.as_str()),
+            Some(*node_type),
+            "{id}: {props:?}"
+        );
+        assert_eq!(
+            props.get("name").and_then(|v| v.as_str()),
+            Some(name.as_str()),
+            "{id}: {props:?}"
+        );
+        assert_eq!(
+            props.get("value").and_then(|v| v.as_i64()),
+            Some(*value),
+            "{id}: {props:?}"
+        );
+    }
+}
+
+/// An edge repeated inside a single batch write is one edge, last properties
+/// winning — and the write succeeds. Ladybug aborted the whole batch with an
+/// engine assertion (`KU_UNREACHABLE`).
+pub async fn test_add_edges_repeated_key_in_one_batch(db: &dyn GraphDBTrait) {
+    db.delete_graph().await.unwrap();
+
+    let nodes: Vec<TestNode> = (0..4)
+        .map(|i| TestNode::new(&format!("re_{i}"), &format!("N{i}"), "T", i))
+        .collect();
+    db.add_nodes(&nodes.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let text = |t: &str| HashMap::from([(Cow::Borrowed("edge_text"), json!(t))]);
+    db.add_edges(&[
+        ("re_0".into(), "re_1".into(), "r".into(), text("a")),
+        ("re_2".into(), "re_3".into(), "s".into(), text("b")),
+    ])
+    .await
+    .unwrap();
+    db.add_edges(&[
+        ("re_0".into(), "re_2".into(), "x".into(), text("first")),
+        ("re_1".into(), "re_3".into(), "y".into(), text("d")),
+        ("re_0".into(), "re_2".into(), "x".into(), text("last")),
+    ])
+    .await
+    .unwrap();
+
+    let (_, edges) = db.get_graph_data().await.unwrap();
+    let mut got: Vec<String> = edges
+        .iter()
+        .map(|(s, t, r, p)| {
+            format!(
+                "{s}-{r}->{t}:{}",
+                p.get("edge_text").and_then(|v| v.as_str()).unwrap_or("")
+            )
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "re_0-r->re_1:a",
+            "re_0-x->re_2:last",
+            "re_1-y->re_3:d",
+            "re_2-s->re_3:b"
+        ]
+    );
+}
+
 // -- edge CRUD ---------------------------------------------------------------
 
 pub async fn test_add_and_has_edge(db: &dyn GraphDBTrait) {
