@@ -17,7 +17,7 @@ use cognee_graph::NodeTruthState;
 use cognee_vector::VectorDB;
 use uuid::Uuid;
 
-use crate::retrievers::context_items::search_results_to_context;
+use crate::retrievers::context_items::{search_node_filtered, search_results_to_context};
 use crate::retrievers::hybrid::pairs::{
     ChunkSummaryPair, attach_source_chunks, chunk_summary_pairs, source_chunk_ids_to_load,
     summary_id_for_chunk, summary_text_by_chunk_id,
@@ -95,30 +95,18 @@ pub(crate) async fn search_collection(
         return Ok(vec![]);
     }
 
-    match node_name {
-        Some(names) if !names.is_empty() => {
-            // Server-side filter-then-limit: the adapter drops out-of-set rows
-            // before applying `limit`, so in-set rows are never crowded out.
-            let results = vector_db
-                .search_similar_filtered(
-                    data_type,
-                    field,
-                    query_vector,
-                    limit,
-                    Some(names),
-                    node_name_filter_operator,
-                )
-                .await?;
-            search_results_to_context(results)
-        }
-        _ => {
-            // No filter — byte-identical to the pre-F9 plain-search path.
-            let results = vector_db
-                .search_similar(data_type, field, query_vector, limit)
-                .await?;
-            search_results_to_context(results)
-        }
-    }
+    // Server-side filter-then-limit: the adapter drops out-of-set rows before
+    // applying `limit`, so in-set rows are never crowded out.
+    search_node_filtered(
+        vector_db.as_ref(),
+        data_type,
+        field,
+        query_vector,
+        limit,
+        node_name,
+        node_name_filter_operator,
+    )
+    .await
 }
 
 /// Fetch `DocumentChunk_text` rows by id for summary-only pairs, dropping any

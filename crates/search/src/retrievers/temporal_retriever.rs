@@ -14,18 +14,16 @@ use serde_json::{Value, json};
 
 use cognee_session::SessionContext;
 
-use crate::graph_retrieval::{
-    DEFAULT_TRIPLET_DISTANCE_PENALTY, GraphRetrievalConfig, RankedGraphEdge,
-    brute_force_triplet_search,
-};
+use crate::graph_retrieval::RankedGraphEdge;
 use crate::retrievers::SearchRetriever;
+use crate::retrievers::graph_core::{
+    GraphPrompts, GraphRetrieverCore, complete, ranked_edge_to_item,
+};
 use crate::types::{
     SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
 };
-use crate::utils::{build_messages_with_history, render_graph_user_prompt, resolve_system_prompt};
+use crate::utils::skip_completion_on_empty_context;
 
-const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_WIDE_SEARCH_TOP_K: usize = 100;
 const TEMPORAL_DATA_TYPE: &str = "Event";
 const TEMPORAL_FIELD_NAME: &str = "name";
 const DEFAULT_TEMPORAL_INTERVAL_PROMPT: &str = "You are tasked with identifying relevant time periods where the answer to a given query should be searched.\nCurrent date is:  `{time_now}`. Determine relevant period(s) and return structured intervals.\n\nExtraction rules:\n\n1. Query without specific timestamp: use the time period with starts_at set to None and ends_at set to now.\n2. Explicit time intervals: If the query specifies a range (e.g., from 2010 to 2020, between January and March 2023), extract both start and end dates. Always assign the earlier date to starts_at and the later date to ends_at.\n3. Single timestamp: If the query refers to one specific moment (e.g., in 2015, on March 5, 2022), set starts_at and ends_at to that same timestamp.\n4. Open-ended time references: For phrases such as \"before X\" or \"after X\", represent the unspecified side as None. For example: before 2009 → starts_at: None, ends_at: 2009; after 2009 → starts_at: 2009, ends_at: None.\n5. Current-time references (\"now\", \"current\", \"today\"): If the query explicitly refers to the present, set both starts_at and ends_at to now (the ingestion timestamp).\n6. \"Who is\" and \"Who was\" questions: These imply a general identity or biographical inquiry without a specific temporal scope. Set both starts_at and ends_at to None.\n7. Ordering rule: Always ensure the earlier date is assigned to starts_at and the later date to ends_at.\n8. No temporal information: If no valid or inferable time reference is found, set both starts_at and ends_at to None.";
@@ -92,19 +90,10 @@ impl QueryInterval {
 }
 
 pub struct TemporalRetriever {
-    vector_db: Arc<dyn VectorDB>,
-    embedding_engine: Arc<dyn EmbeddingEngine>,
-    graph_db: Arc<dyn GraphDBTrait>,
+    core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
-    top_k: usize,
-    wide_search_top_k: usize,
-    triplet_distance_penalty: f32,
-    feedback_influence: f32,
-    neighbor_cap: Option<usize>,
     temporal_interval_prompt: Option<String>,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
 }
 
@@ -113,7 +102,7 @@ impl TemporalRetriever {
     /// (`search.triplet_neighbor_cap`); `None` is uncapped.
     #[must_use]
     pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
-        self.neighbor_cap = cap;
+        self.core.neighbor_cap = cap;
         self
     }
 
@@ -133,20 +122,21 @@ impl TemporalRetriever {
         generation_options: Option<GenerationOptions>,
     ) -> Self {
         Self {
-            vector_db,
-            embedding_engine,
-            graph_db,
+            core: GraphRetrieverCore::new(
+                vector_db,
+                embedding_engine,
+                graph_db,
+                top_k,
+                wide_search_top_k,
+                triplet_distance_penalty,
+            ),
             llm,
-            top_k: top_k.unwrap_or(DEFAULT_TOP_K),
-            wide_search_top_k: wide_search_top_k.unwrap_or(DEFAULT_WIDE_SEARCH_TOP_K),
-            triplet_distance_penalty: triplet_distance_penalty
-                .unwrap_or(DEFAULT_TRIPLET_DISTANCE_PENALTY),
-            feedback_influence: 0.0,
-            neighbor_cap: None,
             temporal_interval_prompt,
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
     }
@@ -179,58 +169,8 @@ impl TemporalRetriever {
         Ok(interval.into_millis_interval())
     }
 
-    fn get_graph_retrieval_config(&self, params: &SearchParams) -> GraphRetrievalConfig {
-        GraphRetrievalConfig {
-            top_k: params.top_k_or(self.top_k),
-            wide_search_top_k: params.wide_search_top_k_or(self.wide_search_top_k),
-            triplet_distance_penalty: params
-                .triplet_distance_penalty_or(self.triplet_distance_penalty),
-            feedback_influence: params.feedback_influence_or(self.feedback_influence),
-            neighbor_cap: self.neighbor_cap,
-            node_type: params.node_type.clone(),
-            node_name: params.node_name.clone(),
-            node_name_filter_operator: params
-                .node_name_filter_operator
-                .as_deref()
-                .unwrap_or("OR")
-                .to_string(),
-        }
-    }
-
-    async fn get_ranked_graph_edges(
-        &self,
-        query: &str,
-        params: &SearchParams,
-    ) -> Result<Vec<RankedGraphEdge>, SearchError> {
-        brute_force_triplet_search(
-            query,
-            self.vector_db.as_ref(),
-            self.embedding_engine.as_ref(),
-            self.graph_db.as_ref(),
-            &self.get_graph_retrieval_config(params),
-        )
-        .await
-    }
-
     fn ranked_edges_to_context(ranked_edges: Vec<RankedGraphEdge>) -> SearchContext {
-        ranked_edges
-            .into_iter()
-            .map(|edge| SearchItem {
-                id: None,
-                score: Some(edge.score),
-                payload: json!({
-                    "source_id": edge.source_id,
-                    "target_id": edge.target_id,
-                    "relationship": edge.relationship_name,
-                    "source_name": edge.source_name,
-                    "target_name": edge.target_name,
-                    "source_text": edge.source_text,
-                    "target_text": edge.target_text,
-                    "source_description": edge.source_description,
-                    "target_description": edge.target_description,
-                }),
-            })
-            .collect()
+        ranked_edges.into_iter().map(ranked_edge_to_item).collect()
     }
 
     async fn get_fallback_context(
@@ -238,7 +178,7 @@ impl TemporalRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        let ranked_edges = self.get_ranked_graph_edges(query, params).await?;
+        let ranked_edges = self.core.ranked_edges(query, params).await?;
         Ok(Self::ranked_edges_to_context(ranked_edges))
     }
 
@@ -262,22 +202,24 @@ impl TemporalRetriever {
         }
 
         if self
+            .core
             .vector_db
             .has_collection(TEMPORAL_DATA_TYPE, TEMPORAL_FIELD_NAME)
             .await?
         {
-            let query_embeddings = self.embedding_engine.embed_query(query).await?;
+            let query_embeddings = self.core.embedding_engine.embed_query(query).await?;
             let query_vector = query_embeddings.into_iter().next().ok_or_else(|| {
                 SearchError::InvalidInput("embedding engine returned no vectors".to_string())
             })?;
 
             let semantic_results = self
+                .core
                 .vector_db
                 .search_similar(
                     TEMPORAL_DATA_TYPE,
                     TEMPORAL_FIELD_NAME,
                     &query_vector,
-                    self.wide_search_top_k.max(self.top_k),
+                    self.core.wide_search_top_k().max(self.core.top_k()),
                 )
                 .await?;
 
@@ -311,6 +253,25 @@ impl TemporalRetriever {
         });
 
         Ok(ranked)
+    }
+
+    /// The answer messages over `context`, or `None` when it renders empty —
+    /// Python's inherited `skip_completion_on_empty_context`. Shared by
+    /// `get_completion` and the `only_context` preview.
+    fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let context_text = Self::temporal_context_to_text(context);
+        if context_text.is_empty() {
+            return Ok(None);
+        }
+        self.prompts
+            .messages(query, &context_text, session, params)
+            .map(Some)
     }
 
     fn temporal_context_to_text(context: &SearchContext) -> String {
@@ -376,7 +337,7 @@ impl SearchRetriever for TemporalRetriever {
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
-            neighbor_cap: Some(self.neighbor_cap),
+            neighbor_cap: Some(self.core.neighbor_cap),
             ..Default::default()
         }
     }
@@ -386,7 +347,7 @@ impl SearchRetriever for TemporalRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        if self.graph_db.is_empty().await? {
+        if self.core.graph_db.is_empty().await? {
             return Ok(vec![]);
         }
 
@@ -396,6 +357,7 @@ impl SearchRetriever for TemporalRetriever {
 
         // Fix 1: Use typed query to find Timestamp nodes instead of full graph scan.
         let (candidate_timestamps, _) = self
+            .core
             .graph_db
             .get_filtered_graph_data(&HashMap::from([(
                 Cow::Borrowed("type"),
@@ -417,7 +379,7 @@ impl SearchRetriever for TemporalRetriever {
         // Fix 2: Collect Event nodes reachable within 1-2 hops from matching Timestamps.
         let mut event_node_ids = HashSet::new();
         for ts_id in &matching_ts_ids {
-            for node_props in self.graph_db.get_neighbors(ts_id).await? {
+            for node_props in self.core.graph_db.get_neighbors(ts_id).await? {
                 let node_type = node_props.get("type").and_then(|v| v.as_str());
                 match node_type {
                     Some("Event") => {
@@ -428,7 +390,8 @@ impl SearchRetriever for TemporalRetriever {
                     Some("Interval") => {
                         // Hop through Interval node to reach Event nodes (hop 2).
                         if let Some(interval_id) = node_props.get("id").and_then(|v| v.as_str()) {
-                            for inner_props in self.graph_db.get_neighbors(interval_id).await? {
+                            for inner_props in self.core.graph_db.get_neighbors(interval_id).await?
+                            {
                                 if inner_props.get("type").and_then(|v| v.as_str()) == Some("Event")
                                     && let Some(id) = inner_props.get("id").and_then(|v| v.as_str())
                                 {
@@ -446,7 +409,7 @@ impl SearchRetriever for TemporalRetriever {
             return self.get_fallback_context(query, params).await;
         }
 
-        let ranked_edges = self.get_ranked_graph_edges(query, params).await?;
+        let ranked_edges = self.core.ranked_edges(query, params).await?;
         let ranked_events = self
             .rank_temporal_events(query, &event_node_ids, &ranked_edges)
             .await?;
@@ -454,7 +417,7 @@ impl SearchRetriever for TemporalRetriever {
         // Fetch Event nodes by ID for building the context payload.
         let event_id_list: Vec<String> = ranked_events
             .iter()
-            .take(params.top_k_or(self.top_k))
+            .take(params.top_k_or(self.core.top_k()))
             .map(|(id, _)| id.clone())
             .collect();
         // Keyed by each row's own `id`, not by zipping against `event_id_list`:
@@ -464,6 +427,7 @@ impl SearchRetriever for TemporalRetriever {
         // zip therefore risked pairing an event's name/description with a
         // different event's id — silently wrong context, no error.
         let nodes_by_id: HashMap<String, NodeData> = self
+            .core
             .graph_db
             .get_nodes(&event_id_list)
             .await?
@@ -476,7 +440,10 @@ impl SearchRetriever for TemporalRetriever {
 
         let mut temporal_context = Vec::new();
 
-        for (event_id, score) in ranked_events.into_iter().take(params.top_k_or(self.top_k)) {
+        for (event_id, score) in ranked_events
+            .into_iter()
+            .take(params.top_k_or(self.core.top_k()))
+        {
             let Some(event_node) = nodes_by_id.get(&event_id) else {
                 continue;
             };
@@ -499,6 +466,16 @@ impl SearchRetriever for TemporalRetriever {
         Ok(temporal_context)
     }
 
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
+    }
+
     async fn get_completion(
         &self,
         query: &str,
@@ -511,43 +488,18 @@ impl SearchRetriever for TemporalRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &Self::temporal_context_to_text(&completion_context),
-        );
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
-
-        if let Some(schema) = &params.response_schema {
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    messages,
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
-        } else {
-            let completion = self
-                .llm
-                .generate(messages, self.generation_options.clone())
-                .await?;
-            Ok(SearchOutput::Text(completion.content))
-        }
+        let Some(messages) =
+            self.build_completion_messages(query, &completion_context, session, params)?
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
+        complete(
+            self.llm.as_ref(),
+            messages,
+            params,
+            self.generation_options.clone(),
+        )
+        .await
     }
 }
 
@@ -2435,6 +2387,7 @@ mod tests {
             target_text: None,
             source_description: None,
             target_description: None,
+            edge_text: None,
         }
     }
 
@@ -2809,5 +2762,55 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "Conference (2024-06-15): Annual tech conference");
         assert_eq!(lines[1], "Speaker -[presents_at]-> Conference");
+    }
+
+    /// The preview is the completion's prompt over the temporal context, and
+    /// an empty context builds none — the completion skips the LLM then.
+    #[tokio::test]
+    async fn completion_messages_render_the_temporal_context() {
+        let retriever = build_retriever_with_llm(TestLlm {
+            completion_response: "unused".to_string(),
+            interval_response: None,
+            fail_structured_output: false,
+            last_messages: Mutex::new(vec![]),
+            structured_completion_response: Mutex::new(None),
+            last_structured_messages: Mutex::new(vec![]),
+        });
+        let params = SearchParams::default();
+        let session = SessionContext::default();
+
+        let context = vec![SearchItem {
+            id: None,
+            score: Some(1.0),
+            payload: json!({
+                "event_id": "e1",
+                "event_name": "Launch",
+                "event_description": "Product launch",
+                "event_time": "2021",
+            }),
+        }];
+        let messages = retriever
+            .completion_messages("What happened in 2021?", &context, &session, &params)
+            .await
+            .unwrap()
+            .expect("a non-empty context builds a prompt");
+        assert!(
+            messages[1]
+                .content
+                .contains("Launch (2021): Product launch")
+        );
+
+        assert!(
+            retriever
+                .completion_messages("q", &vec![], &session, &params)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let output = retriever
+            .get_completion("q", Some(vec![]), &session, &params)
+            .await
+            .unwrap();
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
     }
 }

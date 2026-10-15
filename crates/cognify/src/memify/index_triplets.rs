@@ -89,6 +89,10 @@ pub async fn index_triplets(
                 let mut point = VectorPoint::new(triplet.id, vector)
                     .with_metadata("type", json!("Triplet"))
                     .with_metadata("field", json!("text"))
+                    // The embedded text itself, as Python's Triplet payload
+                    // carries it: TripletRetriever renders its context from
+                    // this key.
+                    .with_metadata("text", json!(triplet.text.clone()))
                     .with_metadata("source_id", json!(triplet.source_entity_id.to_string()))
                     .with_metadata("target_id", json!(triplet.target_entity_id.to_string()))
                     .with_metadata("relationship", json!(triplet.relationship_name.clone()));
@@ -199,6 +203,7 @@ mod tests {
         let tenant_id = Uuid::new_v4();
         let triplet = make_triplet("Src", "Tgt", "rel");
         let triplet_id = triplet.id;
+        let triplet_text = triplet.text.clone();
         let source_id = triplet.source_entity_id;
         let target_id = triplet.target_entity_id;
 
@@ -223,6 +228,9 @@ mod tests {
         assert_eq!(results[0].id, triplet_id);
         assert_eq!(meta.get("type").unwrap(), &json!("Triplet"));
         assert_eq!(meta.get("field").unwrap(), &json!("text"));
+        // The embedded text rides in the payload, as in Python's Triplet
+        // payload: TripletRetriever renders its context from it.
+        assert_eq!(meta.get("text").unwrap(), &json!(triplet_text));
         assert_eq!(
             meta.get("source_id").unwrap(),
             &json!(source_id.to_string())

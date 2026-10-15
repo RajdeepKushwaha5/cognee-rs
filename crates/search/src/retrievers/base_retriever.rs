@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cognee_llm::Message;
 use cognee_session::SessionContext;
 
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
@@ -46,6 +47,34 @@ pub trait SearchRetriever: Send + Sync {
         session: &SessionContext,
         params: &SearchParams,
     ) -> Result<SearchOutput, SearchError>;
+
+    /// The messages [`get_completion`](Self::get_completion) would send the
+    /// LLM for `context`, built without calling it — what an `only_context`
+    /// search returns in place of the bare context.
+    ///
+    /// `None` when this retriever sends no single templated prompt (the
+    /// non-generative types: chunks, summaries, lexical, Cypher, natural
+    /// language, coding rules, feedback) or when the rendered context is
+    /// empty, which is also when `get_completion` skips the LLM. Python's
+    /// `build_only_context_prompt` (`only_context_prompt.py`) returns `None`
+    /// in the same two cases.
+    ///
+    /// Retrievers whose context stage calls the LLM — graph summary's
+    /// summarization, chain-of-thought and context-extension rounds, hybrid's
+    /// overflow summaries — make those calls here too, as Python's preview
+    /// does; only the answer itself is never generated.
+    ///
+    /// Implementations must build the messages with the same code their
+    /// `get_completion` uses, so the preview cannot drift from the real call.
+    async fn completion_messages(
+        &self,
+        _query: &str,
+        _context: &SearchContext,
+        _session: &SessionContext,
+        _params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        Ok(None)
+    }
 
     /// Process multiple queries in sequence and return their contexts.
     ///

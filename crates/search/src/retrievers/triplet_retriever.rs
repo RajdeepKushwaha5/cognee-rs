@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cognee_embedding::EmbeddingEngine;
-use cognee_llm::{GenerationOptions, Llm};
+use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
 use tracing::debug;
 
@@ -11,7 +11,10 @@ use cognee_session::SessionContext;
 use crate::retrievers::SearchRetriever;
 use crate::retrievers::context_items::search_results_to_context;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
-use crate::utils::{build_messages_with_history, render_user_prompt, resolve_system_prompt};
+use crate::utils::{
+    build_messages_with_history, render_user_prompt, resolve_system_prompt,
+    skip_completion_on_empty_context,
+};
 
 const TRIPLET_DATA_TYPE: &str = "Triplet";
 const TRIPLET_PRIMARY_FIELD: &str = "text";
@@ -30,6 +33,49 @@ pub struct TripletRetriever {
 }
 
 impl TripletRetriever {
+    /// The system + user messages a completion over `context` sends, or
+    /// `None` when the rendered context is empty. Shared by `get_completion`
+    /// and the `only_context` preview.
+    fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let context_text = Self::context_to_text(context);
+
+        if context_text.is_empty() {
+            return Ok(None);
+        }
+
+        let system_prompt = resolve_system_prompt(
+            params
+                .system_prompt
+                .as_deref()
+                .or(self.system_prompt.as_deref()),
+            params
+                .system_prompt_path
+                .as_deref()
+                .or(self.system_prompt_path.as_deref()),
+        )?;
+
+        let user_prompt =
+            render_user_prompt(self.user_prompt_template.as_deref(), query, &context_text);
+
+        debug!(
+            context_items = context.len(),
+            "Triplet context assembled:\n{context_text}"
+        );
+        debug!("LLM user prompt:\n{user_prompt}");
+
+        Ok(Some(build_messages_with_history(
+            system_prompt,
+            user_prompt,
+            session,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector_db: Arc<dyn VectorDB>,
@@ -124,6 +170,16 @@ impl SearchRetriever for TripletRetriever {
         search_results_to_context(results)
     }
 
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
+    }
+
     async fn get_completion(
         &self,
         query: &str,
@@ -136,29 +192,11 @@ impl SearchRetriever for TripletRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let context_text = Self::context_to_text(&completion_context);
-
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt =
-            render_user_prompt(self.user_prompt_template.as_deref(), query, &context_text);
-
-        debug!(
-            context_items = completion_context.len(),
-            "Triplet context assembled:\n{context_text}"
-        );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
+        let Some(messages) =
+            self.build_completion_messages(query, &completion_context, session, params)?
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
 
         if let Some(schema) = &params.response_schema {
             let structured_value = self
@@ -493,5 +531,43 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[1].content.contains("Alice knows Bob"));
         assert!(messages[1].content.contains("who knows Bob?"));
+    }
+
+    /// An existing but empty triplet collection is a normal miss: no LLM call
+    /// (Python's `skip_completion_on_empty_context`, `triplet_retriever.py:
+    /// 214-219`).
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+
+        let retriever = TripletRetriever::new(
+            Arc::new(TestVectorDb {
+                collections: HashMap::from([(TestVectorDb::key("Triplet", "text"), vec![])]),
+                searched_fields: Mutex::new(vec![]),
+            }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let output = retriever
+            .get_completion(
+                "who knows Bob?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
     }
 }

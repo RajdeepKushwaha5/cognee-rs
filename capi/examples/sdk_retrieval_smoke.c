@@ -238,25 +238,42 @@ int main(void)
 
     /* ── Test 2: cg_sdk_search non-LLM type → CG_OK, well-formed JSON ──── */
     /*
-     * CHUNKS_LEXICAL is a pure text/vector retriever that does NOT call the LLM.
-     * Against an empty store it returns CG_OK with an empty JSON array.
+     * CODING_RULES reads rule nodes from the graph and does NOT call the LLM.
+     * Against an empty store it returns CG_OK with a well-formed response.
      */
-    printf("=== Test 2: cg_sdk_search CHUNKS_LEXICAL (non-LLM) → CG_OK ===\n");
+    printf("=== Test 2: cg_sdk_search CODING_RULES (non-LLM) → CG_OK ===\n");
     {
         CgErrorCode code = CG_OK;
         char *result = run_search(sdk, "what is cognee?",
-                                  "{\"searchType\":\"CHUNKS_LEXICAL\"}", &code);
-        ASSERT_EQ(code, CG_OK, "CHUNKS_LEXICAL search must succeed against empty store");
+                                  "{\"searchType\":\"CODING_RULES\"}", &code);
+        ASSERT_EQ(code, CG_OK, "CODING_RULES search must succeed against empty store");
         if (result) {
             /* SearchResponse is an array or object — must start with [ or {. */
             ASSERT(result[0] == '[' || result[0] == '{',
                    "search result must be a JSON array or object");
-            printf("  CHUNKS_LEXICAL result: %.200s\n", result);
+            printf("  CODING_RULES result: %.200s\n", result);
             cg_string_destroy(result);
         } else {
             fprintf(stderr, "  last_error: %s\n",
                     cg_last_error_message() ? cg_last_error_message() : "(none)");
         }
+    }
+
+    /* ── Test 2b: CHUNKS_LEXICAL with no chunks → runtime "not found" ──── */
+    /*
+     * With no DocumentChunk to rank, CHUNKS_LEXICAL reports missing data, as
+     * Python's lexical retriever raises NoDataError (SDK-1036). It is a
+     * runtime error, never a validation error.
+     */
+    printf("=== Test 2b: cg_sdk_search CHUNKS_LEXICAL on empty store → CG_ERR_RUNTIME ===\n");
+    {
+        CgErrorCode code = CG_OK;
+        char *result = run_search(sdk, "what is cognee?",
+                                  "{\"searchType\":\"CHUNKS_LEXICAL\"}", &code);
+        ASSERT_EQ(code, CG_ERR_RUNTIME,
+                  "CHUNKS_LEXICAL against an empty store must report missing data");
+        cg_string_destroy(result);
+        printf("  CHUNKS_LEXICAL empty store → not found  OK\n");
     }
 
     /* ── Test 3: cg_sdk_recall with non-LLM scope variants ──────────────── */

@@ -375,8 +375,9 @@ async fn test_search_type_matrix() {
 
     // ── Step 11b: Context assertion for GraphCompletion (only_context=true) ──
     // This is the combination used by the Locust benchmark: the graph retriever
-    // returns ranked edges (source→relationship→target + entity texts) without
-    // calling the LLM.  Verify that the raw edge payloads contain relevant text.
+    // ranks edges (source→relationship→target + entity texts) without calling
+    // the LLM, and the result is the completion prompt rendered from them
+    // (SDK-1036). Verify that it contains relevant text.
     let graph_ctx = SearchRequest {
         query_text: query.to_string(),
         search_type: SearchType::GraphCompletion,

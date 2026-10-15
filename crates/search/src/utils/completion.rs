@@ -1,6 +1,27 @@
 use std::fs;
 
-use crate::types::SearchError;
+use tracing::warn;
+
+use crate::types::{SearchError, SearchOutput};
+
+/// The `NotFound` message every graph-backed retriever raises on an empty
+/// graph — Python's `NoDataError` text (`graph_completion_retriever.py:146`).
+pub const EMPTY_GRAPH_MESSAGE: &str =
+    "The knowledge graph is empty. Ingest data through Cognee before searching.";
+
+/// What a completion retriever returns instead of calling the LLM when the
+/// rendered context is empty.
+///
+/// Python's `skip_completion_on_empty_context` (`base_retriever.py:34-40`, set
+/// on the graph, RAG, triplet and hybrid retrievers; SDK-270): search is not
+/// an LLM gateway, and with no context the only possible answer is a "no
+/// context provided" deflection a caller cannot tell from a real one. Python
+/// returns `[]`; `Texts([])` is its shape here, and — not being `Text` — it is
+/// also not recorded as a session QA turn by the orchestrator.
+pub fn skip_completion_on_empty_context() -> SearchOutput {
+    warn!("Empty context: skipping LLM completion, returning no results");
+    SearchOutput::Texts(Vec::new())
+}
 
 pub const DEFAULT_RAG_SYSTEM_PROMPT: &str =
     "Answer the question using the provided context. Be as brief as possible.";

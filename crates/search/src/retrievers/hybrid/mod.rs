@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::{GraphDBTrait, NodeTruthState};
-use cognee_llm::{GenerationOptions, Llm};
+use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_session::SessionContext;
 use cognee_truth_subspace::align::query_coords;
 use cognee_truth_subspace::{DEFAULT_K, load_centroids, pad_coords};
@@ -56,9 +56,9 @@ use crate::types::{
     SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
 };
 use crate::utils::{
-    DEFAULT_HYBRID_USER_PROMPT_TEMPLATE, HYBRID_SMALL_WINDOW_SYSTEM_PROMPT,
+    DEFAULT_HYBRID_USER_PROMPT_TEMPLATE, EMPTY_GRAPH_MESSAGE, HYBRID_SMALL_WINDOW_SYSTEM_PROMPT,
     HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE, build_messages_with_history, render_user_prompt,
-    resolve_system_prompt,
+    resolve_system_prompt, skip_completion_on_empty_context,
 };
 
 /// Top-k for the chunks/entities/facts lanes when neither a per-lane knob nor
@@ -501,6 +501,150 @@ impl HybridRetriever {
     /// say more per token than the prose they were built from, then whole raw
     /// passages best-ranked first for whatever is left. See [`budget`] for the
     /// measurements behind that order.
+    /// The messages a completion over `completion_context` sends: the
+    /// sectioned context, budgeted to the model's window (summarizing the
+    /// passages that overflow it — part of assembling the context, so the
+    /// `only_context` preview runs it too), in the prompt pair the budgeting
+    /// selected. `None` when every section is empty. Shared by
+    /// `get_completion` and the `only_context` preview.
+    async fn build_completion_messages(
+        &self,
+        query: &str,
+        completion_context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        // Partition the flat context back into the three lanes by "kind".
+        let mut chunks: Vec<SearchItem> = Vec::new();
+        let mut entities: Vec<EntityResult> = Vec::new();
+        let mut facts: Vec<FactResult> = Vec::new();
+        for item in completion_context {
+            match item.payload.get("kind").and_then(Value::as_str) {
+                Some("entity") => entities.push(item_to_entity(item)),
+                Some("fact") => facts.push(item_to_fact(item)),
+                Some("chunk") => chunks.push(item.clone()),
+                _ => {}
+            }
+        }
+
+        let configured_system_prompt = params
+            .system_prompt
+            .as_deref()
+            .or(self.system_prompt.as_deref());
+        let configured_system_prompt_path = params
+            .system_prompt_path
+            .as_deref()
+            .or(self.system_prompt_path.as_deref());
+        let configured_template = self.user_prompt_template.as_deref();
+        let default_system_prompt =
+            resolve_system_prompt(configured_system_prompt, configured_system_prompt_path)?;
+
+        // Everything the prompt costs before a single retrieved item is added:
+        // the system prompt, the template actually in use with the question
+        // filled in, and the session history. Which wording is used is not
+        // settled yet -- budgeting is what selects it -- so with nothing
+        // configured both candidates are costed and the longer one wins, and
+        // the budget is never optimistic.
+        let overhead_system =
+            if configured_system_prompt.is_none() && configured_system_prompt_path.is_none() {
+                default_system_prompt
+                    .len()
+                    .max(HYBRID_SMALL_WINDOW_SYSTEM_PROMPT.len())
+            } else {
+                default_system_prompt.len()
+            };
+        let overhead_template = match configured_template {
+            Some(template) => render_user_prompt(Some(template), query, "").len(),
+            None => render_user_prompt(Some(DEFAULT_HYBRID_USER_PROMPT_TEMPLATE), query, "")
+                .len()
+                .max(
+                    render_user_prompt(Some(HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE), query, "")
+                        .len(),
+                ),
+        };
+        let overhead = overhead_system + overhead_template + session.formatted_history.len();
+
+        let mut overflow_summaries =
+            overflow::known(&chunks, self.budget.overflow_summary_file.as_deref());
+        let (mut context_text, budgeted, unsummarized) =
+            self.assemble_context(&chunks, &entities, &facts, overhead, &overflow_summaries);
+
+        // Nothing to answer from: no prompt (see `get_completion`).
+        if context_text.is_empty() {
+            return Ok(None);
+        }
+
+        // Passages that did not fit and have no summary yet: ask the answering
+        // model for one, then rebuild the context with them in. Only the
+        // passages this question actually pushed out are summarized, and only
+        // once each — `overflow::known()` above already carries everything
+        // earlier questions paid for.
+        if budgeted && !unsummarized.is_empty() && self.budget.summarize_overflow {
+            let to_summarize: Vec<(String, String)> = unsummarized
+                .iter()
+                .filter_map(|id| {
+                    let chunk = chunks
+                        .iter()
+                        .find(|chunk| result_id(chunk).as_deref() == Some(id))?;
+                    let text = payload_str_opt(&chunk.payload, "text")?;
+                    Some((id.clone(), text))
+                })
+                .collect();
+            if !to_summarize.is_empty() {
+                let produced = overflow::summarize(
+                    self.llm.as_ref(),
+                    &to_summarize,
+                    self.budget.summarize_batch.max(1),
+                )
+                .await;
+                if !produced.is_empty() {
+                    overflow_summaries.extend(produced);
+                    let (rebuilt, _, _) = self.assemble_context(
+                        &chunks,
+                        &entities,
+                        &facts,
+                        overhead,
+                        &overflow_summaries,
+                    );
+                    context_text = rebuilt;
+                }
+            }
+        }
+        let context_text = context_text;
+
+        // A context that had to be budgeted is a context long enough to lose
+        // the question in, and a model with a window that small is the one
+        // that reads two brevity instructions as an instruction to say
+        // nothing. That is the case the second pair of prompts exists for.
+        let use_small_window = budgeted
+            && configured_system_prompt.is_none()
+            && configured_system_prompt_path.is_none();
+        let system_prompt = if use_small_window {
+            HYBRID_SMALL_WINDOW_SYSTEM_PROMPT.to_string()
+        } else {
+            default_system_prompt
+        };
+        let template = configured_template.unwrap_or(if budgeted {
+            HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE
+        } else {
+            DEFAULT_HYBRID_USER_PROMPT_TEMPLATE
+        });
+
+        let user_prompt = render_user_prompt(Some(template), query, &context_text);
+
+        debug!(
+            context_items = completion_context.len(),
+            "Hybrid context assembled:\n{context_text}"
+        );
+        debug!("LLM user prompt:\n{user_prompt}");
+
+        Ok(Some(build_messages_with_history(
+            system_prompt,
+            user_prompt,
+            session,
+        )))
+    }
+
     fn assemble_context(
         &self,
         chunks: &[SearchItem],
@@ -787,10 +931,7 @@ impl SearchRetriever for HybridRetriever {
         // this is the default search type — it must not answer a fresh install
         // with an empty context while the other completion types report it.
         if self.graph_db.is_empty().await? {
-            return Err(SearchError::NotFound(
-                "The knowledge graph is empty. Ingest data through Cognee before searching."
-                    .to_string(),
-            ));
+            return Err(SearchError::NotFound(EMPTY_GRAPH_MESSAGE.to_string()));
         }
 
         // Embed the query once and share the vector across both lanes.
@@ -867,6 +1008,17 @@ impl SearchRetriever for HybridRetriever {
         Ok(context)
     }
 
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
+            .await
+    }
+
     async fn get_completion(
         &self,
         query: &str,
@@ -879,136 +1031,17 @@ impl SearchRetriever for HybridRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        // Partition the flat context back into the three lanes by "kind".
-        let mut chunks: Vec<SearchItem> = Vec::new();
-        let mut entities: Vec<EntityResult> = Vec::new();
-        let mut facts: Vec<FactResult> = Vec::new();
-        for item in &completion_context {
-            match item.payload.get("kind").and_then(Value::as_str) {
-                Some("entity") => entities.push(item_to_entity(item)),
-                Some("fact") => facts.push(item_to_fact(item)),
-                Some("chunk") => chunks.push(item.clone()),
-                _ => {}
-            }
-        }
-
-        let configured_system_prompt = params
-            .system_prompt
-            .as_deref()
-            .or(self.system_prompt.as_deref());
-        let configured_system_prompt_path = params
-            .system_prompt_path
-            .as_deref()
-            .or(self.system_prompt_path.as_deref());
-        let configured_template = self.user_prompt_template.as_deref();
-        let default_system_prompt =
-            resolve_system_prompt(configured_system_prompt, configured_system_prompt_path)?;
-
-        // Everything the prompt costs before a single retrieved item is added:
-        // the system prompt, the template actually in use with the question
-        // filled in, and the session history. Which wording is used is not
-        // settled yet -- budgeting is what selects it -- so with nothing
-        // configured both candidates are costed and the longer one wins, and
-        // the budget is never optimistic.
-        let overhead_system =
-            if configured_system_prompt.is_none() && configured_system_prompt_path.is_none() {
-                default_system_prompt
-                    .len()
-                    .max(HYBRID_SMALL_WINDOW_SYSTEM_PROMPT.len())
-            } else {
-                default_system_prompt.len()
-            };
-        let overhead_template = match configured_template {
-            Some(template) => render_user_prompt(Some(template), query, "").len(),
-            None => render_user_prompt(Some(DEFAULT_HYBRID_USER_PROMPT_TEMPLATE), query, "")
-                .len()
-                .max(
-                    render_user_prompt(Some(HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE), query, "")
-                        .len(),
-                ),
-        };
-        let overhead = overhead_system + overhead_template + session.formatted_history.len();
-
-        let mut overflow_summaries =
-            overflow::known(&chunks, self.budget.overflow_summary_file.as_deref());
-        let (mut context_text, budgeted, unsummarized) =
-            self.assemble_context(&chunks, &entities, &facts, overhead, &overflow_summaries);
-
         // Python's `skip_completion_on_empty_context` (`hybrid_retriever.py:52,
         // 246-253`, SDK-270): search is not an LLM gateway, and with every
         // section empty the only possible answer is a "no context provided"
         // deflection. No completion, no session turn — `Texts([])` is not the
         // `Text` the orchestrator records a QA turn for.
-        if context_text.is_empty() {
-            warn!("Empty context: skipping LLM completion, returning no results");
-            return Ok(SearchOutput::Texts(Vec::new()));
-        }
-
-        // Passages that did not fit and have no summary yet: ask the answering
-        // model for one, then rebuild the context with them in. Only the
-        // passages this question actually pushed out are summarized, and only
-        // once each — `overflow::known()` above already carries everything
-        // earlier questions paid for.
-        if budgeted && !unsummarized.is_empty() && self.budget.summarize_overflow {
-            let to_summarize: Vec<(String, String)> = unsummarized
-                .iter()
-                .filter_map(|id| {
-                    let chunk = chunks
-                        .iter()
-                        .find(|chunk| result_id(chunk).as_deref() == Some(id))?;
-                    let text = payload_str_opt(&chunk.payload, "text")?;
-                    Some((id.clone(), text))
-                })
-                .collect();
-            if !to_summarize.is_empty() {
-                let produced = overflow::summarize(
-                    self.llm.as_ref(),
-                    &to_summarize,
-                    self.budget.summarize_batch.max(1),
-                )
-                .await;
-                if !produced.is_empty() {
-                    overflow_summaries.extend(produced);
-                    let (rebuilt, _, _) = self.assemble_context(
-                        &chunks,
-                        &entities,
-                        &facts,
-                        overhead,
-                        &overflow_summaries,
-                    );
-                    context_text = rebuilt;
-                }
-            }
-        }
-        let context_text = context_text;
-
-        // A context that had to be budgeted is a context long enough to lose
-        // the question in, and a model with a window that small is the one
-        // that reads two brevity instructions as an instruction to say
-        // nothing. That is the case the second pair of prompts exists for.
-        let use_small_window = budgeted
-            && configured_system_prompt.is_none()
-            && configured_system_prompt_path.is_none();
-        let system_prompt = if use_small_window {
-            HYBRID_SMALL_WINDOW_SYSTEM_PROMPT.to_string()
-        } else {
-            default_system_prompt
+        let Some(messages) = self
+            .build_completion_messages(query, &completion_context, session, params)
+            .await?
+        else {
+            return Ok(skip_completion_on_empty_context());
         };
-        let template = configured_template.unwrap_or(if budgeted {
-            HYBRID_SMALL_WINDOW_USER_PROMPT_TEMPLATE
-        } else {
-            DEFAULT_HYBRID_USER_PROMPT_TEMPLATE
-        });
-
-        let user_prompt = render_user_prompt(Some(template), query, &context_text);
-
-        debug!(
-            context_items = completion_context.len(),
-            "Hybrid context assembled:\n{context_text}"
-        );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
 
         if let Some(schema) = &params.response_schema {
             let structured_value = self
@@ -1420,6 +1453,39 @@ mod retriever_tests {
         assert!(user.contains(FACTS_SECTION_HEADER));
         assert!(user.contains(CHUNK_TEXT));
         assert!(user.contains(FACT_TEXT));
+    }
+
+    /// `only_context` on HYBRID_COMPLETION returns exactly the messages the
+    /// completion sends, without calling the LLM.
+    #[tokio::test]
+    async fn completion_messages_match_the_completion_prompt() {
+        let (vector_db, graph_db, _alice) = populated_dbs().await;
+        let llm = Arc::new(CapturingLlm {
+            response_text: "hybrid answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever(vector_db, graph_db, Arc::clone(&llm) as Arc<dyn Llm>);
+        let params = SearchParams::default();
+        let session = SessionContext::default();
+
+        let context = retriever
+            .get_context("what happened?", &params)
+            .await
+            .unwrap();
+        let preview = retriever
+            .completion_messages("what happened?", &context, &session, &params)
+            .await
+            .unwrap()
+            .expect("a non-empty context builds a prompt");
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+
+        retriever
+            .get_completion("what happened?", Some(context), &session, &params)
+            .await
+            .unwrap();
+        let sent = llm.last_messages.lock().unwrap().clone();
+        assert_eq!(sent[0].content, preview[0].content);
+        assert_eq!(sent[1].content, preview[1].content);
     }
 
     #[tokio::test]

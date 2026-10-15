@@ -161,7 +161,7 @@ fn build_node_info(payload: &serde_json::Value, prefix: &str) -> NodeInfo {
 /// ...
 ///
 /// Connections:
-/// {source_name} --[{relationship}]--> {target_name}
+/// {source_name} --[{relationship}]--> {target_name}  ({edge_text})
 /// ...
 /// ```
 pub fn resolve_edges_to_text(context: &SearchContext) -> String {
@@ -207,18 +207,30 @@ pub fn resolve_edges_to_text(context: &SearchContext) -> String {
                 .map(|n| n.name.as_str())
                 .unwrap_or("unknown_target");
 
-            let relationship = item
-                .payload
-                .get("relationship")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    item.payload
-                        .get("relationship_name")
-                        .and_then(|v| v.as_str())
-                })
+            // Python: `relationship_type or relationship_name or edge_text`
+            // (`resolve_edges_to_text.py:79-100`); the Rust payload carries
+            // the relationship type as `relationship`. Each source is skipped
+            // when empty, as Python's `or` chain skips a falsy value.
+            let payload_str = |key: &str| {
+                item.payload
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            };
+            let edge_text = payload_str("edge_text");
+            let relationship = payload_str("relationship")
+                .or_else(|| payload_str("relationship_name"))
+                .or(edge_text)
                 .unwrap_or("related_to");
 
-            format!("{source_name} --[{relationship}]--> {target_name}")
+            let mut line = format!("{source_name} --[{relationship}]--> {target_name}");
+            // The edge description follows the label, unless it *is* the label.
+            if let Some(description) = edge_text
+                && description != relationship
+            {
+                line.push_str(&format!("  ({description})"));
+            }
+            line
         })
         .collect();
 
@@ -360,5 +372,62 @@ mod tests {
         let output = resolve_edges_to_text(&context);
         assert!(output.contains("--[KNOWS]-->"));
         assert!(!output.contains(" -[KNOWS]-> ")); // Old format should NOT appear
+    }
+
+    fn connection_line(payload: serde_json::Value) -> String {
+        let output = resolve_edges_to_text(&vec![SearchItem {
+            id: None,
+            score: Some(0.9),
+            payload,
+        }]);
+        output
+            .split("\n\nConnections:\n")
+            .nth(1)
+            .expect("output must contain Connections section")
+            .to_string()
+    }
+
+    #[test]
+    fn edge_text_is_appended_as_a_description() {
+        let line = connection_line(json!({
+            "source_id": "id1",
+            "target_id": "id2",
+            "source_name": "Alice",
+            "target_name": "Acme",
+            "relationship": "works_at",
+            "edge_text": "Alice has worked at Acme since 2019",
+        }));
+        assert_eq!(
+            line,
+            "Alice --[works_at]--> Acme  (Alice has worked at Acme since 2019)"
+        );
+    }
+
+    #[test]
+    fn edge_text_is_the_label_when_no_relationship_is_named() {
+        // Python's `relationship_type or relationship_name or edge_text`: the
+        // edge text becomes the label, and is not repeated as a suffix.
+        let line = connection_line(json!({
+            "source_id": "id1",
+            "target_id": "id2",
+            "source_name": "Alice",
+            "target_name": "Acme",
+            "relationship": "",
+            "edge_text": "employed by",
+        }));
+        assert_eq!(line, "Alice --[employed by]--> Acme");
+    }
+
+    #[test]
+    fn relationship_name_is_the_fallback_label() {
+        let line = connection_line(json!({
+            "source_id": "id1",
+            "target_id": "id2",
+            "source_name": "Alice",
+            "target_name": "Acme",
+            "relationship_name": "works_at",
+            "edge_text": null,
+        }));
+        assert_eq!(line, "Alice --[works_at]--> Acme");
     }
 }

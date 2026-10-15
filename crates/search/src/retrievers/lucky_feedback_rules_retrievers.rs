@@ -179,6 +179,12 @@ pub struct FeelingLuckyRetriever {
     retrievers: HashMap<SearchType, SearchRetrieverRef>,
     fallback_search_type: SearchType,
     generation_options: Option<GenerationOptions>,
+    /// The last query's pick. One search calls this retriever more than once
+    /// (`get_context`, then `get_completion` or `completion_messages`); the
+    /// selector is an LLM call, so asking again could pick a different
+    /// retriever for the second half of the same search — context from one,
+    /// prompt from another — and pays for a second call.
+    last_selection: std::sync::Mutex<Option<(String, SearchType)>>,
 }
 
 impl FeelingLuckyRetriever {
@@ -193,16 +199,8 @@ impl FeelingLuckyRetriever {
             retrievers,
             fallback_search_type: fallback_search_type.unwrap_or(DEFAULT_FEELING_LUCKY_FALLBACK),
             generation_options,
+            last_selection: std::sync::Mutex::new(None),
         }
-    }
-
-    fn fallback_retriever(&self) -> Result<SearchRetrieverRef, SearchError> {
-        self.retrievers
-            .get(&self.fallback_search_type)
-            .cloned()
-            .ok_or(SearchError::UnsupportedSearchType(
-                self.fallback_search_type,
-            ))
     }
 
     fn parse_search_type(raw: &str) -> Option<SearchType> {
@@ -221,7 +219,32 @@ impl FeelingLuckyRetriever {
         serde_json::from_value::<SearchType>(Value::String(mapped)).ok()
     }
 
+    #[allow(clippy::unwrap_used, reason = "lock poison is unrecoverable")]
     async fn select_retriever(&self, query: &str) -> Result<SearchRetrieverRef, SearchError> {
+        let remembered = self
+            .last_selection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(last_query, _)| last_query == query)
+            .map(|(_, search_type)| *search_type);
+        let search_type = match remembered {
+            Some(search_type) => search_type,
+            None => {
+                let search_type = self.choose_search_type(query).await;
+                *self.last_selection.lock().unwrap() = Some((query.to_string(), search_type));
+                search_type
+            }
+        };
+        self.retrievers
+            .get(&search_type)
+            .cloned()
+            .ok_or(SearchError::UnsupportedSearchType(search_type))
+    }
+
+    /// Ask the LLM which search type fits `query`; the fallback type when the
+    /// answer is unusable or names a type that is not registered.
+    async fn choose_search_type(&self, query: &str) -> SearchType {
         let selector_prompt = DEFAULT_FEELING_LUCKY_PROMPT.to_string();
 
         let response = self
@@ -240,10 +263,9 @@ impl FeelingLuckyRetriever {
             .and_then(|completion| Self::parse_search_type(completion.content.as_str()))
             .filter(|search_type| *search_type != SearchType::FeelingLucky);
 
-        match selected_type.and_then(|search_type| self.retrievers.get(&search_type).cloned()) {
-            Some(retriever) => Ok(retriever),
-            None => self.fallback_retriever(),
-        }
+        selected_type
+            .filter(|search_type| self.retrievers.contains_key(search_type))
+            .unwrap_or(self.fallback_search_type)
     }
 }
 
@@ -274,6 +296,19 @@ impl SearchRetriever for FeelingLuckyRetriever {
         self.select_retriever(query)
             .await?
             .get_completion(query, context, session, params)
+            .await
+    }
+
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.select_retriever(query)
+            .await?
+            .completion_messages(query, context, session, params)
             .await
     }
 }
@@ -679,6 +714,19 @@ mod tests {
             _params: &SearchParams,
         ) -> Result<SearchOutput, SearchError> {
             Ok(SearchOutput::Text(self.text.clone()))
+        }
+
+        async fn completion_messages(
+            &self,
+            _query: &str,
+            _context: &SearchContext,
+            _session: &SessionContext,
+            _params: &SearchParams,
+        ) -> Result<Option<Vec<Message>>, SearchError> {
+            Ok(Some(vec![
+                Message::system("system"),
+                Message::user(self.text.clone()),
+            ]))
         }
     }
 
@@ -1100,5 +1148,63 @@ mod tests {
             SearchOutput::Text(text) => assert_eq!(text, "graph result"),
             _ => panic!("expected text output"),
         }
+    }
+
+    /// `only_context` reaches the selected retriever's prompt, and one search
+    /// asks the selector once: context and prompt come from the same pick even
+    /// though the selector would answer differently the second time.
+    #[tokio::test]
+    async fn feeling_lucky_previews_the_selected_retrievers_prompt() {
+        let llm = Arc::new(TestLlm {
+            plain_responses: Mutex::new(VecDeque::from([
+                "GRAPH_COMPLETION".to_string(),
+                "RAG_COMPLETION".to_string(),
+            ])),
+            feedback_response: None,
+        });
+        let retriever = FeelingLuckyRetriever::new(
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            HashMap::from([
+                (
+                    SearchType::RagCompletion,
+                    Arc::new(FixedRetriever {
+                        kind: SearchType::RagCompletion,
+                        text: "rag prompt".to_string(),
+                    }) as SearchRetrieverRef,
+                ),
+                (
+                    SearchType::GraphCompletion,
+                    Arc::new(FixedRetriever {
+                        kind: SearchType::GraphCompletion,
+                        text: "graph prompt".to_string(),
+                    }) as SearchRetrieverRef,
+                ),
+            ]),
+            Some(SearchType::RagCompletion),
+            None,
+        );
+
+        let params = SearchParams::default();
+        let context = retriever
+            .get_context("who knows whom", &params)
+            .await
+            .unwrap();
+        let messages = retriever
+            .completion_messages(
+                "who knows whom",
+                &context,
+                &SessionContext::default(),
+                &params,
+            )
+            .await
+            .unwrap()
+            .expect("the selected retriever builds a prompt");
+
+        assert_eq!(messages[1].content, "graph prompt");
+        assert_eq!(
+            llm.plain_responses.lock().unwrap().len(),
+            1,
+            "the selector must be asked once per search"
+        );
     }
 }

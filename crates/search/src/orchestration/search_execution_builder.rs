@@ -314,12 +314,13 @@ impl SearchBuilder {
 
         retrievers.insert(
             SearchType::ChunksLexical,
-            Arc::new(LexicalRetriever::new(
+            // Python wires CHUNKS_LEXICAL to `BM25ChunksRetriever`
+            // (`get_search_type_retriever_instance.py:353`).
+            Arc::new(LexicalRetriever::bm25(
                 Arc::clone(&graph_db),
                 None,
                 false,
                 None,
-                false,
             )),
         );
 

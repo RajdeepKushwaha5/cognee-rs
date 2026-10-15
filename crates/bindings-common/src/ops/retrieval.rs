@@ -234,6 +234,25 @@ pub fn build_recall_args(opts: &serde_json::Value) -> Result<RecallArgs, SdkErro
     })
 }
 
+/// `nodeNameFilterOperator`: how `nodeName` combines — `"OR"` (any of the
+/// names) or `"AND"` (all of them). Python normalizes it with
+/// `.strip().upper()` and rejects anything else (`search.py:311-317`).
+fn parse_node_name_filter_operator(opts: &serde_json::Value) -> Result<Option<String>, SdkError> {
+    let Some(value) = opts.get("nodeNameFilterOperator").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let normalized = value
+        .as_str()
+        .map(|s| s.trim().to_uppercase())
+        .unwrap_or_default();
+    match normalized.as_str() {
+        "AND" | "OR" => Ok(Some(normalized)),
+        _ => Err(SdkError::Validation(format!(
+            "Invalid node_name_filter_operator: {value}. Must be one of ['AND', 'OR']."
+        ))),
+    }
+}
+
 /// Build a `SearchRequest` from camelCase opts.
 ///
 /// `user_id` is always set from `owner_id` — required when `datasets` is
@@ -285,6 +304,7 @@ pub fn build_search_request(
                 .collect()
         })
     });
+    let node_name_filter_operator = parse_node_name_filter_operator(opts)?;
     let only_context = opts.get("onlyContext").and_then(|v| v.as_bool());
     let use_combined_context = opts.get("useCombinedContext").and_then(|v| v.as_bool());
     let verbose = opts.get("verbose").and_then(|v| v.as_bool());
@@ -323,7 +343,7 @@ pub fn build_search_request(
         session_id,
         node_type,
         node_name,
-        node_name_filter_operator: None,
+        node_name_filter_operator,
         wide_search_top_k: None,
         triplet_distance_penalty: None,
         save_interaction,
@@ -680,6 +700,33 @@ mod tests {
             .expect("retrieverSpecificConfig must reach the request");
         assert_eq!(config.get("text_summaries_top_k"), Some(&json!(3)));
         assert_eq!(config.get("not_a_real_knob"), Some(&json!("x")));
+    }
+
+    /// `nodeNameFilterOperator` reaches the request normalized the way Python
+    /// normalizes it (`.strip().upper()`, `search.py:311-317`); it was
+    /// hard-coded to `None`, so a binding caller could not ask for AND.
+    #[test]
+    fn build_search_request_carries_the_node_name_filter_operator() {
+        let opts = json!({ "nodeName": ["a", "b"], "nodeNameFilterOperator": " and " });
+        let req = build_search_request("q", &opts, Uuid::new_v4()).unwrap();
+        assert_eq!(req.node_name_filter_operator.as_deref(), Some("AND"));
+
+        let req = build_search_request("q", &json!({}), Uuid::new_v4()).unwrap();
+        assert_eq!(req.node_name_filter_operator, None);
+    }
+
+    #[test]
+    fn build_search_request_rejects_an_unknown_node_name_filter_operator() {
+        for bad in [json!("XOR"), json!(1)] {
+            let opts = json!({ "nodeNameFilterOperator": bad });
+            assert!(
+                matches!(
+                    build_search_request("q", &opts, Uuid::new_v4()),
+                    Err(SdkError::Validation(_))
+                ),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     /// Absent, the field stays `None` rather than becoming an empty map — the

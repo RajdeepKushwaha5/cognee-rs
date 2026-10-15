@@ -13,6 +13,17 @@ const SUMMARIES_DATA_TYPE: &str = "TextSummary";
 const SUMMARIES_FIELD_NAME: &str = "text";
 const DEFAULT_TOP_K: usize = 10;
 
+/// SUMMARIES: vector search over the `TextSummary_text` collection.
+///
+/// # Score direction — a known difference from Python
+///
+/// Each item's `score` is the vector layer's **similarity: higher is a better
+/// match**, the convention of every Rust retriever (`cognee_vector::SearchResult
+/// ::score`). Python's `SummariesRetriever` instead writes the raw backend
+/// distance into each payload as `payload["score"]`, where **lower** is better
+/// (`summaries_retriever.py:112-118`). A caller porting Python code that sorts
+/// or thresholds on that score must flip the comparison. Aligning the two
+/// spans every vector adapter and retriever; it is tracked as SDK-1123.
 pub struct SummariesRetriever {
     vector_db: Arc<dyn VectorDB>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
@@ -288,5 +299,41 @@ mod tests {
         assert_eq!(context[0].payload["text"], "first summary");
         assert_eq!(context[1].payload["text"], "second summary");
         assert!(context[0].score.unwrap() >= context[1].score.unwrap());
+    }
+
+    /// Pins the documented score direction: higher is a better match, so the
+    /// summary aligned with the query ranks first with the larger score.
+    #[tokio::test]
+    async fn score_is_a_similarity_higher_is_better() {
+        // `TestEmbeddingEngine` embeds every query as `[0, 1]`.
+        let db = cognee_vector::BruteForceVectorDB::new();
+        db.create_collection("TextSummary", "text", 2)
+            .await
+            .unwrap();
+        let point = |text: &str, vector: Vec<f32>| VectorPoint {
+            id: Uuid::new_v4(),
+            vector,
+            metadata: HashMap::from([("text".to_string(), json!(text))]),
+        };
+        db.index_points(
+            "TextSummary",
+            "text",
+            &[
+                point("off topic", vec![1.0, 0.0]),
+                point("on topic", vec![0.0, 1.0]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let retriever =
+            SummariesRetriever::new(Arc::new(db), Arc::new(TestEmbeddingEngine), Some(2));
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+
+        assert_eq!(context[0].payload["text"], "on topic");
+        assert!(context[0].score.unwrap() > context[1].score.unwrap());
     }
 }

@@ -3,50 +3,53 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
-use cognee_llm::{GenerationOptions, Llm};
+use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
-use serde_json::json;
 use tracing::debug;
 
 use cognee_session::SessionContext;
 
-use crate::graph_retrieval::{
-    DEFAULT_TRIPLET_DISTANCE_PENALTY, GraphRetrievalConfig, brute_force_triplet_search,
-};
 use crate::retrievers::SearchRetriever;
-use crate::types::{
-    SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
-};
-use crate::utils::{
-    build_messages_with_history, render_edges_context, render_graph_user_prompt,
-    resolve_system_prompt,
-};
-
-const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_WIDE_SEARCH_TOP_K: usize = 100;
+use crate::retrievers::graph_core::{GraphPrompts, GraphRetrieverCore, complete};
+use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
+use crate::utils::{render_edges_context, skip_completion_on_empty_context};
 
 pub struct GraphCompletionRetriever {
-    vector_db: Arc<dyn VectorDB>,
-    embedding_engine: Arc<dyn EmbeddingEngine>,
-    graph_db: Arc<dyn GraphDBTrait>,
+    core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
-    top_k: usize,
-    wide_search_top_k: usize,
-    triplet_distance_penalty: f32,
-    feedback_influence: f32,
-    neighbor_cap: Option<usize>,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
 }
 
 impl GraphCompletionRetriever {
+    /// The system + user messages a completion over `context` sends, or
+    /// `None` when the rendered context is empty. Shared by `get_completion`
+    /// and the `only_context` preview.
+    fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let graph_context_text = render_edges_context(context);
+        if graph_context_text.is_empty() {
+            return Ok(None);
+        }
+        debug!(
+            context_items = context.len(),
+            "Graph context assembled:\n{graph_context_text}"
+        );
+        self.prompts
+            .messages(query, &graph_context_text, session, params)
+            .map(Some)
+    }
+
     /// Cap the neighbours expanded per seed node in triplet search
     /// (`search.triplet_neighbor_cap`); `None` is uncapped.
     #[must_use]
     pub fn with_neighbor_cap(mut self, cap: Option<usize>) -> Self {
-        self.neighbor_cap = cap;
+        self.core.neighbor_cap = cap;
         self
     }
 
@@ -65,19 +68,20 @@ impl GraphCompletionRetriever {
         generation_options: Option<GenerationOptions>,
     ) -> Self {
         Self {
-            vector_db,
-            embedding_engine,
-            graph_db,
+            core: GraphRetrieverCore::new(
+                vector_db,
+                embedding_engine,
+                graph_db,
+                top_k,
+                wide_search_top_k,
+                triplet_distance_penalty,
+            ),
             llm,
-            top_k: top_k.unwrap_or(DEFAULT_TOP_K),
-            wide_search_top_k: wide_search_top_k.unwrap_or(DEFAULT_WIDE_SEARCH_TOP_K),
-            triplet_distance_penalty: triplet_distance_penalty
-                .unwrap_or(DEFAULT_TRIPLET_DISTANCE_PENALTY),
-            feedback_influence: 0.0,
-            neighbor_cap: None,
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
     }
@@ -92,7 +96,7 @@ impl SearchRetriever for GraphCompletionRetriever {
     #[cfg(test)]
     fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
         crate::retrievers::AppliedTuning {
-            neighbor_cap: Some(self.neighbor_cap),
+            neighbor_cap: Some(self.core.neighbor_cap),
             ..Default::default()
         }
     }
@@ -107,55 +111,20 @@ impl SearchRetriever for GraphCompletionRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        if self.graph_db.is_empty().await? {
-            debug!("graph is empty — returning empty context");
-            return Ok(vec![]);
-        }
+        // A populated graph with no matching triplets is a normal miss and
+        // returns an empty context; an empty graph is `NotFound`.
+        self.core.ensure_graph_not_empty().await?;
+        self.core.search(query, params).await
+    }
 
-        let config = GraphRetrievalConfig {
-            top_k: params.top_k_or(self.top_k),
-            wide_search_top_k: params.wide_search_top_k_or(self.wide_search_top_k),
-            triplet_distance_penalty: params
-                .triplet_distance_penalty_or(self.triplet_distance_penalty),
-            feedback_influence: params.feedback_influence_or(self.feedback_influence),
-            neighbor_cap: self.neighbor_cap,
-            node_type: params.node_type.clone(),
-            node_name: params.node_name.clone(),
-            node_name_filter_operator: params
-                .node_name_filter_operator
-                .as_deref()
-                .unwrap_or("OR")
-                .to_string(),
-        };
-
-        let ranked_edges = brute_force_triplet_search(
-            query,
-            self.vector_db.as_ref(),
-            self.embedding_engine.as_ref(),
-            self.graph_db.as_ref(),
-            &config,
-        )
-        .await?;
-
-        Ok(ranked_edges
-            .into_iter()
-            .map(|edge| SearchItem {
-                id: None,
-                score: Some(edge.score),
-                payload: json!({
-                    "source_id": edge.source_id,
-                    "target_id": edge.target_id,
-                    "relationship": edge.relationship_name,
-                    "source_name": edge.source_name,
-                    "target_name": edge.target_name,
-                    "source_text": edge.source_text,
-                    "target_text": edge.target_text,
-                    "source_description": edge.source_description,
-                    "target_description": edge.target_description,
-                    "dataset_id": edge.dataset_id,
-                }),
-            })
-            .collect())
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
     }
 
     async fn get_completion(
@@ -170,51 +139,19 @@ impl SearchRetriever for GraphCompletionRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let graph_context_text = render_edges_context(&completion_context);
+        let Some(messages) =
+            self.build_completion_messages(query, &completion_context, session, params)?
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
 
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &graph_context_text,
-        );
-
-        debug!(
-            context_items = completion_context.len(),
-            "Graph context assembled:\n{graph_context_text}"
-        );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
-
-        if let Some(schema) = &params.response_schema {
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    messages,
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
-        } else {
-            let completion = self
-                .llm
-                .generate(messages, self.generation_options.clone())
-                .await?;
-            Ok(SearchOutput::Text(completion.content))
-        }
+        complete(
+            self.llm.as_ref(),
+            messages,
+            params,
+            self.generation_options.clone(),
+        )
+        .await
     }
 }
 
@@ -246,7 +183,7 @@ mod tests {
     use cognee_session::SessionContext;
 
     use crate::retrievers::{GraphCompletionRetriever, SearchRetriever};
-    use crate::types::{SearchOutput, SearchParams};
+    use crate::types::{SearchError, SearchOutput, SearchParams};
 
     struct TestEmbeddingEngine;
 
@@ -764,5 +701,206 @@ mod tests {
         assert!(messages[1].content.contains("knowledge graph"));
         // Should NOT use the generic RAG format
         assert!(!messages[1].content.starts_with("Question:\n"));
+    }
+
+    fn retriever_over(
+        graph_db: TestGraphDb,
+        collections: HashMap<String, Vec<SearchResult>>,
+        llm: &Arc<TestLlm>,
+    ) -> GraphCompletionRetriever {
+        GraphCompletionRetriever::new(
+            Arc::new(TestVectorDb { collections }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::new(graph_db),
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(2),
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Python raises `NoDataError` on an empty graph (SDK-270); the Rust
+    /// counterpart is `NotFound`, the same error the hybrid retriever raises.
+    #[tokio::test]
+    async fn empty_graph_is_not_found() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: true,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            &llm,
+        );
+
+        let err = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SearchError::NotFound(ref message) if message.contains("knowledge graph is empty")),
+            "expected NotFound, got {err:?}"
+        );
+
+        // Through get_completion the error surfaces before any LLM call.
+        let err = retriever
+            .get_completion(
+                "query",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SearchError::NotFound(_)));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// A populated graph with no matching triplet is a normal miss: no error,
+    /// and no LLM call — Python's `skip_completion_on_empty_context`.
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        assert!(context.is_empty());
+
+        let output = retriever
+            .get_completion(
+                "query",
+                Some(context),
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// The edge's `edge_text` property rides into the context payload and is
+    /// rendered after the relationship in the prompt (`resolve_edges_to_text.py:
+    /// 79-100`).
+    #[tokio::test]
+    async fn edge_text_reaches_the_prompt() {
+        let alice = "00000000-0000-0000-0000-000000000001";
+        let acme = "00000000-0000-0000-0000-000000000002";
+        let llm = Arc::new(TestLlm {
+            response_text: "answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![node(alice, "Alice"), node(acme, "Acme")],
+                edges: vec![(
+                    alice.to_string(),
+                    acme.to_string(),
+                    "works_at".to_string(),
+                    HashMap::from([(
+                        Cow::Borrowed("edge_text"),
+                        json!("Alice has worked at Acme since 2019"),
+                    )]),
+                )],
+            },
+            HashMap::from([(
+                TestVectorDb::key("Entity", "name"),
+                vec![entity_hit(alice, 0.9)],
+            )]),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            context[0].payload["edge_text"],
+            "Alice has worked at Acme since 2019"
+        );
+
+        retriever
+            .get_completion(
+                "query",
+                Some(context),
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+        let messages = llm.last_messages.lock().unwrap().clone();
+        assert!(
+            messages[1]
+                .content
+                .contains("Alice --[works_at]--> Acme  (Alice has worked at Acme since 2019)"),
+            "got: {}",
+            messages[1].content
+        );
+    }
+
+    /// Internal nodes (Python's `InternalDataPoint`) are never projected, so
+    /// no edge touching one reaches the context (`CogneeGraph.py:192-232`).
+    #[tokio::test]
+    async fn internal_nodes_never_reach_the_context() {
+        let alice = "00000000-0000-0000-0000-000000000001";
+        let acme = "00000000-0000-0000-0000-000000000002";
+        let preference = "00000000-0000-0000-0000-000000000003";
+        let mut internal = node(preference, "Alice prefers terse answers");
+        internal.1.insert(Cow::Borrowed("is_internal"), json!(true));
+
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: false,
+                nodes: vec![node(alice, "Alice"), node(acme, "Acme"), internal],
+                edges: vec![
+                    (
+                        alice.to_string(),
+                        acme.to_string(),
+                        "works_at".to_string(),
+                        HashMap::new(),
+                    ),
+                    (
+                        alice.to_string(),
+                        preference.to_string(),
+                        "prefers".to_string(),
+                        HashMap::new(),
+                    ),
+                ],
+            },
+            HashMap::from([(
+                TestVectorDb::key("Entity", "name"),
+                vec![entity_hit(alice, 0.9), entity_hit(preference, 0.95)],
+            )]),
+            &llm,
+        );
+
+        let context = retriever
+            .get_context("query", &SearchParams::default())
+            .await
+            .unwrap();
+
+        assert_eq!(context.len(), 1, "only the non-internal edge: {context:?}");
+        assert_eq!(context[0].payload["relationship"], "works_at");
     }
 }

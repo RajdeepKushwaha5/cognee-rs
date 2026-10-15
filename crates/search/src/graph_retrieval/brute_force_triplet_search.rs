@@ -1,8 +1,11 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::{GraphDBTrait, NeighborhoodScope};
+use cognee_models::{INTERNAL_PROPERTY, marks_internal};
 use cognee_vector::VectorDB;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::graph_retrieval::rank_edge_score;
@@ -131,6 +134,9 @@ pub struct RankedGraphEdge {
     pub source_description: Option<String>,
     /// Description of the target node (present on Entity nodes).
     pub target_description: Option<String>,
+    /// The edge's nonblank `edge_text` property — its natural-language
+    /// description, rendered after the relationship in the graph context.
+    pub edge_text: Option<String>,
 }
 
 #[tracing::instrument(
@@ -342,7 +348,16 @@ pub async fn brute_force_triplet_search(
     let mut node_descriptions: HashMap<String, String> = HashMap::new();
     let mut node_feedback_weights: HashMap<String, f32> = HashMap::new();
 
+    // Internal nodes (Python's `InternalDataPoint`, e.g. per-user preference
+    // state in a graph shared with the Python SDK) are never projected, and
+    // an edge touching one is dropped with them (`CogneeGraph.py:192-232`).
+    let mut internal_node_ids: HashSet<String> = HashSet::new();
+
     for (node_id, properties) in graph_nodes {
+        if marks_internal(properties.get(INTERNAL_PROPERTY)) {
+            internal_node_ids.insert(node_id);
+            continue;
+        }
         let name = properties
             .get("name")
             .and_then(|value| value.as_str())
@@ -367,87 +382,59 @@ pub async fn brute_force_triplet_search(
 
     let default_penalty = config.triplet_distance_penalty;
 
-    let mut ranked_edges = graph_edges
-        .into_iter()
-        .filter_map(|(source_id, target_id, relationship_name, properties)| {
-            // Only consider edges where at least one endpoint was found in vector search
-            if !candidate_node_ids.contains(&source_id) && !candidate_node_ids.contains(&target_id)
-            {
-                return None;
-            }
+    // Score every candidate edge against borrowed data; the owned
+    // `RankedGraphEdge` (names, texts, descriptions, edge text) is built only
+    // for the `top_k` that survive the cut below.
+    let mut scored = graph_edges
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(index, (source_id, target_id, relationship_name, properties))| {
+                // Only consider edges where at least one endpoint was found in vector search
+                if !candidate_node_ids.contains(source_id)
+                    && !candidate_node_ids.contains(target_id)
+                {
+                    return None;
+                }
+                if internal_node_ids.contains(source_id) || internal_node_ids.contains(target_id) {
+                    return None;
+                }
 
-            // Unmatched nodes get the default penalty distance (not 0.0)
-            let source_dist = node_distances
-                .get(&source_id)
-                .copied()
-                .unwrap_or(default_penalty);
-            let target_dist = node_distances
-                .get(&target_id)
-                .copied()
-                .unwrap_or(default_penalty);
+                // Unmatched nodes get the default penalty distance (not 0.0)
+                let source_dist = node_distances
+                    .get(source_id)
+                    .copied()
+                    .unwrap_or(default_penalty);
+                let target_dist = node_distances
+                    .get(target_id)
+                    .copied()
+                    .unwrap_or(default_penalty);
 
-            // Recompute the EdgeType vector-row id this edge was indexed under and
-            // look the distance up by that. `edge_type_point_id` returns `None`
-            // only when both the `edge_text` property and the relationship name
-            // are blank — cognify skips building a row for such an edge, so there
-            // is nothing to match and the penalty is correct.
-            // Unmatched edge types get the default penalty distance.
-            let edge_dist = edge_type_point_id(
-                properties.get("edge_text").and_then(|v| v.as_str()),
-                &relationship_name,
-            )
-            .and_then(|point_id| edge_type_distances.get(&point_id).copied())
-            .unwrap_or(default_penalty);
+                // Recompute the EdgeType vector-row id this edge was indexed under and
+                // look the distance up by that. `edge_type_point_id` returns `None`
+                // only when both the `edge_text` property and the relationship name
+                // are blank — cognify skips building a row for such an edge, so there
+                // is nothing to match and the penalty is correct.
+                // Unmatched edge types get the default penalty distance.
+                let edge_dist =
+                    edge_type_point_id(nonblank_edge_text(properties), relationship_name)
+                        .and_then(|point_id| edge_type_distances.get(&point_id).copied())
+                        .unwrap_or(default_penalty);
 
-            let source_name = node_names
-                .get(&source_id)
-                .cloned()
-                .unwrap_or(source_id.clone());
-            let target_name = node_names
-                .get(&target_id)
-                .cloned()
-                .unwrap_or(target_id.clone());
+                let source_fw = node_feedback_weights.get(source_id).copied().unwrap_or(0.5);
+                let target_fw = node_feedback_weights.get(target_id).copied().unwrap_or(0.5);
 
-            let dataset_id = node_dataset_ids
-                .get(&source_id)
-                .or_else(|| node_dataset_ids.get(&target_id))
-                .cloned();
-
-            let source_text = node_texts.get(&source_id).cloned();
-            let target_text = node_texts.get(&target_id).cloned();
-            let source_description = node_descriptions.get(&source_id).cloned();
-            let target_description = node_descriptions.get(&target_id).cloned();
-
-            let source_fw = node_feedback_weights
-                .get(&source_id)
-                .copied()
-                .unwrap_or(0.5);
-            let target_fw = node_feedback_weights
-                .get(&target_id)
-                .copied()
-                .unwrap_or(0.5);
-
-            Some(RankedGraphEdge {
-                source_id,
-                target_id,
-                relationship_name,
-                score: rank_edge_score(
+                let score = rank_edge_score(
                     source_dist,
                     target_dist,
                     edge_dist,
                     config.feedback_influence,
                     source_fw,
                     target_fw,
-                ),
-                source_name,
-                target_name,
-                dataset_id,
-                source_text,
-                target_text,
-                source_description,
-                target_description,
-            })
-        })
+                );
+                Some((index, score))
+            },
+        )
         .collect::<Vec<_>>();
 
     // Sort ascending: lowest total distance = best match (matches Python heapq.nsmallest).
@@ -467,17 +454,56 @@ pub async fn brute_force_triplet_search(
     // query) ranks last. `partial_cmp(..).unwrap_or(Equal)` made the comparator
     // intransitive in that case, which the standard sort detects and panics on.
     let rank_key = |score: f32| if score.is_nan() { f32::INFINITY } else { score };
-    ranked_edges.sort_by(|left, right| {
-        rank_key(left.score)
-            .total_cmp(&rank_key(right.score))
-            .then_with(|| left.source_id.cmp(&right.source_id))
-            .then_with(|| left.target_id.cmp(&right.target_id))
-            .then_with(|| left.relationship_name.cmp(&right.relationship_name))
+    scored.sort_by(|&(left, left_score), &(right, right_score)| {
+        let (left_source, left_target, left_relationship, _) = &graph_edges[left];
+        let (right_source, right_target, right_relationship, _) = &graph_edges[right];
+        rank_key(left_score)
+            .total_cmp(&rank_key(right_score))
+            .then_with(|| left_source.cmp(right_source))
+            .then_with(|| left_target.cmp(right_target))
+            .then_with(|| left_relationship.cmp(right_relationship))
     });
+    scored.truncate(config.top_k);
 
-    let ranked_edges: Vec<_> = ranked_edges.into_iter().take(config.top_k).collect();
+    let ranked_edges: Vec<RankedGraphEdge> = scored
+        .into_iter()
+        .map(|(index, score)| {
+            let (source_id, target_id, relationship_name, properties) = &graph_edges[index];
+            RankedGraphEdge {
+                source_id: source_id.clone(),
+                target_id: target_id.clone(),
+                relationship_name: relationship_name.clone(),
+                score,
+                source_name: node_names
+                    .get(source_id)
+                    .cloned()
+                    .unwrap_or_else(|| source_id.clone()),
+                target_name: node_names
+                    .get(target_id)
+                    .cloned()
+                    .unwrap_or_else(|| target_id.clone()),
+                dataset_id: node_dataset_ids
+                    .get(source_id)
+                    .or_else(|| node_dataset_ids.get(target_id))
+                    .cloned(),
+                source_text: node_texts.get(source_id).cloned(),
+                target_text: node_texts.get(target_id).cloned(),
+                source_description: node_descriptions.get(source_id).cloned(),
+                target_description: node_descriptions.get(target_id).cloned(),
+                edge_text: nonblank_edge_text(properties).map(str::to_string),
+            }
+        })
+        .collect();
     tracing::Span::current().record("cognee.result.count", ranked_edges.len() as u64);
     Ok(ranked_edges)
+}
+
+/// An edge's `edge_text` property, unless absent or blank.
+fn nonblank_edge_text<'a>(properties: &'a HashMap<Cow<'static, str>, Value>) -> Option<&'a str> {
+    properties
+        .get("edge_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
 }
 
 #[cfg(test)]

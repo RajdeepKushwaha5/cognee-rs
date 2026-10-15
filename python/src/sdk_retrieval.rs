@@ -93,7 +93,11 @@ impl PyCognee {
     /// - ``session_id`` / ``sessionId`` — session UUID string
     /// - ``node_type`` / ``nodeType`` — filter by node type string
     /// - ``node_name`` / ``nodeName`` — list of node name strings to filter
-    /// - ``only_context`` / ``onlyContext`` — bool; return raw context only
+    /// - ``node_name_filter_operator`` / ``nodeNameFilterOperator`` — ``"OR"``
+    ///   (default) or ``"AND"``: how the ``node_name`` filter combines
+    /// - ``only_context`` / ``onlyContext`` — bool; skip the LLM and return
+    ///   what it would have received: ``user_prompt`` / ``system_prompt`` (the
+    ///   result is the user prompt) for the completion types, else the context
     /// - ``use_combined_context`` / ``useCombinedContext`` — bool
     /// - ``verbose`` — bool
     /// - ``save_interaction`` / ``saveInteraction`` — bool (default ``True``)

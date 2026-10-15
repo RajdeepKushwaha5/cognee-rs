@@ -19,6 +19,7 @@ public final class SearchOptions extends Options {
     public SearchOptions sessionId(String s) { put("sessionId", s); return this; }
     public SearchOptions nodeType(String t) { put("nodeType", t); return this; }
     public SearchOptions nodeName(List<String> n) { put("nodeName", n); return this; }
+    public SearchOptions nodeNameFilterOperator(String op) { put("nodeNameFilterOperator", op); return this; }
     public SearchOptions onlyContext(boolean b) { put("onlyContext", b); return this; }
     public SearchOptions useCombinedContext(boolean b) { put("useCombinedContext", b); return this; }
     public SearchOptions verbose(boolean b) { put("verbose", b); return this; }

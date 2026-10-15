@@ -1,37 +1,172 @@
+//! Lexical (token-overlap) chunk retrieval over the graph's `DocumentChunk`
+//! nodes: Okapi BM25 for `CHUNKS_LEXICAL`, set/multiset Jaccard on request.
+//!
+//! Port of Python's `LexicalRetriever` family (`lexical_retriever.py`,
+//! `bm25_retriever.py`, `jaccard_retrival.py`).
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use cognee_graph::GraphDBTrait;
 use cognee_session::SessionContext;
+use regex::Regex;
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
 
 use crate::retrievers::SearchRetriever;
 use crate::types::{
     SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
 };
+use crate::utils::DEFAULT_STOP_WORDS;
 
 const DEFAULT_TOP_K: usize = 10;
 const DOCUMENT_CHUNK_TYPE: &str = "DocumentChunk";
 
-struct CachedChunk {
+/// BM25 term-frequency saturation (`bm25_retriever.py:23`).
+pub const BM25_DEFAULT_K1: f32 = 1.5;
+/// BM25 length normalization (`bm25_retriever.py:24`).
+pub const BM25_DEFAULT_B: f32 = 0.75;
+
+/// How a [`LexicalRetriever`] scores a chunk against the query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LexicalScorer {
+    /// Okapi BM25 with corpus IDF and average chunk length — Python's
+    /// `BM25ChunksRetriever`, which backs `CHUNKS_LEXICAL`.
+    Bm25 { k1: f32, b: f32 },
+    /// Set Jaccard, or frequency-aware multiset Jaccard — Python's
+    /// `JaccardChunksRetriever`.
+    Jaccard { multiset: bool },
+}
+
+/// A `DocumentChunk` node as one search loaded it.
+struct LoadedChunk {
     id: Option<uuid::Uuid>,
     payload: serde_json::Value,
-    tokens: Vec<String>,
+    text: String,
 }
+
+/// The tokenized corpus, with the BM25 statistics computed once from it
+/// (`bm25_retriever.py:_build_corpus_stats`).
+///
+/// Built from one load's chunk list and reused while a later load fingerprints
+/// the same: tokenizing every chunk and rebuilding the IDF table is the
+/// expensive part of a lexical search, and it only changes when the chunks do.
+struct Corpus {
+    /// Indices into the load's chunk list of the chunks that produced tokens.
+    kept: Vec<usize>,
+    /// Tokens of each kept chunk, aligned with `kept`.
+    tokens: Vec<Vec<String>>,
+    /// BM25 statistics; empty for a Jaccard scorer, which never reads them.
+    idf: HashMap<String, f32>,
+    avg_chunk_length: f32,
+}
+
+impl Corpus {
+    fn new(kept: Vec<usize>, tokens: Vec<Vec<String>>, with_bm25_stats: bool) -> Self {
+        let mut corpus = Self {
+            kept,
+            tokens,
+            idf: HashMap::new(),
+            avg_chunk_length: 0.0,
+        };
+        if with_bm25_stats {
+            corpus.build_bm25_stats();
+        }
+        corpus
+    }
+
+    fn build_bm25_stats(&mut self) {
+        let total_chunks = self.tokens.len() as f32;
+        let mut document_frequency: HashMap<&str, usize> = HashMap::new();
+        let mut total_length = 0usize;
+        for tokens in &self.tokens {
+            total_length += tokens.len();
+            let unique: HashSet<&str> = tokens.iter().map(String::as_str).collect();
+            for token in unique {
+                *document_frequency.entry(token).or_default() += 1;
+            }
+        }
+        self.idf = document_frequency
+            .into_iter()
+            .map(|(token, df)| {
+                let df = df as f32;
+                (
+                    token.to_string(),
+                    (1.0 + (total_chunks - df + 0.5) / (df + 0.5)).ln(),
+                )
+            })
+            .collect();
+        self.avg_chunk_length = if self.tokens.is_empty() {
+            0.0
+        } else {
+            total_length as f32 / total_chunks
+        };
+    }
+
+    /// Okapi BM25 of one chunk, summed over the unique query terms
+    /// (`bm25_retriever.py:_scorer`).
+    fn bm25(&self, query_tokens: &[String], chunk_tokens: &[String], k1: f32, b: f32) -> f32 {
+        if query_tokens.is_empty() || chunk_tokens.is_empty() || self.avg_chunk_length == 0.0 {
+            return 0.0;
+        }
+
+        let mut term_frequencies: HashMap<&str, usize> = HashMap::new();
+        for token in chunk_tokens {
+            *term_frequencies.entry(token.as_str()).or_default() += 1;
+        }
+        let length_norm = k1 * (1.0 - b + b * chunk_tokens.len() as f32 / self.avg_chunk_length);
+
+        let unique_query: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+        unique_query
+            .into_iter()
+            .filter_map(|token| {
+                let tf = *term_frequencies.get(token)? as f32;
+                let idf = self.idf.get(token).copied().unwrap_or(0.0);
+                Some(idf * (tf * (k1 + 1.0)) / (tf + length_norm))
+            })
+            .sum()
+    }
+}
+
+/// Fingerprint of a chunk list: ids and texts, in load order. Equal
+/// fingerprints mean the cached tokens and statistics still describe it.
+fn fingerprint(chunks: &[LoadedChunk]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    chunks.len().hash(&mut hasher);
+    for chunk in chunks {
+        chunk.id.hash(&mut hasher);
+        chunk.text.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Python's `\w` over `str`: a character `str.isalnum()` accepts — letters
+/// (`L*`) and numbers (`N*`) — or the underscore. Unlike Rust's
+/// `char::is_alphanumeric`, this excludes combining marks such as Devanagari
+/// vowel signs, which Python's `\w` does not match.
+#[allow(
+    clippy::expect_used,
+    reason = "a constant pattern that compiles; the word-pattern test exercises it"
+)]
+static WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\p{L}\p{N}_]+").expect("the word pattern is a valid regex"));
 
 pub struct LexicalRetriever {
     graph_db: Arc<dyn GraphDBTrait>,
     top_k: usize,
     with_scores: bool,
     stop_words: HashSet<String>,
-    multiset_jaccard: bool,
-    cached_chunks: OnceCell<Vec<CachedChunk>>,
+    scorer: LexicalScorer,
+    /// The last corpus built, keyed by the fingerprint of the chunk list it
+    /// was built from.
+    corpus_cache: Mutex<Option<(u64, Arc<Corpus>)>>,
 }
 
 impl LexicalRetriever {
+    /// A Jaccard retriever (Python's `JaccardChunksRetriever`): no stop words
+    /// unless given, set or multiset Jaccard.
     pub fn new(
         graph_db: Arc<dyn GraphDBTrait>,
         top_k: Option<usize>,
@@ -43,105 +178,65 @@ impl LexicalRetriever {
             graph_db,
             top_k: top_k.unwrap_or(DEFAULT_TOP_K),
             with_scores,
-            stop_words: stop_words
-                .unwrap_or_default()
-                .into_iter()
-                .map(|token| token.to_lowercase())
-                .collect(),
-            multiset_jaccard,
-            cached_chunks: OnceCell::new(),
+            stop_words: lowercase_set(stop_words.unwrap_or_default()),
+            scorer: LexicalScorer::Jaccard {
+                multiset: multiset_jaccard,
+            },
+            corpus_cache: Mutex::new(None),
         }
     }
 
+    /// A BM25 retriever (Python's `BM25ChunksRetriever`, `CHUNKS_LEXICAL`):
+    /// `k1 = 1.5`, `b = 0.75`, and the default English stop words unless
+    /// `stop_words` is given (an empty list disables filtering).
+    pub fn bm25(
+        graph_db: Arc<dyn GraphDBTrait>,
+        top_k: Option<usize>,
+        with_scores: bool,
+        stop_words: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            graph_db,
+            top_k: top_k.unwrap_or(DEFAULT_TOP_K),
+            with_scores,
+            stop_words: match stop_words {
+                Some(words) => lowercase_set(words),
+                None => DEFAULT_STOP_WORDS.iter().map(|w| w.to_string()).collect(),
+            },
+            scorer: LexicalScorer::Bm25 {
+                k1: BM25_DEFAULT_K1,
+                b: BM25_DEFAULT_B,
+            },
+            corpus_cache: Mutex::new(None),
+        }
+    }
+
+    /// The scoring function this retriever ranks with.
+    pub fn scorer(&self) -> LexicalScorer {
+        self.scorer
+    }
+
+    /// Lowercase, split on word characters, drop stop words — Python's
+    /// `tokenize_words`: `re.findall(r"\w+", text.lower())`. The whole text is
+    /// lowercased first, as `str.lower()` does, so context-dependent mappings
+    /// (a word-final `Σ` becomes `ς`) match Python.
     fn tokenize(&self, text: &str) -> Vec<String> {
-        let mut tokens = Vec::new();
-        let mut current = String::new();
-
-        for ch in text.chars() {
-            if ch.is_alphanumeric() || ch == '_' {
-                current.extend(ch.to_lowercase());
-            } else if !current.is_empty() {
-                if !self.stop_words.contains(&current) {
-                    tokens.push(std::mem::take(&mut current));
-                } else {
-                    current.clear();
-                }
-            }
-        }
-
-        if !current.is_empty() && !self.stop_words.contains(&current) {
-            tokens.push(current);
-        }
-
-        tokens
+        let lowered = text.to_lowercase();
+        WORD.find_iter(&lowered)
+            .map(|word| word.as_str())
+            .filter(|word| !self.stop_words.contains(*word))
+            .map(str::to_string)
+            .collect()
     }
 
-    fn score(&self, query_tokens: &[String], chunk_tokens: &[String]) -> f32 {
-        if query_tokens.is_empty() || chunk_tokens.is_empty() {
-            return 0.0;
-        }
-
-        if self.multiset_jaccard {
-            let mut query_counts = HashMap::new();
-            for token in query_tokens {
-                *query_counts.entry(token).or_insert(0usize) += 1;
-            }
-
-            let mut chunk_counts = HashMap::new();
-            for token in chunk_tokens {
-                *chunk_counts.entry(token).or_insert(0usize) += 1;
-            }
-
-            let universe: HashSet<&String> = query_counts
-                .keys()
-                .chain(chunk_counts.keys())
-                .copied()
-                .collect();
-
-            let numerator: usize = universe
-                .iter()
-                .map(|token| {
-                    query_counts
-                        .get(*token)
-                        .copied()
-                        .unwrap_or_default()
-                        .min(chunk_counts.get(*token).copied().unwrap_or_default())
-                })
-                .sum();
-
-            let denominator: usize = universe
-                .iter()
-                .map(|token| {
-                    query_counts
-                        .get(*token)
-                        .copied()
-                        .unwrap_or_default()
-                        .max(chunk_counts.get(*token).copied().unwrap_or_default())
-                })
-                .sum();
-
-            if denominator == 0 {
-                0.0
-            } else {
-                numerator as f32 / denominator as f32
-            }
-        } else {
-            let query_set: HashSet<&String> = query_tokens.iter().collect();
-            let chunk_set: HashSet<&String> = chunk_tokens.iter().collect();
-            let intersection_size = query_set.intersection(&chunk_set).count();
-            let union_size = query_set.union(&chunk_set).count();
-
-            if union_size == 0 {
-                0.0
-            } else {
-                intersection_size as f32 / union_size as f32
-            }
+    fn score(&self, corpus: &Corpus, query_tokens: &[String], chunk_tokens: &[String]) -> f32 {
+        match self.scorer {
+            LexicalScorer::Bm25 { k1, b } => corpus.bm25(query_tokens, chunk_tokens, k1, b),
+            LexicalScorer::Jaccard { multiset } => jaccard(query_tokens, chunk_tokens, multiset),
         }
     }
 
-    async fn load_document_chunks(
-        &self,
-    ) -> Result<Vec<(Option<uuid::Uuid>, Value, String)>, SearchError> {
+    async fn load_document_chunks(&self) -> Result<Vec<LoadedChunk>, SearchError> {
         let filters = HashMap::from([(Cow::Borrowed("type"), vec![json!(DOCUMENT_CHUNK_TYPE)])]);
 
         let (nodes, _) = self.graph_db.get_filtered_graph_data(&filters).await?;
@@ -162,42 +257,125 @@ impl LexicalRetriever {
 
             let payload = serde_json::to_value(&node_data)?;
 
-            let item_id = node_data
+            let id = node_data
                 .get("id")
                 .and_then(Value::as_str)
                 .and_then(|id| uuid::Uuid::parse_str(id).ok())
                 .or_else(|| uuid::Uuid::parse_str(&node_id).ok());
 
-            chunks.push((item_id, payload, text.to_string()));
+            chunks.push(LoadedChunk {
+                id,
+                payload,
+                text: text.to_string(),
+            });
         }
 
         Ok(chunks)
     }
 
-    async fn ensure_initialized(&self) -> Result<&[CachedChunk], SearchError> {
-        self.cached_chunks
-            .get_or_try_init(|| async {
-                let raw_chunks = self.load_document_chunks().await?;
-                Ok::<Vec<CachedChunk>, SearchError>(
-                    raw_chunks
-                        .into_iter()
-                        .filter_map(|(id, payload, text)| {
-                            let tokens = self.tokenize(&text);
-                            if tokens.is_empty() {
-                                None
-                            } else {
-                                Some(CachedChunk {
-                                    id,
-                                    payload,
-                                    tokens,
-                                })
-                            }
-                        })
-                        .collect(),
-                )
-            })
-            .await
-            .map(|v: &Vec<CachedChunk>| v.as_slice())
+    /// Load the chunks and the tokenized corpus over them.
+    ///
+    /// The chunks are read on every search: Python builds a fresh retriever
+    /// per search (`get_search_type_retriever_instance.py`), while this one
+    /// lives as long as its orchestrator — a binding handle's lifetime — and
+    /// the graph exposes no change signal, so a cached chunk list would keep
+    /// serving the chunks from before a later `add` + `cognify`. The expensive
+    /// part — tokenizing and the BM25 statistics — is cached and reused while
+    /// the chunk list's fingerprint is unchanged.
+    ///
+    /// No usable chunk is Python's `NoDataError` (`lexical_retriever.py:90-92`).
+    #[allow(clippy::unwrap_used, reason = "lock poison is unrecoverable")]
+    async fn load_corpus(&self) -> Result<(Vec<LoadedChunk>, Arc<Corpus>), SearchError> {
+        let chunks = self.load_document_chunks().await?;
+        let key = fingerprint(&chunks);
+
+        let cached = self
+            .corpus_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(cached_key, _)| *cached_key == key)
+            .map(|(_, corpus)| Arc::clone(corpus));
+        let corpus = match cached {
+            Some(corpus) => corpus,
+            None => {
+                let (kept, tokens): (Vec<usize>, Vec<Vec<String>>) = chunks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, chunk)| {
+                        let tokens = self.tokenize(&chunk.text);
+                        (!tokens.is_empty()).then_some((index, tokens))
+                    })
+                    .unzip();
+                let corpus = Arc::new(Corpus::new(
+                    kept,
+                    tokens,
+                    matches!(self.scorer, LexicalScorer::Bm25 { .. }),
+                ));
+                *self.corpus_cache.lock().unwrap() = Some((key, Arc::clone(&corpus)));
+                corpus
+            }
+        };
+
+        if corpus.kept.is_empty() {
+            return Err(SearchError::NotFound(
+                "No valid chunks loaded during initialization.".to_string(),
+            ));
+        }
+        Ok((chunks, corpus))
+    }
+}
+
+fn lowercase_set(words: Vec<String>) -> HashSet<String> {
+    words.into_iter().map(|word| word.to_lowercase()).collect()
+}
+
+/// Set or multiset Jaccard (`jaccard_retrival.py:_scorer`).
+fn jaccard(query_tokens: &[String], chunk_tokens: &[String], multiset: bool) -> f32 {
+    if query_tokens.is_empty() || chunk_tokens.is_empty() {
+        return 0.0;
+    }
+
+    if multiset {
+        let mut query_counts = HashMap::new();
+        for token in query_tokens {
+            *query_counts.entry(token).or_insert(0usize) += 1;
+        }
+
+        let mut chunk_counts = HashMap::new();
+        for token in chunk_tokens {
+            *chunk_counts.entry(token).or_insert(0usize) += 1;
+        }
+
+        let universe: HashSet<&String> = query_counts
+            .keys()
+            .chain(chunk_counts.keys())
+            .copied()
+            .collect();
+
+        let (numerator, denominator) =
+            universe.iter().fold((0usize, 0usize), |(num, den), token| {
+                let q = query_counts.get(*token).copied().unwrap_or_default();
+                let c = chunk_counts.get(*token).copied().unwrap_or_default();
+                (num + q.min(c), den + q.max(c))
+            });
+
+        if denominator == 0 {
+            0.0
+        } else {
+            numerator as f32 / denominator as f32
+        }
+    } else {
+        let query_set: HashSet<&String> = query_tokens.iter().collect();
+        let chunk_set: HashSet<&String> = chunk_tokens.iter().collect();
+        let intersection_size = query_set.intersection(&chunk_set).count();
+        let union_size = query_set.union(&chunk_set).count();
+
+        if union_size == 0 {
+            0.0
+        } else {
+            intersection_size as f32 / union_size as f32
+        }
     }
 }
 
@@ -212,38 +390,37 @@ impl SearchRetriever for LexicalRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        if self.graph_db.is_empty().await? {
-            return Ok(vec![]);
-        }
+        let (chunks, corpus) = self.load_corpus().await?;
 
         let query_tokens = self.tokenize(query);
         if query_tokens.is_empty() {
             return Ok(vec![]);
         }
 
-        let cached = self.ensure_initialized().await?;
-        if cached.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut items_with_score = cached
+        let mut items_with_score = corpus
+            .kept
             .iter()
-            .map(|chunk| {
-                let score = self.score(&query_tokens, &chunk.tokens);
+            .zip(&corpus.tokens)
+            .map(|(&index, tokens)| {
+                let chunk = &chunks[index];
                 SearchItem {
                     id: chunk.id,
-                    score: Some(score),
+                    score: Some(self.score(&corpus, &query_tokens, tokens)),
                     payload: chunk.payload.clone(),
                 }
             })
             .collect::<Vec<_>>();
 
+        // Descending score. Python's `heapq.nlargest` keeps ties in the order
+        // the graph engine returned the chunks, which no backend guarantees;
+        // ties break on the chunk id instead, so the top-k is the same on every
+        // run and every backend.
         items_with_score.sort_by(|left, right| {
             right
                 .score
                 .unwrap_or_default()
-                .partial_cmp(&left.score.unwrap_or_default())
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&left.score.unwrap_or_default())
+                .then_with(|| left.id.cmp(&right.id))
         });
         items_with_score.truncate(params.top_k_or(self.top_k));
 
@@ -288,7 +465,7 @@ mod tests {
     use cognee_session::SessionContext;
 
     use crate::retrievers::{LexicalRetriever, SearchRetriever};
-    use crate::types::{SearchOutput, SearchParams};
+    use crate::types::{SearchError, SearchOutput, SearchParams};
 
     #[derive(Serialize)]
     struct DocumentChunkNode {
@@ -417,26 +594,164 @@ mod tests {
         assert_eq!(retriever.tokenize("Hello World"), vec!["hello", "world"]);
     }
 
+    /// Chunks cognified after the first search must be searchable: the
+    /// corpus is loaded per search, as Python builds a retriever per search.
     #[tokio::test]
-    async fn cache_is_populated_after_first_get_context_call() {
+    async fn sees_chunks_added_after_the_first_search() {
         let mock_graph_db = Arc::new(MockGraphDB::new());
-        add_chunk(&mock_graph_db, "cached chunk example text").await;
-        let graph_db: Arc<dyn GraphDBTrait> = mock_graph_db;
+        add_chunk(&mock_graph_db, "first chunk about rust").await;
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::clone(&mock_graph_db) as _;
+        let retriever = LexicalRetriever::bm25(graph_db, Some(5), false, None);
 
-        let retriever = LexicalRetriever::new(Arc::clone(&graph_db), Some(5), true, None, false);
-
-        // Cache should be empty before the first call
-        assert!(retriever.cached_chunks.get().is_none());
-
-        let _ = retriever
-            .get_context("cached chunk", &SearchParams::default())
+        let before = retriever
+            .get_context("ownership", &SearchParams::default())
             .await
             .unwrap();
+        assert_eq!(before.len(), 1);
 
-        // Cache should be populated after the first call
-        assert!(retriever.cached_chunks.get().is_some());
-        let cached = retriever.cached_chunks.get().unwrap();
-        assert_eq!(cached.len(), 1);
+        add_chunk(&mock_graph_db, "second chunk about ownership").await;
+        let after = retriever
+            .get_context("ownership", &SearchParams::default())
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].payload["text"], "second chunk about ownership");
+    }
+
+    /// No chunk to search is Python's `NoDataError` (`lexical_retriever.py:
+    /// 90-92`), not an empty result.
+    #[tokio::test]
+    async fn no_chunks_is_not_found() {
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+        let retriever = LexicalRetriever::bm25(graph_db, None, false, None);
+        let err = retriever
+            .get_context("anything", &SearchParams::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SearchError::NotFound(_)), "got {err:?}");
+    }
+
+    async fn bm25_scores(
+        chunks: &[&str],
+        query: &str,
+        stop_words: Option<Vec<String>>,
+    ) -> Vec<(String, f32)> {
+        let mock_graph_db = Arc::new(MockGraphDB::new());
+        for chunk in chunks {
+            add_chunk(&mock_graph_db, chunk).await;
+        }
+        let retriever = LexicalRetriever::bm25(mock_graph_db, Some(chunks.len()), true, stop_words);
+        retriever
+            .get_context(query, &SearchParams::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|item| {
+                (
+                    item.payload["text"].as_str().unwrap().to_string(),
+                    item.score.unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Golden values from Python's `BM25ChunksRetriever._scorer` on the same
+    /// corpus (k1 = 1.5, b = 0.75, stop words disabled).
+    #[tokio::test]
+    async fn bm25_matches_python_scores() {
+        let ranked = bm25_scores(
+            &[
+                "rust memory safety ownership",
+                "python async search orchestration",
+                "ownership ownership ownership model rust",
+                "rust compiler",
+            ],
+            "ownership safety",
+            Some(vec![]),
+        )
+        .await;
+
+        assert_eq!(ranked[0].0, "rust memory safety ownership");
+        assert!((ranked[0].1 - 1.841_864_1).abs() < 1e-5, "{ranked:?}");
+        assert_eq!(ranked[1].0, "ownership ownership ownership model rust");
+        assert!((ranked[1].1 - 1.066_380_3).abs() < 1e-5, "{ranked:?}");
+        assert_eq!(ranked[2].1, 0.0);
+        assert_eq!(ranked[3].1, 0.0);
+    }
+
+    /// IDF: a match on a rare term outranks a match on a common one.
+    #[tokio::test]
+    async fn rare_term_outranks_common_term() {
+        let ranked = bm25_scores(
+            &[
+                "common rare",
+                "common filler",
+                "common other",
+                "common more",
+            ],
+            "common rare",
+            None,
+        )
+        .await;
+        assert_eq!(ranked[0].0, "common rare");
+        assert!(ranked[0].1 > ranked[1].1);
+    }
+
+    /// Length normalization: the same single match scores higher in a short
+    /// chunk than in a long one.
+    #[tokio::test]
+    async fn shorter_chunk_wins_on_equal_term_frequency() {
+        let ranked = bm25_scores(
+            &[
+                "target word padded with many other unrelated filler tokens here",
+                "target word",
+                "nothing relevant",
+            ],
+            "target",
+            None,
+        )
+        .await;
+        assert_eq!(ranked[0].0, "target word");
+        assert!(ranked[0].1 > ranked[1].1);
+    }
+
+    /// k1 saturation: repeating a term helps, but with diminishing returns —
+    /// unlike multiset Jaccard, which is linear in the count.
+    #[tokio::test]
+    async fn term_frequency_saturates() {
+        let ranked = bm25_scores(
+            &[
+                "apple x x x",
+                "apple apple x x",
+                "apple apple apple apple",
+                "pear x x x",
+            ],
+            "apple",
+            Some(vec![]),
+        )
+        .await;
+        let score = |text: &str| ranked.iter().find(|(t, _)| t == text).unwrap().1;
+        let (one, two, four) = (
+            score("apple x x x"),
+            score("apple apple x x"),
+            score("apple apple apple apple"),
+        );
+        assert!(one < two && two < four);
+        assert!(
+            two - one > (four - two) / 2.0,
+            "gain per repeat must shrink"
+        );
+    }
+
+    /// BM25 defaults to the English stop words, so a query made only of them
+    /// matches nothing.
+    #[tokio::test]
+    async fn bm25_filters_default_stop_words() {
+        let ranked = bm25_scores(&["the cat", "a dog"], "the a", None).await;
+        assert!(
+            ranked.is_empty(),
+            "stop-word-only query has no tokens: {ranked:?}"
+        );
     }
 
     #[tokio::test]
@@ -464,5 +779,53 @@ mod tests {
             }
             _ => panic!("expected items output"),
         }
+    }
+
+    /// Golden tokens from Python's `re.findall(r"\w+", text.lower())`:
+    /// Devanagari vowel signs split words (they are not `\w`), a word-final
+    /// `Σ` lowercases to `ς`, and number characters are word characters.
+    #[test]
+    fn tokenize_matches_python_word_characters() {
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::new(MockGraphDB::new());
+        let retriever = LexicalRetriever::new(graph_db, None, false, None, false);
+
+        assert_eq!(
+            retriever.tokenize("किताब ΟΔΟΣ ab_c Ⅻ ½"),
+            vec!["क", "त", "ब", "οδος", "ab_c", "ⅻ", "½"]
+        );
+    }
+
+    /// The tokenized corpus is reused while the chunks are unchanged, and
+    /// rebuilt as soon as one is added.
+    #[tokio::test]
+    async fn corpus_is_reused_until_the_chunks_change() {
+        let mock_graph_db = Arc::new(MockGraphDB::new());
+        add_chunk(&mock_graph_db, "rust ownership").await;
+        let graph_db: Arc<dyn GraphDBTrait> = Arc::clone(&mock_graph_db) as _;
+        let retriever = LexicalRetriever::bm25(graph_db, Some(5), false, None);
+
+        let (_, first) = retriever.load_corpus().await.unwrap();
+        let (_, second) = retriever.load_corpus().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged chunks reuse the corpus"
+        );
+
+        add_chunk(&mock_graph_db, "python async").await;
+        let (_, third) = retriever.load_corpus().await.unwrap();
+        assert!(!Arc::ptr_eq(&second, &third), "a new chunk rebuilds it");
+        assert_eq!(third.tokens.len(), 2);
+    }
+
+    /// Jaccard never reads the BM25 statistics, so they are not built for it.
+    #[tokio::test]
+    async fn jaccard_builds_no_bm25_statistics() {
+        let mock_graph_db = Arc::new(MockGraphDB::new());
+        add_chunk(&mock_graph_db, "rust ownership").await;
+        let graph_db: Arc<dyn GraphDBTrait> = mock_graph_db;
+        let retriever = LexicalRetriever::new(graph_db, Some(5), false, None, false);
+
+        let (_, corpus) = retriever.load_corpus().await.unwrap();
+        assert!(corpus.idf.is_empty());
     }
 }

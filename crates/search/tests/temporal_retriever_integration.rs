@@ -548,10 +548,21 @@ async fn temporal_retriever_completion_fallback() {
     );
 
     let session = SessionContext::default();
+    let context = match retriever
+        .get_context("Who works at Figma?", &SearchParams::default())
+        .await
+    {
+        Ok(context) => context,
+        Err(e) => {
+            eprintln!("Skipping: get_context failed: {e}");
+            return;
+        }
+    };
+    let context_is_empty = context.is_empty();
     let output = match retriever
         .get_completion(
             "Who works at Figma?",
-            None,
+            Some(context),
             &session,
             &SearchParams::default(),
         )
@@ -567,10 +578,20 @@ async fn temporal_retriever_completion_fallback() {
     let text = output_text(&output);
     println!("temporal_retriever_completion_fallback output: {text}");
 
-    assert!(
-        !text.is_empty(),
-        "Completion output should be non-empty even for non-temporal fallback"
-    );
+    if context_is_empty {
+        // No triplet matched (this fixture indexes no vectors): Python's
+        // `skip_completion_on_empty_context` — no answer instead of a
+        // "no context provided" deflection (SDK-270).
+        assert!(
+            matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()),
+            "an empty fallback context must skip the completion, got {output:?}"
+        );
+    } else {
+        assert!(
+            !text.is_empty(),
+            "Completion output should be non-empty for a non-empty fallback context"
+        );
+    }
 
     println!("temporal_retriever_completion_fallback PASSED");
 }

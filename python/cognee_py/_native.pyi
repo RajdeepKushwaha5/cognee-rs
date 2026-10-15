@@ -717,7 +717,8 @@ class Cognee:
         ``search_type`` / ``searchType``, ``datasets``, ``dataset_ids`` /
         ``datasetIds``, ``top_k`` / ``topK``, ``system_prompt`` /
         ``systemPrompt``, ``session_id`` / ``sessionId``, ``node_type`` /
-        ``nodeType``, ``node_name`` / ``nodeName``, ``only_context`` /
+        ``nodeType``, ``node_name`` / ``nodeName``, ``node_name_filter_operator``
+        / ``nodeNameFilterOperator``, ``only_context`` /
         ``onlyContext``, ``use_combined_context`` / ``useCombinedContext``,
         ``verbose``, ``save_interaction`` / ``saveInteraction``,
         ``auto_feedback_detection`` / ``autoFeedbackDetection``.

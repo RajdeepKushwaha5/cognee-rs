@@ -48,7 +48,10 @@ use crate::sdk_ops::parse_c_str_or_fire;
 ///   "sessionId"              — string
 ///   "nodeType"               — string
 ///   "nodeName"               — string array
-///   "onlyContext"            — boolean
+///   "nodeNameFilterOperator" — "OR" (default) or "AND"
+///   "onlyContext"            — boolean; skip the LLM and return what it would
+///                              have received ("user_prompt"/"system_prompt"),
+///                              or the bare context for non-completion types
 ///   "useCombinedContext"     — boolean
 ///   "verbose"                — boolean
 ///   "saveInteraction"        — boolean (default true)

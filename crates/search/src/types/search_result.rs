@@ -68,6 +68,35 @@ pub struct SearchResponse {
     pub only_context: bool,
     pub use_combined_context: bool,
     pub verbose: bool,
+    /// The user message an `only_context` search stands in for: the question
+    /// and the retrieved context rendered through the retriever's template.
+    /// Also the `result` (as `Text`) when set. `None` unless `only_context`
+    /// is on, the retriever sends one templated prompt, and retrieval found
+    /// something — Python's `SearchResultPayload.user_prompt`.
+    #[serde(default)]
+    pub user_prompt: Option<String>,
+    /// The system message that goes with [`user_prompt`](Self::user_prompt);
+    /// set and unset with it. Carries the session history when a session is
+    /// active, since that is where the Rust completion sends it.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// For an `only_context` search over several datasets without
+    /// `use_combined_context`: the prompt built from each dataset's own
+    /// context, keyed by dataset id like [`context`](Self::context). Python
+    /// builds one prompt per dataset in its fan-out. A dataset whose context
+    /// is empty, or whose retriever sends no single prompt, has no entry.
+    /// [`user_prompt`](Self::user_prompt) stays the first dataset's — the one
+    /// the completion answers from.
+    #[serde(default)]
+    pub prompts: Option<HashMap<String, SearchPrompt>>,
+}
+
+/// The two messages a completion sends, as an `only_context` search returns
+/// them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchPrompt {
+    pub user_prompt: String,
+    pub system_prompt: String,
 }
 
 impl SearchResponse {
@@ -82,6 +111,9 @@ impl SearchResponse {
             only_context: false,
             use_combined_context: false,
             verbose: false,
+            user_prompt: None,
+            system_prompt: None,
+            prompts: None,
         }
     }
 }

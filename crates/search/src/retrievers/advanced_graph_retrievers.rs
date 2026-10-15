@@ -6,24 +6,17 @@ use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
 use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
-use serde_json::json;
 
 use cognee_session::SessionContext;
 
-use crate::graph_retrieval::{
-    DEFAULT_TRIPLET_DISTANCE_PENALTY, GraphRetrievalConfig, brute_force_triplet_search,
-};
 use crate::retrievers::SearchRetriever;
-use crate::types::{
-    SearchContext, SearchError, SearchItem, SearchOutput, SearchParams, SearchType,
-};
+use crate::retrievers::graph_core::{GraphPrompts, GraphRetrieverCore, complete};
+use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
 use crate::utils::{
     DEFAULT_RAG_SYSTEM_PROMPT, build_messages_with_history, render_edges_context,
-    render_graph_user_prompt, resolve_system_prompt,
+    render_graph_user_prompt, resolve_system_prompt, skip_completion_on_empty_context,
 };
 
-const DEFAULT_TOP_K: usize = 10;
-const DEFAULT_WIDE_SEARCH_TOP_K: usize = 100;
 const DEFAULT_CONTEXT_EXTENSION_ROUNDS: usize = 4;
 const DEFAULT_COT_MAX_ITER: usize = 4;
 
@@ -35,94 +28,6 @@ const DEFAULT_COT_VALIDATION_USER_PROMPT: &str = "<QUESTION>\n`{question}`\n</QU
 
 const DEFAULT_COT_FOLLOW_UP_SYSTEM_PROMPT: &str = "You are a helpful assistant whose job is to ask exactly one clarifying follow-up question,\nto collect the missing piece of information needed to fully answer the user's original query.\nRespond with the question only (no extra text, no punctuation beyond what's needed).";
 const DEFAULT_COT_FOLLOW_UP_USER_PROMPT: &str = "Based on the following, ask exactly one question that would directly resolve the gap identified in the validation reasoning and allow a valid answer.\nThink in a way that with the followup question you are exploring a knowledge graph which contains entities, entity types and document chunks\n\n<QUERY>\n`{question}`\n</QUERY>\n\n<ANSWER>\n`{answer}`\n</ANSWER>\n\n<REASONING>\n`{validation}`\n</REASONING>";
-
-struct GraphRetrieverCore {
-    vector_db: Arc<dyn VectorDB>,
-    embedding_engine: Arc<dyn EmbeddingEngine>,
-    graph_db: Arc<dyn GraphDBTrait>,
-    top_k: usize,
-    wide_search_top_k: usize,
-    triplet_distance_penalty: f32,
-    feedback_influence: f32,
-    neighbor_cap: Option<usize>,
-}
-
-impl GraphRetrieverCore {
-    fn new(
-        vector_db: Arc<dyn VectorDB>,
-        embedding_engine: Arc<dyn EmbeddingEngine>,
-        graph_db: Arc<dyn GraphDBTrait>,
-        top_k: Option<usize>,
-        wide_search_top_k: Option<usize>,
-        triplet_distance_penalty: Option<f32>,
-    ) -> Self {
-        Self {
-            vector_db,
-            embedding_engine,
-            graph_db,
-            top_k: top_k.unwrap_or(DEFAULT_TOP_K),
-            wide_search_top_k: wide_search_top_k.unwrap_or(DEFAULT_WIDE_SEARCH_TOP_K),
-            triplet_distance_penalty: triplet_distance_penalty
-                .unwrap_or(DEFAULT_TRIPLET_DISTANCE_PENALTY),
-            feedback_influence: 0.0,
-            neighbor_cap: None,
-        }
-    }
-
-    async fn get_context(
-        &self,
-        query: &str,
-        params: &SearchParams,
-    ) -> Result<SearchContext, SearchError> {
-        if self.graph_db.is_empty().await? {
-            return Ok(vec![]);
-        }
-
-        let config = GraphRetrievalConfig {
-            top_k: params.top_k_or(self.top_k),
-            wide_search_top_k: params.wide_search_top_k_or(self.wide_search_top_k),
-            triplet_distance_penalty: params
-                .triplet_distance_penalty_or(self.triplet_distance_penalty),
-            feedback_influence: params.feedback_influence_or(self.feedback_influence),
-            neighbor_cap: self.neighbor_cap,
-            node_type: params.node_type.clone(),
-            node_name: params.node_name.clone(),
-            node_name_filter_operator: params
-                .node_name_filter_operator
-                .as_deref()
-                .unwrap_or("OR")
-                .to_string(),
-        };
-
-        let ranked_edges = brute_force_triplet_search(
-            query,
-            self.vector_db.as_ref(),
-            self.embedding_engine.as_ref(),
-            self.graph_db.as_ref(),
-            &config,
-        )
-        .await?;
-
-        Ok(ranked_edges
-            .into_iter()
-            .map(|edge| SearchItem {
-                id: None,
-                score: Some(edge.score),
-                payload: json!({
-                    "source_id": edge.source_id,
-                    "target_id": edge.target_id,
-                    "relationship": edge.relationship_name,
-                    "source_name": edge.source_name,
-                    "target_name": edge.target_name,
-                    "source_text": edge.source_text,
-                    "target_text": edge.target_text,
-                    "source_description": edge.source_description,
-                    "target_description": edge.target_description,
-                }),
-            })
-            .collect())
-    }
-}
 
 fn merge_dedup_context(left: &SearchContext, right: &SearchContext) -> SearchContext {
     let mut seen = HashSet::new();
@@ -145,9 +50,7 @@ fn merge_dedup_context(left: &SearchContext, right: &SearchContext) -> SearchCon
 pub struct GraphSummaryCompletionRetriever {
     core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
 }
 
@@ -184,11 +87,48 @@ impl GraphSummaryCompletionRetriever {
                 triplet_distance_penalty,
             ),
             llm,
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
+    }
+
+    /// The answer messages over `context`: the rendered triplets are first
+    /// summarized by the LLM (Python's `get_context_from_objects`), then sent
+    /// through the graph prompt. `None` on an empty context, before any LLM
+    /// call.
+    async fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let graph_context_text = render_edges_context(context);
+        if graph_context_text.is_empty() {
+            return Ok(None);
+        }
+
+        let summary_prompt =
+            DEFAULT_GRAPH_SUMMARY_USER_PROMPT.replace("{context}", &graph_context_text);
+        let summarized_context = self
+            .llm
+            .generate(
+                vec![
+                    Message::system(DEFAULT_GRAPH_SUMMARY_SYSTEM_PROMPT),
+                    Message::user(summary_prompt),
+                ],
+                self.generation_options.clone(),
+            )
+            .await?
+            .content;
+
+        self.prompts
+            .messages(query, &summarized_context, session, params)
+            .map(Some)
     }
 }
 
@@ -206,12 +146,27 @@ impl SearchRetriever for GraphSummaryCompletionRetriever {
         }
     }
 
+    /// Python's `GraphSummaryCompletionRetriever` inherits
+    /// `GraphCompletionRetriever.get_retrieved_objects`, so an empty graph is
+    /// `NotFound` here too.
     async fn get_context(
         &self,
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        self.core.get_context(query, params).await
+        self.core.ensure_graph_not_empty().await?;
+        self.core.search(query, params).await
+    }
+
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
+            .await
     }
 
     async fn get_completion(
@@ -226,59 +181,19 @@ impl SearchRetriever for GraphSummaryCompletionRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let graph_context_text = render_edges_context(&completion_context);
-        let summary_prompt =
-            DEFAULT_GRAPH_SUMMARY_USER_PROMPT.replace("{context}", &graph_context_text);
-
-        let summarized_context = self
-            .llm
-            .generate(
-                vec![
-                    Message::system(DEFAULT_GRAPH_SUMMARY_SYSTEM_PROMPT),
-                    Message::user(summary_prompt),
-                ],
-                self.generation_options.clone(),
-            )
+        let Some(messages) = self
+            .build_completion_messages(query, &completion_context, session, params)
             .await?
-            .content;
-
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &summarized_context,
-        );
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
-
-        if let Some(schema) = &params.response_schema {
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    messages,
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
-        } else {
-            let completion = self
-                .llm
-                .generate(messages, self.generation_options.clone())
-                .await?;
-            Ok(SearchOutput::Text(completion.content))
-        }
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
+        complete(
+            self.llm.as_ref(),
+            messages,
+            params,
+            self.generation_options.clone(),
+        )
+        .await
     }
 }
 
@@ -286,9 +201,7 @@ pub struct GraphCompletionContextExtensionRetriever {
     core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
     context_extension_rounds: usize,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
 }
 
@@ -328,67 +241,32 @@ impl GraphCompletionContextExtensionRetriever {
             llm,
             context_extension_rounds: context_extension_rounds
                 .unwrap_or(DEFAULT_CONTEXT_EXTENSION_ROUNDS),
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
     }
-}
 
-#[async_trait]
-impl SearchRetriever for GraphCompletionContextExtensionRetriever {
-    fn search_type(&self) -> SearchType {
-        SearchType::GraphCompletionContextExtension
-    }
-
-    #[cfg(test)]
-    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
-        crate::retrievers::AppliedTuning {
-            neighbor_cap: Some(self.core.neighbor_cap),
-            ..Default::default()
-        }
-    }
-
-    async fn get_context(
+    /// Grow `context` round by round: answer over the current context, search
+    /// with the answer, merge, and stop when a round adds nothing (Python's
+    /// `_run_extension_round`).
+    async fn extend_context(
         &self,
         query: &str,
+        mut extended_context: SearchContext,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        self.core.get_context(query, params).await
-    }
-
-    async fn get_completion(
-        &self,
-        query: &str,
-        context: Option<SearchContext>,
-        session: &SessionContext,
-        params: &SearchParams,
-    ) -> Result<SearchOutput, SearchError> {
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
         let rounds = params
             .context_extension_rounds
             .unwrap_or(self.context_extension_rounds);
 
-        let mut extended_context = match context {
-            Some(existing_context) => existing_context,
-            None => self.get_context(query, params).await?,
-        };
-
         for _ in 0..rounds {
             let current_context_text = render_edges_context(&extended_context);
             let extension_prompt = render_graph_user_prompt(
-                self.user_prompt_template.as_deref(),
+                self.prompts.user_prompt_template.as_deref(),
                 query,
                 &current_context_text,
             );
@@ -420,33 +298,97 @@ impl SearchRetriever for GraphCompletionContextExtensionRetriever {
 
             extended_context = merged_context;
         }
+        Ok(extended_context)
+    }
 
-        let user_prompt = render_graph_user_prompt(
-            self.user_prompt_template.as_deref(),
-            query,
-            &render_edges_context(&extended_context),
-        );
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
-
-        if let Some(schema) = &params.response_schema {
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    messages,
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
-        } else {
-            let completion = self
-                .llm
-                .generate(messages, self.generation_options.clone())
-                .await?;
-            Ok(SearchOutput::Text(completion.content))
+    /// The answer messages over the extended `context`, or `None` when the
+    /// initial context is empty — no extension round runs over nothing.
+    async fn build_completion_messages(
+        &self,
+        query: &str,
+        context: SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        if render_edges_context(&context).is_empty() {
+            return Ok(None);
         }
+        let extended_context = self.extend_context(query, context, params).await?;
+        self.prompts
+            .messages(
+                query,
+                &render_edges_context(&extended_context),
+                session,
+                params,
+            )
+            .map(Some)
+    }
+}
+
+#[async_trait]
+impl SearchRetriever for GraphCompletionContextExtensionRetriever {
+    fn search_type(&self) -> SearchType {
+        SearchType::GraphCompletionContextExtension
+    }
+
+    #[cfg(test)]
+    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
+        crate::retrievers::AppliedTuning {
+            neighbor_cap: Some(self.core.neighbor_cap),
+            ..Default::default()
+        }
+    }
+
+    /// Python's context-extension retriever overrides
+    /// `get_retrieved_objects` without the empty-graph check, so an empty
+    /// graph is an empty context here, not `NotFound`.
+    async fn get_context(
+        &self,
+        query: &str,
+        params: &SearchParams,
+    ) -> Result<SearchContext, SearchError> {
+        self.core.search(query, params).await
+    }
+
+    /// The final prompt over the extended context. The extension rounds call
+    /// the LLM, as they do under Python's `only_context` — they are retrieval,
+    /// not the answer.
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context.clone(), session, params)
+            .await
+    }
+
+    async fn get_completion(
+        &self,
+        query: &str,
+        context: Option<SearchContext>,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<SearchOutput, SearchError> {
+        let initial_context = match context {
+            Some(existing_context) => existing_context,
+            None => self.get_context(query, params).await?,
+        };
+
+        let Some(messages) = self
+            .build_completion_messages(query, initial_context, session, params)
+            .await?
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
+        complete(
+            self.llm.as_ref(),
+            messages,
+            params,
+            self.generation_options.clone(),
+        )
+        .await
     }
 }
 
@@ -454,10 +396,15 @@ pub struct GraphCompletionCotRetriever {
     core: GraphRetrieverCore,
     llm: Arc<dyn Llm>,
     max_iter: usize,
-    system_prompt: Option<String>,
-    system_prompt_path: Option<String>,
-    user_prompt_template: Option<String>,
+    prompts: GraphPrompts,
     generation_options: Option<GenerationOptions>,
+}
+
+/// Where a chain-of-thought run ended: the last answer and the context it
+/// was reasoned over.
+struct CotOutcome {
+    answer: Option<String>,
+    context: SearchContext,
 }
 
 impl GraphCompletionCotRetriever {
@@ -495,77 +442,64 @@ impl GraphCompletionCotRetriever {
             ),
             llm,
             max_iter: max_iter.unwrap_or(DEFAULT_COT_MAX_ITER),
-            system_prompt,
-            system_prompt_path,
-            user_prompt_template,
+            prompts: GraphPrompts {
+                system_prompt,
+                system_prompt_path,
+                user_prompt_template,
+            },
             generation_options,
         }
     }
-}
 
-#[async_trait]
-impl SearchRetriever for GraphCompletionCotRetriever {
-    fn search_type(&self) -> SearchType {
-        SearchType::GraphCompletionCot
-    }
-
-    #[cfg(test)]
-    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
-        crate::retrievers::AppliedTuning {
-            neighbor_cap: Some(self.core.neighbor_cap),
-            ..Default::default()
-        }
-    }
-
-    async fn get_context(
+    /// Answer, validate, ask a follow-up, widen the context, answer again —
+    /// `max_iter` times or until no follow-up comes back.
+    ///
+    /// With `final_answer = false` (the `only_context` preview) the answer
+    /// after the last widening is not generated: nothing reads it, and
+    /// Python's preview stops there too (`skip_final_completion=True`).
+    async fn reason(
         &self,
         query: &str,
-        params: &SearchParams,
-    ) -> Result<SearchContext, SearchError> {
-        self.core.get_context(query, params).await
-    }
-
-    async fn get_completion(
-        &self,
-        query: &str,
-        context: Option<SearchContext>,
+        mut current_context: SearchContext,
         session: &SessionContext,
         params: &SearchParams,
-    ) -> Result<SearchOutput, SearchError> {
-        let mut current_context = match context {
-            Some(existing_context) => existing_context,
-            None => self.get_context(query, params).await?,
-        };
-
+        final_answer: bool,
+    ) -> Result<CotOutcome, SearchError> {
         let system_prompt = resolve_system_prompt(
             params
                 .system_prompt
                 .as_deref()
-                .or(self.system_prompt.as_deref()),
+                .or(self.prompts.system_prompt.as_deref()),
             params
                 .system_prompt_path
                 .as_deref()
-                .or(self.system_prompt_path.as_deref()),
+                .or(self.prompts.system_prompt_path.as_deref()),
         )?;
-
         let max_iter = params.max_iter.unwrap_or(self.max_iter);
+        let answer_over = |context: &SearchContext| {
+            render_graph_user_prompt(
+                self.prompts.user_prompt_template.as_deref(),
+                query,
+                &render_edges_context(context),
+            )
+        };
 
         // Step 1: Generate INITIAL completion (before any reasoning rounds)
-        let context_text = render_edges_context(&current_context);
-        let answer_prompt =
-            render_graph_user_prompt(self.user_prompt_template.as_deref(), query, &context_text);
-
         let mut current_answer = self
             .llm
             .generate(
-                build_messages_with_history(system_prompt.clone(), answer_prompt, session),
+                build_messages_with_history(
+                    system_prompt.clone(),
+                    answer_over(&current_context),
+                    session,
+                ),
                 self.generation_options.clone(),
             )
             .await?
             .content;
 
         // Step 2: Run max_iter REASONING rounds
-        for _ in 0..max_iter {
+        for iteration in 0..max_iter {
             // 2a. Validate the current answer against the context
             let validation_prompt = DEFAULT_COT_VALIDATION_USER_PROMPT
                 .replace("{question}", query)
@@ -612,20 +546,20 @@ impl SearchRetriever for GraphCompletionCotRetriever {
             let additional_context = self.get_context(&follow_up_query, params).await?;
             current_context = merge_dedup_context(&current_context, &additional_context);
 
-            // 2d. Regenerate completion with the enriched context
-            let enriched_context_text = render_edges_context(&current_context);
-            let regeneration_prompt = render_graph_user_prompt(
-                self.user_prompt_template.as_deref(),
-                query,
-                &enriched_context_text,
-            );
+            if !final_answer && iteration + 1 == max_iter {
+                return Ok(CotOutcome {
+                    answer: None,
+                    context: current_context,
+                });
+            }
 
+            // 2d. Regenerate completion with the enriched context
             current_answer = self
                 .llm
                 .generate(
                     build_messages_with_history(
                         system_prompt.clone(),
-                        regeneration_prompt,
+                        answer_over(&current_context),
                         session,
                     ),
                     self.generation_options.clone(),
@@ -634,28 +568,101 @@ impl SearchRetriever for GraphCompletionCotRetriever {
                 .content;
         }
 
-        if let Some(schema) = &params.response_schema {
-            // CoT builds answer iteratively as plain text; structured output
-            // is applied only to the final answer by re-running the last
-            // completion as a structured call.
-            let final_context_text = render_edges_context(&current_context);
-            let final_prompt = render_graph_user_prompt(
-                self.user_prompt_template.as_deref(),
+        Ok(CotOutcome {
+            answer: Some(current_answer),
+            context: current_context,
+        })
+    }
+}
+
+#[async_trait]
+impl SearchRetriever for GraphCompletionCotRetriever {
+    fn search_type(&self) -> SearchType {
+        SearchType::GraphCompletionCot
+    }
+
+    #[cfg(test)]
+    fn applied_tuning(&self) -> crate::retrievers::AppliedTuning {
+        crate::retrievers::AppliedTuning {
+            neighbor_cap: Some(self.core.neighbor_cap),
+            ..Default::default()
+        }
+    }
+
+    /// Python's chain-of-thought retriever overrides `get_retrieved_objects`
+    /// without the empty-graph check, so an empty graph is an empty context
+    /// here, not `NotFound`.
+    async fn get_context(
+        &self,
+        query: &str,
+        params: &SearchParams,
+    ) -> Result<SearchContext, SearchError> {
+        self.core.search(query, params).await
+    }
+
+    /// The final prompt over the context the reasoning ended with. The
+    /// reasoning rounds call the LLM, as they do under Python's
+    /// `only_context`; the final answer is not generated.
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        if render_edges_context(context).is_empty() {
+            return Ok(None);
+        }
+        let outcome = self
+            .reason(query, context.clone(), session, params, false)
+            .await?;
+        self.prompts
+            .messages(
                 query,
-                &final_context_text,
-            );
-            let structured_value = self
-                .llm
-                .create_structured_output_with_messages_raw(
-                    build_messages_with_history(system_prompt, final_prompt, session),
-                    schema,
-                    self.generation_options.clone(),
-                )
-                .await
-                .map_err(|e| SearchError::LlmError(e.to_string()))?;
-            Ok(SearchOutput::Structured(structured_value))
+                &render_edges_context(&outcome.context),
+                session,
+                params,
+            )
+            .map(Some)
+    }
+
+    async fn get_completion(
+        &self,
+        query: &str,
+        context: Option<SearchContext>,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<SearchOutput, SearchError> {
+        let initial_context = match context {
+            Some(existing_context) => existing_context,
+            None => self.get_context(query, params).await?,
+        };
+        if render_edges_context(&initial_context).is_empty() {
+            return Ok(skip_completion_on_empty_context());
+        }
+
+        let outcome = self
+            .reason(query, initial_context, session, params, true)
+            .await?;
+
+        if params.response_schema.is_some() {
+            // CoT builds the answer as plain text; structured output is the
+            // final prompt re-run as a structured call.
+            let messages = self.prompts.messages(
+                query,
+                &render_edges_context(&outcome.context),
+                session,
+                params,
+            )?;
+            complete(
+                self.llm.as_ref(),
+                messages,
+                params,
+                self.generation_options.clone(),
+            )
+            .await
         } else {
-            Ok(SearchOutput::Text(current_answer))
+            Ok(SearchOutput::Text(outcome.answer.unwrap_or_default()))
         }
     }
 }
@@ -689,7 +696,7 @@ mod tests {
         GraphCompletionContextExtensionRetriever, GraphCompletionCotRetriever,
         GraphSummaryCompletionRetriever, SearchRetriever,
     };
-    use crate::types::{SearchOutput, SearchParams, SearchType};
+    use crate::types::{SearchError, SearchOutput, SearchParams, SearchType};
 
     struct TestEmbeddingEngine;
 
@@ -1115,5 +1122,214 @@ mod tests {
 
         // Exactly one LLM call: the initial completion (no reasoning rounds).
         assert_eq!(llm.captured_messages.lock().unwrap().len(), 1);
+    }
+
+    fn summary(graph_db: Arc<MockGraphDB>, llm: &Arc<TestLlm>) -> GraphSummaryCompletionRetriever {
+        GraphSummaryCompletionRetriever::new(
+            build_vector_db(),
+            Arc::new(TestEmbeddingEngine),
+            graph_db,
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(5),
+            Some(5),
+            Some(0.0),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn extension(
+        graph_db: Arc<MockGraphDB>,
+        llm: &Arc<TestLlm>,
+    ) -> GraphCompletionContextExtensionRetriever {
+        GraphCompletionContextExtensionRetriever::new(
+            build_vector_db(),
+            Arc::new(TestEmbeddingEngine),
+            graph_db,
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(5),
+            Some(5),
+            Some(0.0),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn cot(graph_db: Arc<MockGraphDB>, llm: &Arc<TestLlm>) -> GraphCompletionCotRetriever {
+        GraphCompletionCotRetriever::new(
+            build_vector_db(),
+            Arc::new(TestEmbeddingEngine),
+            graph_db,
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(5),
+            Some(5),
+            Some(0.0),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// GRAPH_SUMMARY_COMPLETION inherits Python's empty-graph `NoDataError`.
+    #[tokio::test]
+    async fn graph_summary_on_an_empty_graph_is_not_found() {
+        let llm = Arc::new(TestLlm::new(vec![]));
+        let retriever = summary(Arc::new(MockGraphDB::new()), &llm);
+
+        let err = retriever
+            .get_completion(
+                "q",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SearchError::NotFound(_)), "got {err:?}");
+        assert!(llm.captured_messages.lock().unwrap().is_empty());
+    }
+
+    /// CoT and context extension skip Python's empty-graph check, but an empty
+    /// context still never reaches the LLM: no reasoning or extension round
+    /// runs over nothing, and the answer is skipped.
+    #[tokio::test]
+    async fn cot_and_extension_skip_the_llm_on_an_empty_graph() {
+        let llm = Arc::new(TestLlm::new(vec![]));
+        let params = SearchParams::default();
+        let session = SessionContext::default();
+
+        let extension = extension(Arc::new(MockGraphDB::new()), &llm);
+        assert!(
+            extension
+                .get_context("q", &params)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let output = extension
+            .get_completion("q", None, &session, &params)
+            .await
+            .unwrap();
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+
+        let cot = cot(Arc::new(MockGraphDB::new()), &llm);
+        assert!(cot.get_context("q", &params).await.unwrap().is_empty());
+        let output = cot
+            .get_completion("q", None, &session, &params)
+            .await
+            .unwrap();
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+
+        assert!(
+            llm.captured_messages.lock().unwrap().is_empty(),
+            "no LLM call"
+        );
+    }
+
+    /// The summary preview runs the summarization (a context-stage LLM call,
+    /// as under Python's `only_context`) and returns exactly the messages the
+    /// completion then sends.
+    #[tokio::test]
+    async fn graph_summary_preview_matches_the_completion_prompt() {
+        let params = SearchParams::default();
+        let session = SessionContext::default();
+
+        let preview_llm = Arc::new(TestLlm::new(vec!["the summary"]));
+        let retriever = summary(build_graph_db().await, &preview_llm);
+        let context = retriever
+            .get_context("Who knows Bob?", &params)
+            .await
+            .unwrap();
+        let preview = retriever
+            .completion_messages("Who knows Bob?", &context, &session, &params)
+            .await
+            .unwrap()
+            .expect("a non-empty context builds a prompt");
+        assert_eq!(
+            preview_llm.captured_messages.lock().unwrap().len(),
+            1,
+            "summary only"
+        );
+
+        let llm = Arc::new(TestLlm::new(vec!["the summary", "answer"]));
+        summary(build_graph_db().await, &llm)
+            .get_completion("Who knows Bob?", None, &session, &params)
+            .await
+            .unwrap();
+        let sent = llm.captured_messages.lock().unwrap()[1].clone();
+        assert_eq!(sent[0].content, preview[0].content);
+        assert_eq!(sent[1].content, preview[1].content);
+        assert!(preview[1].content.contains("the summary"));
+    }
+
+    /// The CoT preview reasons as the completion does but stops before the
+    /// final answer, and its prompt is the one the final answer is built from.
+    #[tokio::test]
+    async fn graph_cot_preview_skips_the_final_answer() {
+        let llm = Arc::new(TestLlm::new(vec![
+            "first answer",
+            "needs more evidence",
+            "find graph neighbors",
+        ]));
+        let retriever = cot(build_graph_db().await, &llm);
+        let params = SearchParams::default();
+        let context = retriever
+            .get_context("Who knows Bob?", &params)
+            .await
+            .unwrap();
+
+        let preview = retriever
+            .completion_messages(
+                "Who knows Bob?",
+                &context,
+                &SessionContext::default(),
+                &params,
+            )
+            .await
+            .unwrap()
+            .expect("a non-empty context builds a prompt");
+
+        // Initial answer, validation, follow-up — no regeneration.
+        assert_eq!(llm.captured_messages.lock().unwrap().len(), 3);
+        assert!(preview[1].content.contains("Who knows Bob?"));
+        assert!(preview[1].content.contains("--[KNOWS]-->"));
+    }
+
+    /// The context-extension preview runs the extension rounds and returns
+    /// the prompt over the extended context.
+    #[tokio::test]
+    async fn graph_extension_preview_runs_the_rounds() {
+        let llm = Arc::new(TestLlm::new(vec!["Find Bob relations"]));
+        let retriever = extension(build_graph_db().await, &llm);
+        let params = SearchParams::default();
+        let context = retriever
+            .get_context("Who knows Bob?", &params)
+            .await
+            .unwrap();
+
+        let preview = retriever
+            .completion_messages(
+                "Who knows Bob?",
+                &context,
+                &SessionContext::default(),
+                &params,
+            )
+            .await
+            .unwrap()
+            .expect("a non-empty context builds a prompt");
+
+        assert_eq!(
+            llm.captured_messages.lock().unwrap().len(),
+            1,
+            "one extension round"
+        );
+        assert!(preview[1].content.contains("--[KNOWS]-->"));
     }
 }

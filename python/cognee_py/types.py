@@ -112,6 +112,7 @@ class SearchOpts(TypedDict, total=False):
     session_id: str
     node_type: str
     node_name: list[str]
+    node_name_filter_operator: str
     only_context: bool
     use_combined_context: bool
     verbose: bool

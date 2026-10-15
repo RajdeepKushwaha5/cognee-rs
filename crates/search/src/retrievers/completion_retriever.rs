@@ -2,16 +2,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cognee_embedding::EmbeddingEngine;
-use cognee_llm::{GenerationOptions, Llm};
+use cognee_llm::{GenerationOptions, Llm, Message};
 use cognee_vector::VectorDB;
 use tracing::debug;
 
 use cognee_session::SessionContext;
 
 use crate::retrievers::SearchRetriever;
-use crate::retrievers::context_items::search_results_to_context;
+use crate::retrievers::context_items::search_node_filtered;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
-use crate::utils::{build_messages_with_history, render_user_prompt, resolve_system_prompt};
+use crate::utils::{
+    build_messages_with_history, render_user_prompt, resolve_system_prompt,
+    skip_completion_on_empty_context,
+};
 
 const CHUNKS_DATA_TYPE: &str = "DocumentChunk";
 const CHUNKS_FIELD_NAME: &str = "text";
@@ -29,6 +32,53 @@ pub struct CompletionRetriever {
 }
 
 impl CompletionRetriever {
+    /// The system + user messages a completion over `context` sends, or
+    /// `None` when the rendered context is empty. Shared by `get_completion`
+    /// and the `only_context` preview.
+    fn build_completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        let context_text = context
+            .iter()
+            .filter_map(|item| item.payload.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if context_text.is_empty() {
+            return Ok(None);
+        }
+
+        let system_prompt = resolve_system_prompt(
+            params
+                .system_prompt
+                .as_deref()
+                .or(self.system_prompt.as_deref()),
+            params
+                .system_prompt_path
+                .as_deref()
+                .or(self.system_prompt_path.as_deref()),
+        )?;
+
+        let user_prompt =
+            render_user_prompt(self.user_prompt_template.as_deref(), query, &context_text);
+
+        debug!(
+            context_items = context.len(),
+            "RAG context assembled:\n{context_text}"
+        );
+        debug!("LLM user prompt:\n{user_prompt}");
+
+        Ok(Some(build_messages_with_history(
+            system_prompt,
+            user_prompt,
+            session,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vector_db: Arc<dyn VectorDB>,
@@ -79,17 +129,26 @@ impl SearchRetriever for CompletionRetriever {
             SearchError::InvalidInput("embedding engine returned no vectors".to_string())
         })?;
 
-        let results = self
-            .vector_db
-            .search_similar(
-                CHUNKS_DATA_TYPE,
-                CHUNKS_FIELD_NAME,
-                &query_vector,
-                params.top_k_or(self.top_k),
-            )
-            .await?;
+        search_node_filtered(
+            self.vector_db.as_ref(),
+            CHUNKS_DATA_TYPE,
+            CHUNKS_FIELD_NAME,
+            &query_vector,
+            params.top_k_or(self.top_k),
+            params.node_name.as_deref(),
+            params.node_name_filter_operator.as_deref().unwrap_or("OR"),
+        )
+        .await
+    }
 
-        search_results_to_context(results)
+    async fn completion_messages(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        session: &SessionContext,
+        params: &SearchParams,
+    ) -> Result<Option<Vec<Message>>, SearchError> {
+        self.build_completion_messages(query, context, session, params)
     }
 
     async fn get_completion(
@@ -104,33 +163,11 @@ impl SearchRetriever for CompletionRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let context_text = completion_context
-            .iter()
-            .filter_map(|item| item.payload.get("text").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_prompt = resolve_system_prompt(
-            params
-                .system_prompt
-                .as_deref()
-                .or(self.system_prompt.as_deref()),
-            params
-                .system_prompt_path
-                .as_deref()
-                .or(self.system_prompt_path.as_deref()),
-        )?;
-
-        let user_prompt =
-            render_user_prompt(self.user_prompt_template.as_deref(), query, &context_text);
-
-        debug!(
-            context_items = completion_context.len(),
-            "RAG context assembled:\n{context_text}"
-        );
-        debug!("LLM user prompt:\n{user_prompt}");
-
-        let messages = build_messages_with_history(system_prompt, user_prompt, session);
+        let Some(messages) =
+            self.build_completion_messages(query, &completion_context, session, params)?
+        else {
+            return Ok(skip_completion_on_empty_context());
+        };
 
         if let Some(schema) = &params.response_schema {
             let structured_value = self
@@ -451,5 +488,103 @@ mod tests {
         let messages = llm.last_messages.lock().unwrap().clone();
         assert_eq!(messages[0].content, "custom system prompt");
         assert!(messages[1].content.contains("Q=who?; C=provided chunk"));
+    }
+
+    /// An existing but empty chunk collection is a normal miss: no LLM call
+    /// (Python's `skip_completion_on_empty_context`, `completion_retriever.py:
+    /// 265-270`).
+    #[tokio::test]
+    async fn empty_context_skips_the_llm() {
+        let llm = Arc::new(TestLlm {
+            response_text: "phantom answer".to_string(),
+            ..Default::default()
+        });
+
+        let retriever = CompletionRetriever::new(
+            Arc::new(TestVectorDb {
+                has_collection: true,
+                results: vec![],
+            }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let output = retriever
+            .get_completion(
+                "what happened?",
+                None,
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(output, SearchOutput::Texts(ref texts) if texts.is_empty()));
+        assert!(llm.last_messages.lock().unwrap().is_empty(), "no LLM call");
+    }
+
+    /// RAG scopes its chunk search by `node_name` like Python's
+    /// `CompletionRetriever` (`completion_retriever.py:136-144`): only in-set
+    /// chunks reach the prompt.
+    #[tokio::test]
+    async fn node_name_scopes_the_rag_context() {
+        use cognee_vector::VectorPoint;
+
+        let db = cognee_vector::BruteForceVectorDB::new();
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        let point = |text: &str, sets: &[&str]| VectorPoint {
+            id: Uuid::new_v4(),
+            vector: vec![1.0, 0.0],
+            metadata: HashMap::from([
+                ("text".to_string(), json!(text)),
+                ("belongs_to_set".to_string(), json!(sets)),
+            ]),
+        };
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[
+                point("in both sets", &["x", "y"]),
+                point("only in x", &["x"]),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let llm = Arc::new(TestLlm {
+            response_text: "answer".to_string(),
+            ..Default::default()
+        });
+        let retriever = CompletionRetriever::new(
+            Arc::new(db),
+            Arc::new(TestEmbeddingEngine),
+            Arc::clone(&llm) as Arc<dyn Llm>,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+        );
+        let params = SearchParams {
+            node_name: Some(vec!["x".to_string(), "y".to_string()]),
+            node_name_filter_operator: Some("AND".to_string()),
+            ..SearchParams::default()
+        };
+
+        retriever
+            .get_completion("q", None, &SessionContext::default(), &params)
+            .await
+            .unwrap();
+
+        let prompt = llm.last_messages.lock().unwrap()[1].content.clone();
+        assert!(prompt.contains("in both sets"), "got: {prompt}");
+        assert!(!prompt.contains("only in x"), "got: {prompt}");
     }
 }

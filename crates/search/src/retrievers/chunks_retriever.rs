@@ -6,7 +6,7 @@ use cognee_session::SessionContext;
 use cognee_vector::VectorDB;
 
 use crate::retrievers::SearchRetriever;
-use crate::retrievers::context_items::search_results_to_context;
+use crate::retrievers::context_items::search_node_filtered;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
 
 const CHUNKS_DATA_TYPE: &str = "DocumentChunk";
@@ -64,17 +64,16 @@ impl SearchRetriever for ChunksRetriever {
             SearchError::InvalidInput("embedding engine returned no vectors".to_string())
         })?;
 
-        let results = self
-            .vector_db
-            .search_similar(
-                CHUNKS_DATA_TYPE,
-                CHUNKS_FIELD_NAME,
-                &query_vector,
-                params.top_k_or(self.top_k),
-            )
-            .await?;
-
-        search_results_to_context(results)
+        search_node_filtered(
+            self.vector_db.as_ref(),
+            CHUNKS_DATA_TYPE,
+            CHUNKS_FIELD_NAME,
+            &query_vector,
+            params.top_k_or(self.top_k),
+            params.node_name.as_deref(),
+            params.node_name_filter_operator.as_deref().unwrap_or("OR"),
+        )
+        .await
     }
 
     async fn get_completion(
@@ -293,5 +292,70 @@ mod tests {
         assert_eq!(context[0].payload["text"], "first");
         assert_eq!(context[1].payload["text"], "second");
         assert!(context[0].score.unwrap() >= context[1].score.unwrap());
+    }
+
+    /// Three chunks: `x` only, `x`+`y`, `y` only — all equidistant from the
+    /// query, so only the node filter decides what comes back.
+    async fn node_set_fixture() -> Arc<dyn VectorDB> {
+        let db = cognee_vector::BruteForceVectorDB::new();
+        db.create_collection("DocumentChunk", "text", 2)
+            .await
+            .unwrap();
+        let point = |text: &str, sets: &[&str]| VectorPoint {
+            id: Uuid::new_v4(),
+            vector: vec![1.0, 0.0],
+            metadata: HashMap::from([
+                ("text".to_string(), json!(text)),
+                ("belongs_to_set".to_string(), json!(sets)),
+            ]),
+        };
+        db.index_points(
+            "DocumentChunk",
+            "text",
+            &[
+                point("x only", &["x"]),
+                point("x and y", &["x", "y"]),
+                point("y only", &["y"]),
+            ],
+        )
+        .await
+        .unwrap();
+        Arc::new(db)
+    }
+
+    async fn texts_for(node_name: Option<&[&str]>, operator: Option<&str>) -> Vec<String> {
+        let retriever = ChunksRetriever::new(
+            node_set_fixture().await,
+            Arc::new(TestEmbeddingEngine),
+            Some(10),
+        );
+        let params = SearchParams {
+            node_name: node_name.map(|names| names.iter().map(|n| n.to_string()).collect()),
+            node_name_filter_operator: operator.map(str::to_string),
+            ..SearchParams::default()
+        };
+        let mut texts: Vec<String> = retriever
+            .get_context("query", &params)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|item| item.payload["text"].as_str().unwrap().to_string())
+            .collect();
+        texts.sort();
+        texts
+    }
+
+    /// Python passes `node_name` / `node_name_filter_operator` to the vector
+    /// search (`chunks_retriever.py:127-135`); CHUNKS used to ignore both.
+    #[tokio::test]
+    async fn node_name_scopes_the_chunk_search() {
+        assert_eq!(texts_for(None, None).await, ["x and y", "x only", "y only"]);
+        // OR is the default operator.
+        assert_eq!(texts_for(Some(&["x"]), None).await, ["x and y", "x only"]);
+        assert_eq!(
+            texts_for(Some(&["x", "y"]), Some("OR")).await,
+            ["x and y", "x only", "y only"]
+        );
+        assert_eq!(texts_for(Some(&["x", "y"]), Some("AND")).await, ["x and y"]);
     }
 }

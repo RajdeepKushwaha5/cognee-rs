@@ -237,18 +237,25 @@ async fn test_memify_e2e_real_embedding_real_qdrant() {
         .await
         .expect("TripletCompletion search should succeed");
 
-    // With `only_context = true` the orchestrator returns the retrieved
-    // context as `SearchOutput::Items(..)`. That must be non-empty.
-    match &response.result {
-        SearchOutput::Items(items) => {
-            assert!(
-                !items.is_empty(),
-                "TripletCompletion should return at least one context item \
-                 after memifying 3 seeded edges"
-            );
-        }
-        other => panic!("only_context=true should yield SearchOutput::Items, got {other:?}"),
-    }
+    // With `only_context = true` the retrieved context travels in
+    // `response.context`; the result is the prompt the completion would have
+    // sent (SDK-1036). The context must be non-empty.
+    let items: Vec<_> = response
+        .context
+        .as_ref()
+        .expect("only_context responses carry their context")
+        .values()
+        .flatten()
+        .collect();
+    assert!(
+        !items.is_empty(),
+        "TripletCompletion should return at least one context item \
+         after memifying 3 seeded edges"
+    );
+    assert!(
+        response.user_prompt.is_some(),
+        "a non-empty TRIPLET_COMPLETION context yields the completion prompt"
+    );
 
     // The memify-indexed metadata includes `relationship`, `source_id`,
     // `target_id`, etc. Assert that at least one returned payload mentions

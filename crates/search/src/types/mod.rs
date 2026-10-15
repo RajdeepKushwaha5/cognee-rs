@@ -11,6 +11,6 @@ pub use search_params::SearchParams;
 pub use search_request::SearchRequest;
 pub use search_result::{
     Rule, SearchContext, SearchGraph, SearchGraphEdge, SearchGraphNode, SearchItem, SearchOutput,
-    SearchResponse,
+    SearchPrompt, SearchResponse,
 };
 pub use search_type::SearchType;
