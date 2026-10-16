@@ -199,7 +199,7 @@ impl Fx {
     }
 
     async fn log_history(&self, user: Uuid) {
-        database::ops::search_history::log_query(&self.db, "q", "CHUNKS", Some(user))
+        database::ops::search_history::log_query(&self.db, "q", "CHUNKS", Some(user), None)
             .await
             .unwrap();
     }
