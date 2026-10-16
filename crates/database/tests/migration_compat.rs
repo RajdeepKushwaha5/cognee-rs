@@ -285,6 +285,9 @@ async fn baseline_creates_full_table_set_sqlite() {
 /// Bumped to 7 for `m20261015_000001_search_history_dataset_id`: `queries` and
 /// `results` gain nullable `dataset_id` and `updated_at`, which existing
 /// databases must acquire without the baseline being rewritten.
+/// Bumped to 8 for `m20261016_000001_search_history_python_columns`: the
+/// history columns are renamed to Python's names in place, so existing
+/// databases keep their rows.
 #[test]
 fn relational_chain_is_baseline_plus_additive_migrations() {
     use sea_orm_migration::MigratorTrait;
@@ -294,7 +297,7 @@ fn relational_chain_is_baseline_plus_additive_migrations() {
         .collect();
     assert_eq!(
         names.len(),
-        7,
+        8,
         "unexpected migration-chain length — chain: {names:?}"
     );
     assert!(
