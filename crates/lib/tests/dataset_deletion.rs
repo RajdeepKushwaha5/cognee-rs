@@ -508,6 +508,7 @@ async fn forget_by_dataset_uuid_succeeds() {
             dataset: DatasetRef::Id(dataset_id),
         },
         owner_id,
+        None,
         &svc,
         Some(db_ref.as_ref()),
     )
@@ -547,6 +548,7 @@ async fn forget_by_dataset_uuid_missing_returns_err() {
             dataset: DatasetRef::Id(missing_id),
         },
         owner_id,
+        None,
         &svc,
         Some(db_ref.as_ref()),
     )
@@ -562,4 +564,130 @@ async fn forget_by_dataset_uuid_missing_returns_err() {
         Ok(_) => panic!("forget should have returned InvalidArgument"),
         Err(other) => panic!("expected InvalidArgument, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// forget() resolves dataset references in the caller's tenant (strict,
+// `None` ⇔ tenant-less; Python `get_dataset_ids.py:30-34@37f788bd2`) and
+// deletes by id — S1 review loop 2.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forget_resolves_dataset_names_and_ids_in_the_callers_tenant() {
+    let (_handle, _ctx, db) = test_task_context().await;
+    let storage = Arc::new(MockStorage::new());
+    let owner_id = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+
+    // "same" in T1 first (an unordered tenant-less lookup tends to return
+    // it), then a tenant-less "same".
+    let in_t1 = ops::datasets::create_dataset(
+        &db,
+        Dataset::new("same".into(), owner_id, Some(t1), Uuid::new_v4()),
+    )
+    .await
+    .unwrap();
+    let (untenanted, data_u, _) = seed_dataset_with_data(&db, &storage, owner_id, "same").await;
+
+    let svc = DeleteService::new(
+        storage.clone() as Arc<dyn StorageTrait>,
+        db.clone() as Arc<dyn DeleteDb>,
+    );
+    let db_ref: Arc<dyn IngestDb> = db.clone();
+
+    // By id: a T1 dataset is not reachable from a tenant-less caller.
+    match forget(
+        ForgetTarget::Dataset {
+            dataset: DatasetRef::Id(in_t1.id),
+        },
+        owner_id,
+        None,
+        &svc,
+        Some(db_ref.as_ref()),
+    )
+    .await
+    {
+        Err(ApiError::InvalidArgument(_)) => {}
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+
+    // By name, tenant-less: the item and then the tenant-less dataset go.
+    forget(
+        ForgetTarget::Item {
+            data_id: data_u,
+            dataset: DatasetRef::Name("same".into()),
+        },
+        owner_id,
+        None,
+        &svc,
+        Some(db_ref.as_ref()),
+    )
+    .await
+    .expect("item in the tenant-less \"same\"");
+    assert!(ops::data::get_data(&db, data_u).await.unwrap().is_none());
+    let result = forget(
+        ForgetTarget::Dataset {
+            dataset: DatasetRef::Name("same".into()),
+        },
+        owner_id,
+        None,
+        &svc,
+        Some(db_ref.as_ref()),
+    )
+    .await
+    .expect("tenant-less \"same\"");
+    assert_eq!(result.delete_result.deleted_datasets, 1);
+    assert!(
+        ops::datasets::get_dataset(&db, untenanted)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ops::datasets::get_dataset(&db, in_t1.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the same-named T1 dataset must survive a tenant-less forget"
+    );
+
+    // No tenant-less "same" is left: not found, T1 still untouched.
+    assert!(matches!(
+        forget(
+            ForgetTarget::Dataset {
+                dataset: DatasetRef::Name("same".into()),
+            },
+            owner_id,
+            None,
+            &svc,
+            Some(db_ref.as_ref()),
+        )
+        .await,
+        Err(ApiError::InvalidArgument(_))
+    ));
+    assert!(
+        ops::datasets::get_dataset(&db, in_t1.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // In T1 the name resolves to the T1 row.
+    forget(
+        ForgetTarget::Dataset {
+            dataset: DatasetRef::Name("same".into()),
+        },
+        owner_id,
+        Some(t1),
+        &svc,
+        Some(db_ref.as_ref()),
+    )
+    .await
+    .expect("\"same\" in T1");
+    assert!(
+        ops::datasets::get_dataset(&db, in_t1.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

@@ -18,6 +18,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **Tenant-filtered per-dataset permission checks; strict tenant-less
+  fallback (SDK-974, SDK-687, SDK-689).** Every per-id check now applies the
+  caller's tenant like Python (`dataset.tenant_id == user.tenant_id`, strict:
+  `None` reaches only tenant-less datasets), and a grant on another tenant's
+  dataset is denied with the same error as no grant.
+
+  | Item | Before | After |
+  |---|---|---|
+  | `AclDb::has_permission_with_roles` | required method | **removed** |
+  | `AclDb::has_permission_in_tenant(user, dataset, perm, tenant)` | — | new, provided (default = membership in `authorized_dataset_ids_in_tenant`) |
+  | `DatasetManager::{list_datasets, list_data, has_data, empty_dataset, delete_data, delete_all}` | `(…, owner_id, …)` | `(…, owner_id, tenant_id: Option<Uuid>, …)` |
+  | `DatasetManager` per-id methods under an ACL | unknown id `NotFound`; cross-tenant grant admitted | `PermissionDenied` for unknown id, no grant and other tenant |
+  | `DatasetManager::list_datasets` without an ACL | every owned dataset | owned datasets with `tenant_id == tenant_id` |
+  | `AuthorizedDeleteService::{preview, execute}` | `(request, principal_id)` | `(request, principal_id, tenant_id)` |
+  | `AuthorizedDeleteService` `DeleteScope::All` | delete **everything** if the caller covers every dataset in the DB, else `PermissionDenied` naming one | delete, by id, the caller's `delete`-authorized datasets in its tenant (Python `datasets.delete_all`); no system-wide graph/vector/search-history wipe |
+  | `AuthorizedDeleteService` User-cover denial message | names the uncovered dataset | generic (`delete permission denied for the requested scope`) |
+  | `DatasetManager::delete_all` | lists `read`-authorized (ACL) / owned datasets and deletes each **by name** | lists `delete`-authorized in tenant (ACL) / owned in tenant, deletes each **by id** |
+  | `cognee-cli search` / `recall` | no tenant | new `--tenant-id` (strict match) |
+  | `IngestDb` / `DeleteDb` | — | new provided `get_dataset_by_name_in_tenant` (strict, `None` ⇔ NULL; point query on SeaORM) and `get_datasets_by_ids` (batch on SeaORM) |
+  | `cognee_database::ops::acl::authorized_datasets_in_tenant` | — | new: existing datasets a user holds a permission on in a tenant (one ACL listing + one batch lookup) |
+  | `AuthorizedDeleteService` by-name scopes (`Dataset`, `Data` with a name) | resolved with no tenant predicate, inner service re-resolved by name | resolved once in the caller's tenant (strict), inner service driven **by id** |
+  | `AuthorizedDeleteService` `DeleteScope::All` failure | first error, progress lost | `DeleteError::Partial { completed, failed_dataset_id, source }` after the first dataset |
+  | `AuthorizedDeleteService::preview(All)` | sum of per-dataset previews | union preview (`DeleteService::preview_datasets_by_id`, new) |
+  | `DeleteError` | — | new variant `Partial` (exhaustive matches break) |
+  | `DeleteResult` / `DeletePreview` | — | `AddAssign` (field-wise sum) |
+  | `DatasetManager::{empty_dataset, delete_data}` without an ACL | by name (tenant-loose re-resolution) | owner + strict-tenant check, then by id |
+  | `cognee::api::update` delete step | `DeleteScope::Data` by name | `DeleteScope::DataInDataset` by the authorized `dataset_id` |
+  | `cognee::api::forget(target, owner_id, …)` | no tenant; names by owner only | `forget(target, owner_id, tenant_id, …)`; references resolve in the tenant (strict) and delete by id; `db` required for any dataset reference |
+  | `cognee-cli forget --tenant-id` | parsed and ignored | honoured |
+  | `cognee::api::update` denial | `ApiError::InvalidArgument` | new `ApiError::PermissionDenied(String)` |
+  | `SearchOrchestrator` without an ACL, `tenant_id: None` | no tenant filter for ids and names | tenant-less datasets only |
+  | Bindings `list_datasets` / `delete_all_datasets` | every owned dataset | tenant-less datasets only (the handle user has no tenant) |
+  | `HandleState::tenant_id()` | — | new accessor |
+
+  **Migration.** An external `AclDb` impl deletes its `has_permission_with_roles`
+  (it is no longer a trait member) and may override `has_permission_in_tenant`
+  for an O(1) path that gives the same answer:
+
+  ```rust
+  async fn has_permission_in_tenant(
+      &self, user_id: Uuid, dataset_id: Uuid, perm: &str, tenant_id: Option<Uuid>,
+  ) -> Result<bool, DatabaseError> {
+      // dataset row exists with dataset.tenant_id == tenant_id (NULL for None)
+      // AND a direct / tenant / role grant of `perm` on it
+  }
+  ```
+
+  Callers pass the caller's tenant: `mgr.list_datasets(owner, tenant)`,
+  `auth_svc.execute(&req, principal, tenant)`. `match`es on `ApiError` add the
+  `PermissionDenied` arm. Data written with a per-call `tenant` opt (or
+  `cognee-cli add/remember/improve --tenant-id`) is no longer listed or deleted
+  by the tenant-less binding dataset ops, and is not reachable from a
+  tenant-less search; pass the same tenant on read (`cognee-cli search/recall
+  --tenant-id`, the bindings' `tenant` search opt) (Python parity).
+  Without an ACL the `DatasetManager` per-id methods still perform no
+  ownership or tenant check.
+
 - **`cognee-search`: `TEMPORAL` search is hybrid retrieval reranked by the
   question's time window, and `TemporalRetriever` is gone.** `SearchType::Temporal`
   now maps to the new `TemporalHybridRetriever`, a port of Python's

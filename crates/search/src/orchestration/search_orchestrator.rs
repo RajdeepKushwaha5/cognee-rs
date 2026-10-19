@@ -333,7 +333,7 @@ impl SearchOrchestrator {
     /// "read", tenant)`: direct, tenant and role grants, kept only where
     /// `dataset.tenant_id == tenant` (strict: `None` admits only datasets with
     /// no tenant). That is Python's `get_all_user_permission_datasets`
-    /// (`get_all_user_permission_datasets.py:49-55` at f154b32), so it admits
+    /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`), so it admits
     /// datasets *shared* with the caller, not only owned ones, but only in the
     /// caller's tenant (SDK-689: the grant listing alone spans every tenant
     /// the user belongs to). This is the intended production path.
@@ -348,12 +348,14 @@ impl SearchOrchestrator {
     /// It also skips Python's check that the owner's own `read` grant is still
     /// present, so an owner whose grant was revoked is admitted here and
     /// denied in Python. Python's other filter — `dataset.tenant_id ==
-    /// user.tenant_id` — **is** applied, via `tenant`: `list_datasets_by_owner`
-    /// spans every tenant the owner appears in, and the bindings let one handle
-    /// write under several (`add`'s `tenant` opt), so without it a caller
-    /// scoped to tenant A could pass tenant B's dataset id and pass the check.
-    /// `tenant: None` means the caller named no tenant and no filter applies,
-    /// which is the single-tenant default every OSS row is written under.
+    /// user.tenant_id` — **is** applied, via `tenant`, with the same strict
+    /// equality as the ACL branch (`get_all_user_permission_datasets.py:49-53`,
+    /// `cognee/modules/data/methods/get_dataset_ids.py:34` @37f788bd2):
+    /// `list_datasets_by_owner` spans every tenant the owner appears in, and
+    /// the bindings let one handle write under several (`add`'s `tenant` opt),
+    /// so without it a caller scoped to tenant A could pass tenant B's dataset
+    /// id and pass the check. `tenant: None` is a tenant-less caller and
+    /// reaches only datasets that have no tenant.
     ///
     /// Callers gate on `acl_db.is_some() || dataset_resolver.is_some()` (the
     /// unfiltered-search scope on `acl_db.is_some()` alone); if
@@ -376,7 +378,7 @@ impl SearchOrchestrator {
                 .list_datasets_by_owner(requester)
                 .await?
                 .into_iter()
-                .filter(|dataset| tenant.is_none_or(|t| dataset.tenant_id == Some(t)))
+                .filter(|dataset| dataset.tenant_id == tenant)
                 .map(|dataset| dataset.id)
                 .collect());
         }
@@ -387,7 +389,7 @@ impl SearchOrchestrator {
     /// readable set.
     ///
     /// Mirrors Python `get_specific_user_permission_datasets`
-    /// (`get_specific_user_permission_datasets.py:30-38`): it intersects the
+    /// (`get_specific_user_permission_datasets.py:30-38@37f788bd2`): it intersects the
     /// requested ids with `get_all_user_permission_datasets` and raises one
     /// `PermissionDeniedError` when the lengths differ — whether an id belongs
     /// to someone else or does not exist. Unknown and foreign ids stay
@@ -397,7 +399,7 @@ impl SearchOrchestrator {
     /// dataset *names* resolve to. Python reaches this same function on both
     /// paths — `get_authorized_existing_datasets` calls `get_dataset_ids` and
     /// then feeds the result straight into it
-    /// (`get_authorized_existing_datasets.py:25-32`) — and checking only the
+    /// (`get_authorized_existing_datasets.py:31-38@37f788bd2`) — and checking only the
     /// explicit-id path left a bypass: a caller whose `read` grant was revoked
     /// or never written was refused by id and served by name.
     async fn authorize_dataset_ids(
@@ -532,23 +534,25 @@ impl SearchOrchestrator {
         }
 
         // Resolve dataset names → UUIDs. Mirrors Python `cognee.search()`:
-        //   - names are looked up via owner-scoped `get_dataset_by_name`,
-        //     additionally scoped to `request.tenant_id` when the caller
-        //     supplies one. Python's `get_dataset_ids` filters on owner AND
-        //     `dataset.tenant_id == user.tenant_id`; owner-scoping alone let a
-        //     name resolve to a row belonging to another tenant. Owner-scoping
+        //   - names resolve among the owner's datasets, then strict tenant
+        //     equality `dataset.tenant_id == request.tenant_id` (`None` ⇔ a
+        //     tenant-less row only) — Python `get_dataset_ids` lists the
+        //     owner's datasets, filters names, then tenant
+        //     (`cognee/modules/data/methods/get_dataset_ids.py:29-34@37f788bd2`).
+        //     Owner-scoping alone let a name resolve to a row belonging to
+        //     another tenant. Owner-scoping
         //     itself is deliberate and matches Python, whose docstring reads
         //     "If a user wants to write to a dataset he is not the owner of it
         //     must be provided through UUID" — do not widen it to shared
         //     datasets.
         //   - per-batch error: if ZERO names resolve → `DatasetNotFound`
-        //     (Python `cognee/api/v1/search/search.py:331-337` at c0d18c8,
-        //     `:341-347` at f154b32); partial misses are dropped and the
-        //     search proceeds with the resolved subset, logging a warning.
-        //     That matched Python at c0d18c8 (`get_dataset_ids` dropped them
-        //     silently); Python f154b32 resolves names with `strict=True`
-        //     and raises for any unresolved name — a divergence not changed
-        //     here.
+        //     (Python `cognee/api/v1/search/search.py:356-362@37f788bd2`);
+        //     partial misses are dropped and the search proceeds with the
+        //     resolved subset, logging a warning. That matched Python at
+        //     c0d18c8 (`get_dataset_ids` dropped them silently); Python
+        //     37f788bd2 resolves names with `strict=True` and raises for any
+        //     unresolved name (`get_dataset_ids.py:35-43`) — a divergence not
+        //     changed here.
         //   - `datasets=Some(empty_vec)` is treated like `None`: no name
         //     resolution (Python's `if datasets:` short-circuits empty lists
         //     too); the request then counts as naming no dataset at all.
@@ -573,11 +577,18 @@ impl SearchOrchestrator {
                     )
                 })?;
 
+                // One tenant-strict point lookup per name: owner, name and
+                // `dataset.tenant_id == request.tenant_id` with `None` ⇔ NULL —
+                // Python's `get_dataset_ids` rule
+                // (`get_dataset_ids.py:30-34@37f788bd2`). Not
+                // `get_dataset_by_name(.., None)`: with `None` it applies no
+                // tenant predicate, and of two same-named rows it may return
+                // the tenanted one the strict readable set excludes.
                 let mut resolved = Vec::with_capacity(names.len());
                 let mut missing = Vec::new();
                 for name in names {
                     match resolver
-                        .get_dataset_by_name(name, owner_id, request.tenant_id)
+                        .get_dataset_by_name_in_tenant(name, owner_id, request.tenant_id)
                         .await?
                     {
                         Some(ds) => resolved.push(ds.id),
@@ -606,10 +617,10 @@ impl SearchOrchestrator {
                 //
                 // Only when an `AclDb` is wired. Without one the check cannot
                 // reject anything: `readable_dataset_ids` falls back to
-                // `list_datasets_by_owner` filtered by tenant, and
-                // `get_dataset_by_name` above already filtered on that same
-                // owner and tenant, so every resolved id is in the set by
-                // construction. Running it anyway would add a full
+                // `list_datasets_by_owner` filtered by strict tenant equality,
+                // and the name resolution above applied the same owner and
+                // strict tenant predicate (point lookups), so every resolved
+                // id is in the set by construction. Running it anyway would add a full
                 // owner-wide dataset listing to every name-scoped search for
                 // a result that is provably `Ok(())`.
                 if self.acl_db.is_some() {
@@ -2309,6 +2320,175 @@ mod tests {
         );
     }
 
+    /// W20/D4. Scenario: no `AclDb`; the owner owns a tenant-less dataset and
+    /// one in tenant T1, and searches with **no** tenant.
+    /// Expected: the T1 id is `PermissionDenied`, the tenant-less id is
+    /// admitted. Python's filter is strict equality, `None` ⇔ NULL
+    /// (`get_all_user_permission_datasets.py:49-53`,
+    /// `get_dataset_ids.py:34` @37f788bd2) — a tenant-less caller is not a
+    /// wildcard.
+    #[tokio::test]
+    async fn tenantless_explicit_ids_reach_only_tenantless_datasets_without_an_acl() {
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let db = fresh_db().await;
+        let untenanted = seed_dataset(&db, "u", owner).await;
+        let tenanted = seed_dataset_in_tenant(&db, "t", owner, t1).await;
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeChunksRetriever));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_dataset_resolver(db as Arc<dyn IngestDb>);
+
+        let err = orchestrator
+            .search(&SearchRequest {
+                dataset_ids: Some(vec![tenanted.id]),
+                user_id: Some(owner),
+                tenant_id: None,
+                ..dataset_request_template()
+            })
+            .await
+            .expect_err("a tenanted id must not pass a tenant-less ownership fallback");
+        assert!(matches!(err, SearchError::PermissionDenied(_)), "{err:?}");
+
+        orchestrator
+            .search(&SearchRequest {
+                dataset_ids: Some(vec![untenanted.id]),
+                user_id: Some(owner),
+                tenant_id: None,
+                ..dataset_request_template()
+            })
+            .await
+            .expect("a tenant-less id is reachable from a tenant-less caller");
+    }
+
+    /// W20/D4. Scenario: the owner has `"shared"` without a tenant and
+    /// `"shared"` in T1; a tenant-less caller searches by that name.
+    /// Expected: only the tenant-less row resolves (strict equality). Verified
+    /// to fail against the pre-S1 per-name `get_dataset_by_name(.., None)`
+    /// loop with this seed order.
+    #[tokio::test]
+    async fn tenantless_name_resolves_only_the_tenantless_row() {
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let db = fresh_db().await;
+        // The T1 row is seeded **first**: an unordered by-name lookup with no
+        // tenant predicate (`get_dataset_by_name(.., None)`) then tends to
+        // return it, so this test fails on the loose resolution.
+        let tenanted = seed_dataset_in_tenant(&db, "shared", owner, t1).await;
+        let untenanted = seed_dataset(&db, "shared", owner).await;
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(ResolutionFixtureRetriever {
+            dataset_a: untenanted.id,
+            dataset_b: tenanted.id,
+        }));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_dataset_resolver(db as Arc<dyn IngestDb>);
+
+        let response = orchestrator
+            .search(&SearchRequest {
+                datasets: Some(vec!["shared".into()]),
+                user_id: Some(owner),
+                tenant_id: None,
+                ..dataset_request_template()
+            })
+            .await
+            .expect("the tenant-less row resolves");
+        let context_map = response.context.expect("scoped context map");
+        assert!(context_map.contains_key(&untenanted.id.to_string()));
+        assert!(
+            !context_map.contains_key(&tenanted.id.to_string()),
+            "the T1 row must not be reachable from a tenant-less caller"
+        );
+        assert_eq!(response.datasets, Some(vec![untenanted.id]));
+    }
+
+    /// W20/D4. Scenario: the owner's only `"only_t"` is in T1; a tenant-less
+    /// caller searches by that name. Expected: `DatasetNotFound` — unresolved
+    /// names never reach the permission check
+    /// (`get_authorized_existing_datasets.py:31-40@37f788bd2`).
+    #[tokio::test]
+    async fn tenantless_name_of_a_tenanted_dataset_does_not_resolve() {
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let db = fresh_db().await;
+        let _ = seed_dataset_in_tenant(&db, "only_t", owner, t1).await;
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(FakeChunksRetriever));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_dataset_resolver(db as Arc<dyn IngestDb>);
+
+        let err = orchestrator
+            .search(&SearchRequest {
+                datasets: Some(vec!["only_t".into()]),
+                user_id: Some(owner),
+                tenant_id: None,
+                ..dataset_request_template()
+            })
+            .await
+            .expect_err("must error");
+        assert!(
+            matches!(err, SearchError::DatasetNotFound(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// W1. Scenario: an ACL is wired; the caller holds `read` on a T2
+    /// dataset and nothing on another T2 dataset, and asks for each by id
+    /// while acting in T1.
+    /// Expected: both are `PermissionDenied` — the same variant, so a grant
+    /// in another tenant is indistinguishable from no grant
+    /// (`get_specific_user_permission_datasets.py:27-38@37f788bd2`). In T2
+    /// the granted id is admitted.
+    #[tokio::test]
+    async fn acl_explicit_id_granted_only_in_another_tenant_is_denied_like_no_grant() {
+        let caller = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let granted = Uuid::new_v4();
+        let ungranted = Uuid::new_v4();
+        let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+        acl.grant_permission(caller, granted, "read")
+            .await
+            .expect("grant");
+        acl.set_dataset_tenant(granted, t2);
+        acl.set_dataset_tenant(ungranted, t2);
+
+        let mut registry = SearchTypeRegistry::new();
+        registry.register(Arc::new(ResolutionFixtureRetriever {
+            dataset_a: granted,
+            dataset_b: ungranted,
+        }));
+        let orchestrator =
+            super::SearchOrchestrator::new(registry).with_acl_db(acl as Arc<dyn AclDb>);
+
+        for id in [granted, ungranted] {
+            let err = orchestrator
+                .search(&SearchRequest {
+                    dataset_ids: Some(vec![id]),
+                    user_id: Some(caller),
+                    tenant_id: Some(t1),
+                    ..dataset_request_template()
+                })
+                .await
+                .expect_err("must be denied from T1");
+            assert!(matches!(err, SearchError::PermissionDenied(_)), "{err:?}");
+        }
+
+        let response = orchestrator
+            .search(&SearchRequest {
+                dataset_ids: Some(vec![granted]),
+                user_id: Some(caller),
+                tenant_id: Some(t2),
+                ..dataset_request_template()
+            })
+            .await
+            .expect("the grant is admitted in its own tenant");
+        assert_eq!(response.datasets, Some(vec![granted]));
+    }
+
     /// Scenario: caller passes a list of dataset names where none of
     /// them exist in the metadata DB.
     /// Expected: the orchestrator returns `SearchError::DatasetNotFound`
@@ -3182,7 +3362,7 @@ mod tests {
     /// holds it alone, and an explicit id from tenant B or from no tenant is
     /// `PermissionDenied`. With no tenant on the request only the tenant-less
     /// dataset is readable. Python keeps `dataset.tenant_id ==
-    /// user.tenant_id` (`get_all_user_permission_datasets.py:49-55`); the
+    /// user.tenant_id` (`get_all_user_permission_datasets.py:49-53@37f788bd2`); the
     /// grant listing alone spans every tenant the user belongs to.
     #[tokio::test]
     async fn acl_readable_set_is_limited_to_the_callers_tenant() {

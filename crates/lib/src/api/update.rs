@@ -41,7 +41,8 @@ pub struct UpdateResult {
 /// * `data_id` - ID of the data item to replace.
 /// * `new_data` - Replacement data inputs.
 /// * `dataset_id` - Explicit dataset UUID (no re-derivation from name).
-/// * `dataset_name` - Dataset name (still required for delete scope).
+/// * `dataset_name` - Dataset name: only the add pipeline's name/lock key; both
+///   the delete and the add target `dataset_id`.
 /// * `owner_id` / `tenant_id` - Ownership context.
 /// * `node_set` - Optional graph node identifiers for access-control grouping.
 /// * `preferred_loaders` - Optional MIME-type-to-loader-name overrides.
@@ -53,13 +54,13 @@ pub struct UpdateResult {
 /// * `llm` .. `cognify_config` - Components for the cognify phase.
 ///
 /// # Errors
-/// Returns `ApiError::InvalidArgument` when `acl_db` is set and the caller
-/// lacks `write` on the dataset — **not** `PermissionDenied`, which this
-/// doc previously claimed. The variant exists (`api::error::ApiError`) and is
-/// arguably the right one, but changing it is a caller-visible break, so the
-/// doc is corrected to the shipped behaviour and the shape is pinned by
-/// `missing_write_grant_is_denied`. Propagates errors from delete, add, or
-/// cognify phases.
+/// Returns `ApiError::PermissionDenied` when `acl_db` is set and the caller
+/// lacks `write` on the dataset **in `tenant_id`** — no grant and a grant only
+/// on another tenant's dataset answer the same, like Python's single
+/// `PermissionDeniedError` (403,
+/// `cognee/modules/users/exceptions/exceptions.py:42-51@37f788bd2`). A failing
+/// ACL backend is `ApiError::InvalidArgument`. Propagates errors from delete,
+/// add, or cognify phases.
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     data_id: Uuid,
@@ -85,22 +86,17 @@ pub async fn update(
 ) -> Result<UpdateResult, ApiError> {
     // ── Permission gate ───────────────────────────────────────────────────────
     if let Some(acl) = acl_db {
-        require_write_permission(acl, owner_id, dataset_id).await?;
+        require_write_permission(acl, owner_id, tenant_id, dataset_id).await?;
     }
 
     // ── Step 1: Delete old data ───────────────────────────────────────────────
-    let delete_request = DeleteRequest {
-        scope: DeleteScope::Data {
-            owner_id,
-            data_id,
-            dataset_name: Some(dataset_name.to_string()),
-            delete_dataset_if_empty: false,
-        },
-        // Python update() → datasets.delete_data defaults mode="soft" (datasets.py:147).
-        mode: DeleteMode::Soft,
-        memory_only: false,
-    };
-    let delete_result = delete_service.execute(&delete_request).await?;
+    // By the authorized `dataset_id`, not by name: a by-name scope is
+    // re-resolved without a tenant predicate and could detach the item from a
+    // same-named dataset in another tenant — not the one the write check just
+    // authorized. Python's `update()` is driven by `dataset_id` throughout
+    // (`cognee/api/v1/update/update.py:36@37f788bd2`); step 2 already adds by
+    // id (`AddParams::dataset_id`).
+    let delete_result = delete_old_data(delete_service, dataset_id, data_id).await?;
 
     // ── Step 2: Re-add new data ───────────────────────────────────────────────
     let params = AddParams {
@@ -178,32 +174,64 @@ pub async fn update(
     })
 }
 
-/// Deny the update unless `owner_id` holds `write` on `dataset_id`.
+/// Step 1 of [`update`]: detach/delete `data_id` from the dataset
+/// `dataset_id` — by id (see the comment at the call site).
+async fn delete_old_data(
+    delete_service: &DeleteService,
+    dataset_id: Uuid,
+    data_id: Uuid,
+) -> Result<DeleteResult, ApiError> {
+    let delete_request = DeleteRequest {
+        scope: DeleteScope::DataInDataset {
+            dataset_id,
+            data_id,
+            delete_dataset_if_empty: false,
+        },
+        // Python update() → datasets.delete_data defaults mode="soft" (datasets.py:147).
+        mode: DeleteMode::Soft,
+        memory_only: false,
+    };
+    Ok(delete_service.execute(&delete_request).await?)
+}
+
+/// Deny the update unless `owner_id` holds `write` on `dataset_id` in
+/// `tenant_id`.
 ///
-/// Uses the roles-aware check: Python authorizes `update()` through the
-/// dataset ACL (`ingest_data` → `get_specific_user_permission_datasets(user.id,
-/// "write", [dataset_id])`), which walks the caller's tenant and role grants
-/// as well as direct ones. A collaborator who holds `write` only via a role
-/// must therefore be admitted here too.
+/// Uses the roles-aware, tenant-filtered check: Python authorizes `update()`
+/// through the dataset ACL (`ingest_data` →
+/// `get_specific_user_permission_datasets(user.id, "write", [dataset_id])`,
+/// `cognee/tasks/ingestion/ingest_data.py:212`,
+/// `cognee/modules/users/permissions/methods/get_specific_user_permission_datasets.py:27-38`
+/// @37f788bd2), which walks the caller's tenant and role grants as well as
+/// direct ones and then keeps only datasets with `tenant_id == user.tenant_id`
+/// (`get_all_user_permission_datasets.py:49-53@37f788bd2`). A collaborator who
+/// holds `write` only via a role is admitted; a grant on another tenant's
+/// dataset is not.
 async fn require_write_permission(
     acl: &dyn AclDb,
     owner_id: Uuid,
+    tenant_id: Option<Uuid>,
     dataset_id: Uuid,
 ) -> Result<(), ApiError> {
     let permitted = acl
-        .has_permission_with_roles(owner_id, dataset_id, "write")
+        .has_permission_in_tenant(owner_id, dataset_id, "write", tenant_id)
         .await
         .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
     if permitted {
         Ok(())
     } else {
-        Err(ApiError::InvalidArgument(
+        Err(ApiError::PermissionDenied(
             "write permission denied on dataset".to_string(),
         ))
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
 mod tests {
     use super::*;
     use cognee_test_utils::MockAclDb;
@@ -224,7 +252,9 @@ mod tests {
         assert!(acl.grant_permission(role, dataset, "write").await.is_ok());
 
         assert!(
-            require_write_permission(&acl, user, dataset).await.is_ok(),
+            require_write_permission(&acl, user, None, dataset)
+                .await
+                .is_ok(),
             "a role-held write grant must satisfy the update gate"
         );
     }
@@ -238,12 +268,16 @@ mod tests {
         let dataset = Uuid::new_v4();
         assert!(acl.grant_permission(user, dataset, "write").await.is_ok());
 
-        assert!(require_write_permission(&acl, user, dataset).await.is_ok());
+        assert!(
+            require_write_permission(&acl, user, None, dataset)
+                .await
+                .is_ok()
+        );
     }
 
     /// Scenario: the caller holds `read` (directly and via a role) but not
-    /// `write`. Expected: denied with `InvalidArgument`, the pre-existing
-    /// error shape for this gate.
+    /// `write`. Expected: denied with `PermissionDenied` (Python's
+    /// `PermissionDeniedError`, 403).
     #[tokio::test]
     async fn missing_write_grant_is_denied() {
         let acl = MockAclDb::new();
@@ -257,10 +291,102 @@ mod tests {
         assert!(acl.grant_permission(user, dataset, "read").await.is_ok());
         assert!(acl.grant_permission(role, dataset, "read").await.is_ok());
 
-        let err = require_write_permission(&acl, user, dataset).await;
+        let err = require_write_permission(&acl, user, None, dataset).await;
         assert!(
-            matches!(err, Err(ApiError::InvalidArgument(_))),
+            matches!(err, Err(ApiError::PermissionDenied(_))),
             "got {err:?}"
+        );
+    }
+
+    /// Scenario: `write` granted on a dataset in tenant T2; the caller acts in
+    /// T1 (or tenant-less). Expected: the same `PermissionDenied` as no grant
+    /// — Python intersects with the tenant-filtered set
+    /// (`get_all_user_permission_datasets.py:49-53@37f788bd2`). In T2 the same
+    /// grant is admitted.
+    #[tokio::test]
+    async fn write_grant_in_another_tenant_is_denied() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let dataset = Uuid::new_v4();
+        acl.set_dataset_tenant(dataset, t2);
+        assert!(acl.grant_permission(user, dataset, "write").await.is_ok());
+
+        for tenant in [Some(t1), None] {
+            let err = require_write_permission(&acl, user, tenant, dataset).await;
+            assert!(
+                matches!(err, Err(ApiError::PermissionDenied(_))),
+                "{tenant:?}: got {err:?}"
+            );
+        }
+        assert!(
+            require_write_permission(&acl, user, Some(t2), dataset)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Review loop 2 #1. One data item is attached to `"x"` in T1 (seeded
+    /// first) and to the tenant-less `"x"`. Updating it in the tenant-less
+    /// dataset must detach it there only. The old by-name delete step
+    /// re-resolved `"x"` with no tenant predicate and could hit the T1 row.
+    #[tokio::test]
+    async fn delete_step_targets_the_authorized_dataset_id_not_a_same_named_row() {
+        use cognee_database::{DeleteDb, IngestDb, connect, initialize};
+        use cognee_models::Dataset;
+        let db = Arc::new(connect("sqlite::memory:").await.unwrap());
+        initialize(&db).await.unwrap();
+        let owner = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let ingest: &dyn IngestDb = db.as_ref();
+        let tenanted = ingest
+            .create_dataset(Dataset::new("x".into(), owner, Some(t1), Uuid::new_v4()))
+            .await
+            .unwrap();
+        let untenanted = ingest
+            .create_dataset(Dataset::new("x".into(), owner, None, Uuid::new_v4()))
+            .await
+            .unwrap();
+        let loc = format!("file:///tmp/{}.txt", Uuid::new_v4());
+        let data = Data::builder(
+            Uuid::new_v4(),
+            "d.txt",
+            loc.as_str(),
+            loc.as_str(),
+            "txt",
+            "text/plain",
+            "hash",
+            owner,
+        )
+        .build();
+        ingest.create_data(data.clone()).await.unwrap();
+        for ds in [tenanted.id, untenanted.id] {
+            ingest.attach_data_to_dataset(ds, data.id).await.unwrap();
+        }
+        let delete_service = DeleteService::new(
+            Arc::new(cognee_storage::MockStorage::new()) as Arc<dyn StorageTrait>,
+            db.clone() as Arc<dyn DeleteDb>,
+        );
+
+        delete_old_data(&delete_service, untenanted.id, data.id)
+            .await
+            .unwrap();
+
+        let ids = |v: Vec<Data>| v.into_iter().map(|d| d.id).collect::<Vec<_>>();
+        assert!(
+            ids(DeleteDb::get_dataset_data(db.as_ref(), untenanted.id)
+                .await
+                .unwrap())
+            .is_empty(),
+            "detached from the authorized (tenant-less) dataset"
+        );
+        assert_eq!(
+            ids(DeleteDb::get_dataset_data(db.as_ref(), tenanted.id)
+                .await
+                .unwrap()),
+            vec![data.id],
+            "the same-named T1 dataset keeps its link"
         );
     }
 }

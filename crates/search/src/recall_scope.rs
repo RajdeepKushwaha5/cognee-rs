@@ -41,9 +41,11 @@ pub struct RecallOptions {
     pub neighborhood_depth: Option<usize>,
     pub neighborhood_seed_top_k: Option<usize>,
     /// Tenant the requester belongs to. Forwarded to
-    /// [`SearchRequest::tenant_id`] so `datasets` name resolution is scoped to
-    /// the caller's tenant, as Python's `get_dataset_ids` does. `None` means
-    /// no tenant filter — correct for single-tenant callers.
+    /// [`SearchRequest::tenant_id`], which scopes dataset names, explicit ids
+    /// and the readable set to the caller's tenant by strict equality, as
+    /// Python's `get_dataset_ids` does (`get_dataset_ids.py:34@37f788bd2`).
+    /// `None` means a tenant-less caller: it reaches only datasets that have
+    /// no tenant.
     pub tenant_id: Option<Uuid>,
 }
 

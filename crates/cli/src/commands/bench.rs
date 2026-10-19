@@ -972,7 +972,8 @@ async fn phase_dataset_delete(
 
     let datasets = DatasetManager::new(Arc::clone(&database) as Arc<dyn DatasetDb>);
     datasets
-        .empty_dataset(dataset.id, owner_id, &delete_service)
+        // The CLI has no tenant: a tenant-less caller (Python D4).
+        .empty_dataset(dataset.id, owner_id, None, &delete_service)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())

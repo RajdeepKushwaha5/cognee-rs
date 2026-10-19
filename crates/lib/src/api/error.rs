@@ -62,6 +62,13 @@ pub enum ApiError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// The caller lacks the permission on the dataset in its tenant. "No
+    /// grant" and "a grant only on another tenant's dataset" both answer this
+    /// variant, like Python's single `PermissionDeniedError` (HTTP 403,
+    /// `cognee/modules/users/exceptions/exceptions.py:42-51@37f788bd2`).
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("Background task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 }

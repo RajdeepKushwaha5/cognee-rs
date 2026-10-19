@@ -18,6 +18,12 @@
 //!   has non-string JSON keys → convert to `HashMap<String, _>` before
 //!   serialising.
 //! - `has_data` returns `serde_json::Value::Bool(b)` (strict JSON bool).
+//!
+//! ## Tenant
+//! Every op passes [`HandleState::tenant_id`] (`None` for the default user):
+//! a tenant-less caller lists, reads and deletes only tenant-less datasets
+//! (strict equality, Python `get_all_user_permission_datasets.py:49-53@37f788bd2`),
+//! so datasets written with a per-call `tenant` opt are not listed here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +44,7 @@ pub async fn list_datasets(state: &HandleState) -> Result<serde_json::Value, Sdk
 
     let mgr = DatasetManager::new(Arc::clone(&svc.database) as Arc<dyn DatasetDb>);
     let datasets = mgr
-        .list_datasets(owner_id)
+        .list_datasets(owner_id, state.tenant_id())
         .await
         .map_err(|e| SdkError::Runtime(format!("list_datasets failed: {e}")))?;
 
@@ -60,7 +66,7 @@ pub async fn list_data(
 
     let mgr = DatasetManager::new(Arc::clone(&svc.database) as Arc<dyn DatasetDb>);
     let items = mgr
-        .list_data(dataset_id, owner_id)
+        .list_data(dataset_id, owner_id, state.tenant_id())
         .await
         .map_err(|e| SdkError::Runtime(format!("list_data failed: {e}")))?;
 
@@ -88,7 +94,7 @@ pub async fn has_data(
 
     let mgr = DatasetManager::new(Arc::clone(&svc.database) as Arc<dyn DatasetDb>);
     let has = mgr
-        .has_data(dataset_id, owner_id)
+        .has_data(dataset_id, owner_id, state.tenant_id())
         .await
         .map_err(|e| SdkError::Runtime(format!("has_data failed: {e}")))?;
 
@@ -149,7 +155,12 @@ pub async fn empty_dataset(
 
     let mgr = DatasetManager::new(Arc::clone(&svc.database) as Arc<dyn DatasetDb>);
     let result = mgr
-        .empty_dataset(dataset_id, owner_id, svc.delete_service.as_ref())
+        .empty_dataset(
+            dataset_id,
+            owner_id,
+            state.tenant_id(),
+            svc.delete_service.as_ref(),
+        )
         .await
         .map_err(|e| SdkError::Runtime(format!("empty_dataset failed: {e}")))?;
 
@@ -200,6 +211,7 @@ pub async fn delete_data(
             dataset_id,
             data_id,
             owner_id,
+            state.tenant_id(),
             mode,
             delete_dataset_if_empty,
             svc.delete_service.as_ref(),
@@ -222,7 +234,7 @@ pub async fn delete_all_datasets(state: &HandleState) -> Result<serde_json::Valu
 
     let mgr = DatasetManager::new(Arc::clone(&svc.database) as Arc<dyn DatasetDb>);
     let results = mgr
-        .delete_all(owner_id, svc.delete_service.as_ref())
+        .delete_all(owner_id, state.tenant_id(), svc.delete_service.as_ref())
         .await
         .map_err(|e| SdkError::Runtime(format!("delete_all failed: {e}")))?;
 

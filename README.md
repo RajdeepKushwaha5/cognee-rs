@@ -145,7 +145,7 @@ cognee-cli improve -d main_dataset --node-name "Cognee" --feedback-alpha 0.1
 | Command | Purpose | Shared flags |
 |---|---|---|
 | `remember <data…>` | add + cognify (+ improve) | `-d/--dataset-name`, `--session-id`, `--no-improve`, `--tenant-id` |
-| `recall <query>` | smart search (auto-routes) | `-d/--datasets`, `-t/--query-type`, `-k/--top-k` (10), `--session-id`, `-f/--output-format` |
+| `recall <query>` | smart search (auto-routes) | `-d/--datasets`, `-t/--query-type`, `-k/--top-k` (10), `--session-id`, `-f/--output-format`, `--tenant-id` |
 | `improve` | reinforce graph from feedback | `-d/--dataset-name`, `--session-id`, `--node-name`, `--feedback-alpha` (0.1), `--tenant-id` |
 | `forget` | delete memory | one of `--all` / `-d` / `--data-id`+`--dataset-name`, `--tenant-id` |
 

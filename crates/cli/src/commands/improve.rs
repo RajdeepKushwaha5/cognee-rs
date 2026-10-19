@@ -29,12 +29,7 @@ pub fn run(args: ImproveArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
     })?;
     drop(settings);
 
-    let tenant_id = args
-        .tenant_id
-        .as_deref()
-        .map(Uuid::parse_str)
-        .transpose()
-        .map_err(|error| CliError::Validation(format!("Invalid --tenant-id: {error}")))?;
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
 
     let session_ids = if args.session_id.is_empty() {
         None

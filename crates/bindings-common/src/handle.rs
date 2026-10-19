@@ -63,7 +63,6 @@ pub struct HandleState {
     /// then.
     owner_id: TokioMutex<Option<Uuid>>,
     /// The default user carries no tenant (see `get_or_create_default_user`).
-    #[allow(dead_code)] // consumed by SDK ops in later phases
     tenant_id: Option<Uuid>,
     /// Optional DB-backed default-user bootstrap hook. `None` (the OSS default)
     /// keeps the DB-free in-memory derivation; a downstream build can attach
@@ -471,6 +470,15 @@ impl HandleState {
                 current.spawn(async move { this.teardown(mark_closed).await });
             }
         }
+    }
+
+    /// The handle user's tenant. The default user carries no tenant (`None`),
+    /// so the dataset ops act as a tenant-less caller and reach only
+    /// tenant-less datasets — Python's strict `dataset.tenant_id ==
+    /// user.tenant_id` (`get_all_user_permission_datasets.py:49-53@37f788bd2`,
+    /// D4).
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        self.tenant_id
     }
 
     /// Resolve the owner id, warming lazily if necessary.

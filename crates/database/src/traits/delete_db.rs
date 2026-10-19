@@ -24,6 +24,43 @@ pub trait DeleteDb: Send + Sync {
     async fn count_dataset_data(&self, dataset_id: Uuid) -> Result<usize, DatabaseError>;
     async fn list_datasets_by_owner(&self, owner_id: Uuid) -> Result<Vec<Dataset>, DatabaseError>;
     async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError>;
+    /// The dataset named `name` owned by `owner_id` in `tenant_id`, with
+    /// **strict** tenant equality (`None` matches only a tenant-less row) —
+    /// Python's `get_dataset_ids` rule
+    /// (`cognee/modules/data/methods/get_dataset_ids.py:30-34@37f788bd2`).
+    /// Every by-name path that must stay inside the caller's tenant uses this,
+    /// not [`Self::get_dataset_by_name`] (whose `None` means "no filter").
+    ///
+    /// The default filters [`Self::list_datasets_by_owner`] and is correct for
+    /// any implementation; override it with a point query.
+    async fn get_dataset_by_name_in_tenant(
+        &self,
+        name: &str,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Option<Dataset>, DatabaseError> {
+        Ok(self
+            .list_datasets_by_owner(owner_id)
+            .await?
+            .into_iter()
+            .find(|ds| ds.name == name && ds.tenant_id == tenant_id))
+    }
+
+    /// The datasets among `ids` that exist, in `ids` order (duplicates and
+    /// missing ids dropped). The default looks each id up with
+    /// [`Self::get_dataset_by_id`]; override it with a batch query.
+    async fn get_datasets_by_ids(&self, ids: &[Uuid]) -> Result<Vec<Dataset>, DatabaseError> {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if seen.insert(*id)
+                && let Some(ds) = self.get_dataset_by_id(*id).await?
+            {
+                out.push(ds);
+            }
+        }
+        Ok(out)
+    }
     /// A dataset by id, whoever owns it. Defaults to scanning
     /// [`Self::list_datasets`]; implementations with an indexed lookup
     /// override it.
@@ -199,6 +236,19 @@ impl DeleteDb for DatabaseConnection {
 
     async fn list_datasets(&self) -> Result<Vec<Dataset>, DatabaseError> {
         datasets::list_datasets(self).await
+    }
+
+    async fn get_dataset_by_name_in_tenant(
+        &self,
+        name: &str,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Option<Dataset>, DatabaseError> {
+        datasets::get_dataset_by_name_in_tenant(self, name, owner_id, tenant_id).await
+    }
+
+    async fn get_datasets_by_ids(&self, ids: &[Uuid]) -> Result<Vec<Dataset>, DatabaseError> {
+        datasets::get_datasets_by_ids(self, ids).await
     }
 
     async fn get_dataset_by_id(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError> {

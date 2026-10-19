@@ -31,22 +31,19 @@ pub struct SearchRequest {
     pub save_interaction: Option<bool>,
     #[serde(default)]
     pub user_id: Option<Uuid>,
-    /// Tenant the requester belongs to, used to scope `datasets` name
-    /// resolution.
+    /// Tenant the requester belongs to. Applied with **strict equality**
+    /// everywhere — `datasets` name resolution, explicit `dataset_ids`, and
+    /// the no-filter scope, with or without an `AclDb`: only datasets whose
+    /// `tenant_id` equals this value are reachable, `None` included. A caller
+    /// with no tenant (`None`) reaches only datasets that have no tenant —
+    /// which is every row in OSS single-user mode and the CLI.
     ///
-    /// Python's `get_dataset_ids` filters candidate rows on both
-    /// `dataset.owner_id == user.id` **and** `dataset.tenant_id ==
-    /// user.tenant_id`; leaving this `None` resolves names across every
-    /// tenant the owner id appears in. `None` means "no tenant filter" and is
-    /// correct for single-tenant callers (the CLI, OSS single-user mode),
-    /// where every row carries `tenant_id = NULL` anyway.
-    ///
-    /// With an `AclDb` wired it also bounds the readable set (explicit ids,
-    /// resolved names and the no-filter scope) to datasets whose
-    /// `tenant_id` **equals** this value, `None` included: a caller with no
-    /// tenant reads only datasets with no tenant, as in Python's
-    /// `get_all_user_permission_datasets` (`dataset.tenant_id ==
-    /// user.tenant_id`).
+    /// Python: `get_dataset_ids` filters names on `dataset.owner_id ==
+    /// user.id` **and** `dataset.tenant_id == user.tenant_id`
+    /// (`cognee/modules/data/methods/get_dataset_ids.py:29-34@37f788bd2`), and
+    /// `get_all_user_permission_datasets` keeps only `dataset.tenant_id ==
+    /// user.tenant_id`
+    /// (`cognee/modules/users/permissions/methods/get_all_user_permission_datasets.py:49-53@37f788bd2`).
     #[serde(default)]
     pub tenant_id: Option<Uuid>,
     pub verbose: Option<bool>,

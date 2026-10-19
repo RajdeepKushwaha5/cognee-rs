@@ -26,6 +26,7 @@ pub fn run(args: RecallArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
         ))
     })?;
     drop(settings);
+    let tenant_id = crate::commands::parse_tenant_id(args.tenant_id.as_deref())?;
 
     // When `--query-type` is omitted, recall auto-routes the search type.
     let (query_type, auto_route): (Option<SearchType>, bool) = match args.query_type {
@@ -94,7 +95,11 @@ pub fn run(args: RecallArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
             Some(session_store.as_ref()),
             Some(session_manager.as_ref()),
             None,
-            None,
+            // Only the tenant is set; absent, keep `None` (no options at all).
+            tenant_id.map(|tenant_id| cognee::api::RecallOptions {
+                tenant_id: Some(tenant_id),
+                ..Default::default()
+            }),
         )
         .await
         .map_err(|error| CliError::Runtime(format!("Recall failed: {error}")))?;

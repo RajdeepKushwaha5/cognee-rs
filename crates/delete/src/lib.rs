@@ -91,7 +91,9 @@ const FALLBACK_VECTOR_COLLECTIONS: &[(&str, &str)] = &[
 /// authorize with `get_authorized_dataset(user, dataset_id, "delete")`, i.e. a
 /// `delete` grant, not ownership. `DeleteService` does **not** authorize them:
 /// the caller checks `delete` on `dataset_id` first, or uses
-/// [`AuthorizedDeleteService`], which does (SDK-936).
+/// [`AuthorizedDeleteService`], which does (SDK-936) — in the caller's tenant,
+/// so a grant only in another tenant is denied like no grant
+/// (`get_all_user_permission_datasets.py:49-53@37f788bd2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeleteScope {
     Data {
@@ -195,6 +197,95 @@ pub enum DeleteError {
 
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
+
+    /// A multi-dataset delete (e.g. `AuthorizedDeleteService`'s
+    /// [`DeleteScope::All`]) stopped at the first failing dataset. Like
+    /// Python's `datasets.delete_all`, which empties the datasets one by one
+    /// and lets the first exception propagate
+    /// (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`), the datasets
+    /// before it **stay deleted**; `completed` reports what they removed so
+    /// the caller does not lose that work, and `source` is the failure.
+    #[error(
+        "delete stopped at dataset {failed_dataset_id} after deleting {} dataset(s): {source}",
+        completed.deleted_datasets
+    )]
+    Partial {
+        completed: Box<DeleteResult>,
+        failed_dataset_id: Uuid,
+        source: Box<DeleteError>,
+    },
+}
+
+/// Field-wise sum, for aggregating per-dataset results. Destructures `rhs`
+/// exhaustively so a new field cannot be silently dropped from the sum.
+impl std::ops::AddAssign for DeleteResult {
+    fn add_assign(&mut self, rhs: Self) {
+        let DeleteResult {
+            deleted_datasets,
+            deleted_dataset_links,
+            deleted_data,
+            deleted_storage_files,
+            deleted_graph_nodes,
+            deleted_vector_points,
+            deleted_provenance_nodes,
+            deleted_provenance_edges,
+            deleted_orphan_entities,
+            deleted_orphan_entity_types,
+            deleted_orphan_edge_types,
+            deleted_pipeline_runs,
+            cleared_pipeline_statuses,
+            deleted_search_queries,
+            pruned_sessions,
+            warnings,
+        } = rhs;
+        self.deleted_datasets += deleted_datasets;
+        self.deleted_dataset_links += deleted_dataset_links;
+        self.deleted_data += deleted_data;
+        self.deleted_storage_files += deleted_storage_files;
+        self.deleted_graph_nodes += deleted_graph_nodes;
+        self.deleted_vector_points += deleted_vector_points;
+        self.deleted_provenance_nodes += deleted_provenance_nodes;
+        self.deleted_provenance_edges += deleted_provenance_edges;
+        self.deleted_orphan_entities += deleted_orphan_entities;
+        self.deleted_orphan_entity_types += deleted_orphan_entity_types;
+        self.deleted_orphan_edge_types += deleted_orphan_edge_types;
+        self.deleted_pipeline_runs += deleted_pipeline_runs;
+        self.cleared_pipeline_statuses += cleared_pipeline_statuses;
+        self.deleted_search_queries += deleted_search_queries;
+        self.pruned_sessions |= pruned_sessions;
+        self.warnings.extend(warnings);
+    }
+}
+
+/// Field-wise sum. Destructures `rhs` exhaustively so a new field cannot be
+/// silently dropped. Note that summing per-dataset previews under-counts data
+/// shared between those datasets; use [`DeleteService::preview_datasets_by_id`]
+/// for a set of datasets deleted together.
+impl std::ops::AddAssign for DeletePreview {
+    fn add_assign(&mut self, rhs: Self) {
+        let DeletePreview {
+            datasets_to_delete,
+            dataset_links_to_delete,
+            data_to_delete,
+            storage_files_to_delete,
+            graph_nodes_to_delete,
+            vector_points_to_delete,
+            provenance_nodes_to_delete,
+            provenance_edges_to_delete,
+            search_queries_to_delete,
+            orphaned_edge_types_to_delete,
+        } = rhs;
+        self.datasets_to_delete += datasets_to_delete;
+        self.dataset_links_to_delete += dataset_links_to_delete;
+        self.data_to_delete += data_to_delete;
+        self.storage_files_to_delete += storage_files_to_delete;
+        self.graph_nodes_to_delete += graph_nodes_to_delete;
+        self.vector_points_to_delete += vector_points_to_delete;
+        self.provenance_nodes_to_delete += provenance_nodes_to_delete;
+        self.provenance_edges_to_delete += provenance_edges_to_delete;
+        self.search_queries_to_delete += search_queries_to_delete;
+        self.orphaned_edge_types_to_delete += orphaned_edge_types_to_delete;
+    }
 }
 
 struct ResolvedDeleteTargets {
@@ -267,15 +358,6 @@ impl DeleteService {
     )]
     pub async fn preview(&self, request: &DeleteRequest) -> Result<DeletePreview, DeleteError> {
         let targets = self.resolve_targets(request).await?;
-        let data_to_delete = self
-            .count_data_that_would_be_deleted(&targets.candidate_data_ids, &targets.links_to_detach)
-            .await?;
-
-        // Count graph nodes, vector points, and provenance rows from tables
-        let (graph_node_count, vector_point_count, prov_node_count, prov_edge_count) =
-            self.count_graph_vector_artifacts(&targets).await?;
-
-        // Count search history queries that would be deleted
         let search_queries_to_delete = match &request.scope {
             DeleteScope::User { owner_id } => self
                 .database
@@ -298,6 +380,42 @@ impl DeleteService {
             | DeleteScope::DataInDataset { .. }
             | DeleteScope::DatasetById { .. } => 0,
         };
+        self.preview_targets(targets, search_queries_to_delete)
+            .await
+    }
+
+    /// Preview deleting the datasets `dataset_ids` **together**, by id,
+    /// whoever owns them (no authorization — see
+    /// [`AuthorizedDeleteService`]). The targets are resolved over the union,
+    /// so a data item linked only to datasets in the set counts as deleted
+    /// once — which is what deleting them one after another does, and what a
+    /// sum of per-dataset previews would miss (each would see the other link
+    /// and count it 0).
+    #[tracing::instrument(name = "cognee.delete.preview_datasets_by_id", skip_all)]
+    pub async fn preview_datasets_by_id(
+        &self,
+        dataset_ids: &[Uuid],
+    ) -> Result<DeletePreview, DeleteError> {
+        let mut datasets = Vec::with_capacity(dataset_ids.len());
+        for id in dataset_ids {
+            datasets.push(self.dataset_by_id(*id).await?);
+        }
+        let targets = self.resolve_dataset_list(datasets).await?;
+        self.preview_targets(targets, 0).await
+    }
+
+    async fn preview_targets(
+        &self,
+        targets: ResolvedDeleteTargets,
+        search_queries_to_delete: usize,
+    ) -> Result<DeletePreview, DeleteError> {
+        let data_to_delete = self
+            .count_data_that_would_be_deleted(&targets.candidate_data_ids, &targets.links_to_detach)
+            .await?;
+
+        // Count graph nodes, vector points, and provenance rows from tables
+        let (graph_node_count, vector_point_count, prov_node_count, prov_edge_count) =
+            self.count_graph_vector_artifacts(&targets).await?;
 
         tracing::Span::current().record("cognee.result.count", data_to_delete);
 
@@ -3700,6 +3818,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect("authorized delete should succeed");
@@ -3734,7 +3853,11 @@ mod tests {
             memory_only: false,
         };
         let err = svc
-            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), mallory)
+            .execute(
+                &by_id(DeleteScope::DatasetById { dataset_id }),
+                mallory,
+                None,
+            )
             .await
             .expect_err("no grant, no delete");
         assert!(matches!(err, DeleteError::PermissionDenied(_)), "{err:?}");
@@ -3747,13 +3870,14 @@ mod tests {
                     delete_dataset_if_empty: false,
                 }),
                 bob,
+                None,
             )
             .await
             .expect("a delete grant must let a non-owner delete a data item");
         assert_eq!(result.deleted_dataset_links, 1);
 
         let result = svc
-            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), bob)
+            .execute(&by_id(DeleteScope::DatasetById { dataset_id }), bob, None)
             .await
             .expect("a delete grant must let a non-owner delete the dataset");
         assert_eq!(result.deleted_datasets, 1);
@@ -3782,6 +3906,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("an item outside the dataset must be refused");
@@ -3811,6 +3936,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("should fail without delete permission");
@@ -3847,6 +3973,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner_b, // wrong principal
+                None,
             )
             .await
             .expect_err("should fail for wrong principal");
@@ -3889,6 +4016,7 @@ mod tests {
                     memory_only: false,
                 },
                 user_b,
+                None,
             )
             .await
             .expect("delegated delete should succeed");
@@ -3947,7 +4075,8 @@ mod tests {
     // Python `check_permission_on_dataset` → `get_specific_user_permission_
     // datasets` → `get_all_user_permission_datasets` resolves direct, tenant
     // and role grants for every permission type. The delete path must use
-    // the `_with_roles` variants so a principal holding `delete` only through
+    // the roles-aware methods (`has_permission_in_tenant`,
+    // `authorized_dataset_ids_in_tenant`) so a principal holding `delete` only through
     // a role or tenant is admitted. Each test below grants to a role/tenant
     // id and calls as the member user; with the plain variants the grant is
     // invisible and every one of these goes red.
@@ -3955,7 +4084,7 @@ mod tests {
 
     /// Scenario: `delete` granted to a *role*; the caller holds the role.
     /// Exercises `require_delete_permission` (Dataset scope →
-    /// `has_permission_with_roles`).
+    /// `has_permission_in_tenant`).
     #[tokio::test]
     async fn authorized_delete_via_role_grant_dataset_scope() {
         use cognee_database::AclDb;
@@ -3989,6 +4118,7 @@ mod tests {
                     memory_only: false,
                 },
                 member,
+                None,
             )
             .await
             .expect("a role-held delete grant must authorize the delete");
@@ -4028,6 +4158,7 @@ mod tests {
                     memory_only: false,
                 },
                 member,
+                None,
             )
             .await
             .expect_err("a role-held read grant must not authorize delete");
@@ -4039,7 +4170,7 @@ mod tests {
 
     /// Scenario: User scope; the owner has two datasets, one granted to the
     /// caller directly and one granted only to a *tenant* the caller belongs
-    /// to. Exercises the `authorized_dataset_ids_with_roles` set-cover in the
+    /// to. Exercises the `authorized_dataset_ids_in_tenant` set-cover in the
     /// `DeleteScope::User` branch. A third, ungranted dataset must still deny.
     #[tokio::test]
     async fn authorized_delete_via_tenant_grant_user_scope() {
@@ -4068,7 +4199,7 @@ mod tests {
             memory_only: false,
         };
         let result = svc
-            .execute(&request, member)
+            .execute(&request, member, None)
             .await
             .expect("direct + tenant grants must cover every owner dataset");
         assert_eq!(result.deleted_datasets, 2);
@@ -4077,7 +4208,7 @@ mod tests {
         // check must fail even though the member still holds the others.
         seed_dataset_with_data(&db, &storage, owner, "user_ungranted").await;
         let err = svc
-            .execute(&request, member)
+            .execute(&request, member, None)
             .await
             .expect_err("an owner dataset with no grant must deny User scope");
         assert!(
@@ -4087,7 +4218,7 @@ mod tests {
     }
 
     /// Scenario: All scope; every dataset in the DB is granted to a *role*
-    /// the caller holds. Exercises `authorized_dataset_ids_with_roles` in the
+    /// the caller holds. Exercises `authorized_dataset_ids_in_tenant` in the
     /// `DeleteScope::All` branch.
     #[tokio::test]
     async fn authorized_delete_via_role_grant_all_scope() {
@@ -4129,6 +4260,7 @@ mod tests {
                     memory_only: false,
                 },
                 admin,
+                None,
             )
             .await
             .expect("role-held delete on every dataset must authorize All scope");
@@ -4182,6 +4314,7 @@ mod tests {
                     memory_only: false,
                 },
                 owner,
+                None,
             )
             .await
             .expect_err("preview should fail without permission");

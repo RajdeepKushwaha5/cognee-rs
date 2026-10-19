@@ -30,12 +30,7 @@ pub fn run(args: RememberArgs, cm: Arc<ComponentManager>) -> Result<(), CliError
     })?;
     drop(settings);
 
-    let tenant_id = args
-        .tenant_id
-        .as_deref()
-        .map(Uuid::parse_str)
-        .transpose()
-        .map_err(|error| CliError::Validation(format!("Invalid --tenant-id: {error}")))?;
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
 
     // `--no-improve` flips the default-on self-improvement (memify) pass.
     let self_improvement = !args.no_improve;

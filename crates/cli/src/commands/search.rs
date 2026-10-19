@@ -33,6 +33,8 @@ pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
         ))
     })?;
 
+    let tenant_id = crate::commands::parse_tenant_id(args.tenant_id.as_deref())?;
+
     // `--system-prompt` is inline prompt text and takes precedence over
     // `--system-prompt-path`. With neither, the orchestrator applies the
     // `default_system_prompt_path` setting (see `Settings::search_tuning`).
@@ -103,7 +105,7 @@ pub fn run(args: SearchArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
             triplet_distance_penalty: None,
             save_interaction: Some(false),
             user_id: Some(owner_id),
-            tenant_id: None,
+            tenant_id,
             verbose: None,
             feedback_influence: None,
             retriever_specific_config: None,

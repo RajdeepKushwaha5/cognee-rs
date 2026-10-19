@@ -97,6 +97,97 @@ pub async fn get_dataset_by_name(
     Ok(result)
 }
 
+/// The dataset named `name` owned by `owner_id` **in `tenant_id`**, with
+/// strict tenant equality: `None` matches only a row whose `tenant_id` is
+/// NULL. Python resolves names exactly so — the owner's datasets, filtered on
+/// name, then `dataset.tenant_id == user.tenant_id`
+/// (`cognee/modules/data/methods/get_dataset_ids.py:30-34@37f788bd2`).
+///
+/// Unlike [`get_dataset_by_name`], whose `None` applies *no* tenant predicate
+/// (and may then return either of two same-named rows), this lookup is never
+/// ambiguous: `(name, owner, tenant)` determines the deterministic dataset id.
+#[instrument(
+    name = "cognee.db.relational.datasets.get_dataset_by_name_in_tenant",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_dataset_by_name_in_tenant(
+    db: &DatabaseConnection,
+    name: &str,
+    owner_id: Uuid,
+    tenant_id: Option<Uuid>,
+) -> Result<Option<Dataset>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let q = dataset::Entity::find().filter(
+        dataset::Column::Name
+            .eq(name)
+            .and(dataset::Column::OwnerId.eq(uuid_hex::to_hex(owner_id))),
+    );
+    let q = match tenant_id {
+        Some(tid) => q.filter(dataset::Column::TenantId.eq(uuid_hex::to_hex(tid))),
+        None => q.filter(dataset::Column::TenantId.is_null()),
+    };
+    let result = q
+        .order_by_asc(dataset::Column::CreatedAt)
+        .one(db)
+        .await
+        .map_err(map_sea_err)
+        .map(|opt| opt.map(Dataset::from))?;
+    Span::current().record(
+        COGNEE_DB_ROW_COUNT,
+        if result.is_some() { 1i64 } else { 0i64 },
+    );
+    Ok(result)
+}
+
+/// The datasets among `ids` that exist, in one `IN (...)` query per 500 ids
+/// (the driver's bound-variable cap). Missing ids are skipped; the result is
+/// in `ids` order, without duplicates.
+#[instrument(
+    name = "cognee.db.relational.datasets.get_datasets_by_ids",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn get_datasets_by_ids(
+    db: &DatabaseConnection,
+    ids: &[Uuid],
+) -> Result<Vec<Dataset>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    const CHUNK: usize = 500;
+    let mut found: std::collections::HashMap<Uuid, Dataset> =
+        std::collections::HashMap::with_capacity(ids.len());
+    let hex_ids: Vec<String> = ids.iter().map(|id| uuid_hex::to_hex(*id)).collect();
+    for chunk in hex_ids.chunks(CHUNK) {
+        let rows = dataset::Entity::find()
+            .filter(dataset::Column::Id.is_in(chunk.to_vec()))
+            .all(db)
+            .await
+            .map_err(map_sea_err)?;
+        for row in rows {
+            let ds = Dataset::from(row);
+            found.insert(ds.id, ds);
+        }
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let rows: Vec<Dataset> = ids
+        .iter()
+        .filter(|id| seen.insert(**id))
+        .filter_map(|id| found.remove(id))
+        .collect();
+    Span::current().record(COGNEE_DB_ROW_COUNT, rows.len() as i64);
+    Ok(rows)
+}
+
 #[instrument(
     name = "cognee.db.relational.datasets.list_datasets_by_owner",
     level = "info",

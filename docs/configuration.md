@@ -1540,8 +1540,34 @@ What an attached `AclDb` changes for search and recall:
   rather than answered empty or across datasets the caller may not read.
   `FEEDBACK` is not dataset data and is not scoped.
 
+The per-dataset checks outside search — `DatasetManager` (`list_data`,
+`has_data`, `empty_dataset`, `delete_data`), `AuthorizedDeleteService` and
+`cognee::api::update` — use `AclDb::has_permission_in_tenant` with the caller's
+(authenticated) tenant, strict equality. A grant on another tenant's dataset is
+denied with the same error as no grant at all; under an ACL an unknown dataset
+id is denied too, never "not found". Python answers these denials with
+`PermissionDeniedError` (HTTP 403) on `list_data`, `has_data`, `empty_dataset`
+and `update`, but `delete_data` re-raises it as `UnauthorizedDataAccessError`
+(HTTP 401); the Rust layers return one permission-denied variant and leave the
+status to the HTTP layer. `DatasetManager::list_datasets` and `delete_all`
+count only grants on datasets in the caller's tenant (`delete_all` uses the
+`delete` grants and deletes each listed dataset by id), and
+`AuthorizedDeleteService`'s `DeleteScope::All` deletes the caller's
+`delete`-authorized datasets in its tenant, like Python's `datasets.delete_all`.
+
+Without an ACL, `DatasetManager::empty_dataset` / `delete_data` require the
+dataset to be the caller's and in its tenant, then delete by id; `list_data` /
+`has_data` perform no ownership or tenant check — the tenant they take is used
+only under an ACL. Every by-name dataset lookup on these paths (`update`,
+`AuthorizedDeleteService`, search names, `forget`) resolves among the owner's
+datasets in the caller's tenant, strictly, and the delete then runs by id.
+
 Without an `AclDb`, an unfiltered search stays unscoped and every type runs, as
-in Python's non-ACL mode.
+in Python's non-ACL mode. The ownership fallback that replaces the ACL — explicit
+`dataset_ids`, dataset names and `DatasetManager::list_datasets` — also keeps
+only datasets whose tenant equals the caller's: a tenant-less caller (`None`)
+sees only tenant-less datasets (Python `get_dataset_ids.py:34`,
+`get_all_user_permission_datasets.py:49-53`).
 
 > **Migrating from Python:** Python's `.env.template` ships an uncommented
 > `ENABLE_BACKEND_ACCESS_CONTROL=True`. A `.env` copied from it (cognee-rust loads

@@ -353,8 +353,10 @@ pub fn build_search_request(
         // (`ops::pipeline::opts_tenant`). One handle can therefore hold
         // same-named datasets in several tenants, so resolving a `datasets`
         // name without this predicate could pick the wrong tenant's row.
-        // Absent, it stays `None` — "no tenant filter" — which is right for
-        // the single-tenant default where every row carries `tenant_id = NULL`.
+        // Absent, it stays `None`: a tenant-less caller, which reaches only
+        // tenant-less datasets (strict equality, Python
+        // `get_all_user_permission_datasets.py:49-53@37f788bd2`) — every row
+        // in the single-tenant default carries `tenant_id = NULL`.
         tenant_id,
         verbose,
         feedback_influence: None,
@@ -771,8 +773,9 @@ mod tests {
         assert_eq!(req.tenant_id, Some(tenant), "search must scope by tenant");
     }
 
-    /// An absent `tenant` stays `None` — "no tenant filter" — which is what
-    /// the single-tenant default needs, since those rows carry a NULL tenant.
+    /// An absent `tenant` stays `None` — a tenant-less caller, which reaches
+    /// only tenant-less datasets (strict equality) — which is what the
+    /// single-tenant default needs, since those rows carry a NULL tenant.
     #[test]
     fn tenant_is_none_when_absent() {
         let opts = json!({});

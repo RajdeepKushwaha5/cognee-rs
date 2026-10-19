@@ -21,12 +21,9 @@ pub fn run(args: ForgetArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
     })?;
     drop(settings);
 
-    let _tenant_id = args
-        .tenant_id
-        .as_deref()
-        .map(Uuid::parse_str)
-        .transpose()
-        .map_err(|error| CliError::Validation(format!("Invalid --tenant-id: {error}")))?;
+    // Honoured: `--dataset-name` / `--data-id` resolve among the owner's
+    // datasets in this tenant only (strict; omit = tenant-less datasets).
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
 
     let data_id = args
         .data_id
@@ -72,6 +69,7 @@ pub fn run(args: ForgetArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
         let result = forget(
             target,
             owner_id,
+            tenant_id,
             &delete_service,
             Some(database.as_ref() as &dyn IngestDb),
         )

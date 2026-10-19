@@ -7,6 +7,7 @@
 
 use cognee_database::IngestDb;
 use cognee_delete::{DeleteMode, DeleteRequest, DeleteResult, DeleteScope, DeleteService};
+use cognee_models::Dataset;
 use uuid::Uuid;
 
 use super::error::ApiError;
@@ -26,6 +27,60 @@ pub enum DatasetRef {
 }
 
 impl DatasetRef {
+    /// Resolve this reference to the caller's dataset **in `tenant_id`**.
+    ///
+    /// - `Name`: the owner's dataset with that name whose tenant equals
+    ///   `tenant_id` — strict, `None` matches only a tenant-less row (Python
+    ///   `get_dataset_ids.py:30-34`, `get_authorized_dataset_by_name.py:23-25`
+    ///   @37f788bd2). A same-named dataset in another tenant never resolves.
+    /// - `Id`: the dataset must exist, be owned by `owner_id` and be in
+    ///   `tenant_id`.
+    ///
+    /// # Errors
+    /// [`ApiError::InvalidArgument`] when `db` is `None`, or when no such
+    /// dataset exists for this owner in this tenant.
+    pub async fn resolve(
+        &self,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+        db: Option<&dyn IngestDb>,
+    ) -> Result<Dataset, ApiError> {
+        let db = db.ok_or_else(|| {
+            ApiError::InvalidArgument(
+                "db connection required to resolve a dataset reference".to_string(),
+            )
+        })?;
+        match self {
+            DatasetRef::Name(name) => db
+                .get_dataset_by_name_in_tenant(name, owner_id, tenant_id)
+                .await
+                .map_err(|e| {
+                    ApiError::InvalidArgument(format!("Dataset '{name}' lookup failed: {e}"))
+                })?
+                .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset '{name}' not found"))),
+            DatasetRef::Id(id) => {
+                let dataset = db
+                    .get_dataset(*id)
+                    .await
+                    .map_err(|e| {
+                        ApiError::InvalidArgument(format!("Dataset {id} lookup failed: {e}"))
+                    })?
+                    .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset {id} not found")))?;
+                if dataset.owner_id != owner_id {
+                    return Err(ApiError::InvalidArgument(format!(
+                        "Dataset {id} not owned by the requesting user"
+                    )));
+                }
+                if dataset.tenant_id != tenant_id {
+                    return Err(ApiError::InvalidArgument(format!(
+                        "Dataset {id} not found in the caller's tenant"
+                    )));
+                }
+                Ok(dataset)
+            }
+        }
+    }
+
     /// Resolve this reference to a dataset name, performing a reverse lookup
     /// via [`IngestDb::get_dataset`] when the reference is a UUID.
     ///
@@ -92,10 +147,16 @@ pub struct ForgetResult {
 /// # Arguments
 /// * `target` - What to delete (item, dataset, or everything).
 /// * `owner_id` - The owner whose data is affected.
+/// * `tenant_id` - The caller's tenant. Dataset references resolve only
+///   among the owner's datasets in this tenant (strict, `None` ⇔ tenant-less;
+///   see [`DatasetRef::resolve`]) and are then deleted **by id**, so a
+///   same-named dataset in another tenant is never touched.
+///   [`ForgetTarget::All`] is not tenant-scoped yet (owner-wide
+///   `DeleteScope::User`; S2).
 /// * `delete_service` - Pre-configured [`DeleteService`] with all backends.
-/// * `db` - Database connection for name-to-ID resolution. Required when
-///   `target` references a dataset by [`DatasetRef::Id`]; optional otherwise
-///   (used for dataset existence validation when resolving by name).
+/// * `db` - Database connection for dataset resolution. Required for every
+///   target that references a dataset (by name or id); unused by
+///   [`ForgetTarget::All`].
 ///
 /// # Errors
 /// Returns [`ApiError::InvalidArgument`] if the dataset cannot be found,
@@ -103,6 +164,7 @@ pub struct ForgetResult {
 pub async fn forget(
     target: ForgetTarget,
     owner_id: Uuid,
+    tenant_id: Option<Uuid>,
     delete_service: &DeleteService,
     db: Option<&dyn IngestDb>,
 ) -> Result<ForgetResult, ApiError> {
@@ -139,53 +201,33 @@ pub async fn forget(
 
     let (scope, memory_only, label) = match target {
         ForgetTarget::Item { data_id, dataset } => {
-            let dataset_name = dataset.to_name(owner_id, db).await?;
-            let scope = DeleteScope::Data {
-                owner_id,
+            let ds = dataset.resolve(owner_id, tenant_id, db).await?;
+            let scope = DeleteScope::DataInDataset {
+                dataset_id: ds.id,
                 data_id,
-                dataset_name: Some(dataset_name),
                 delete_dataset_if_empty: false,
             };
             (scope, false, format!("item:{data_id}"))
         }
         ForgetTarget::Dataset { dataset } => {
-            let dataset_name = dataset.to_name(owner_id, db).await?;
-            // Validate dataset exists if we have a DB connection and the
-            // reference came in as a name (UUID path already validated above).
-            if let Some(db) = db {
-                let _dataset = db
-                    .get_dataset_by_name(&dataset_name, owner_id, None)
-                    .await
-                    .map_err(|e| {
-                        ApiError::InvalidArgument(format!(
-                            "Dataset '{dataset_name}' not found: {e}"
-                        ))
-                    })?;
-            }
-            let scope = DeleteScope::Dataset {
-                owner_id,
-                dataset_name: dataset_name.clone(),
-            };
-            (scope, false, format!("dataset:{dataset_name}"))
+            let ds = dataset.resolve(owner_id, tenant_id, db).await?;
+            let scope = DeleteScope::DatasetById { dataset_id: ds.id };
+            (scope, false, format!("dataset:{}", ds.name))
         }
         ForgetTarget::All => {
             let scope = DeleteScope::User { owner_id };
             (scope, false, "all".to_string())
         }
         ForgetTarget::DatasetMemoryOnly { dataset } => {
-            let dataset_name = dataset.to_name(owner_id, db).await?;
-            let scope = DeleteScope::Dataset {
-                owner_id,
-                dataset_name: dataset_name.clone(),
-            };
-            (scope, true, format!("dataset_memory_only:{dataset_name}"))
+            let ds = dataset.resolve(owner_id, tenant_id, db).await?;
+            let scope = DeleteScope::DatasetById { dataset_id: ds.id };
+            (scope, true, format!("dataset_memory_only:{}", ds.name))
         }
         ForgetTarget::DataItemMemoryOnly { data_id, dataset } => {
-            let dataset_name = dataset.to_name(owner_id, db).await?;
-            let scope = DeleteScope::Data {
-                owner_id,
+            let ds = dataset.resolve(owner_id, tenant_id, db).await?;
+            let scope = DeleteScope::DataInDataset {
+                dataset_id: ds.id,
                 data_id,
-                dataset_name: Some(dataset_name),
                 delete_dataset_if_empty: false,
             };
             (scope, true, format!("data_item_memory_only:{data_id}"))

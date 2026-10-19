@@ -27,22 +27,26 @@ use uuid::Uuid;
 /// [`MockAclDb::add_user_to_role`] record which tenants a user belongs to
 /// and which roles it holds. The plain `has_permission` /
 /// `authorized_dataset_ids` consult only rows whose `principal_id` is the
-/// caller itself; the `_with_roles` variants additionally consult rows
-/// granted to any tenant or role the caller is a member of. A test that
-/// grants `delete` to a *role* and then calls a code path as a *user*
-/// therefore passes only if that path uses the roles-aware variant — which
-/// is the property the mock exists to make testable.
+/// caller itself; [`AclDb::authorized_dataset_ids_with_roles`],
+/// [`AclDb::authorized_dataset_ids_in_tenant`] and
+/// [`AclDb::has_permission_in_tenant`] (not overridden here, so the trait's
+/// default body is what tests exercise) additionally consult rows granted to
+/// any tenant or role the caller is a member of. A test that grants `delete`
+/// to a *role* and then calls a code path as a *user* therefore passes only
+/// if that path uses a roles-aware method — which is the property the mock
+/// exists to make testable.
 ///
 /// Divergences from Python `get_all_user_permission_datasets` that this
 /// mock does **not** model (it has no dataset table or user table):
 /// - Python only walks roles inside the tenant loop, so a user with zero
 ///   tenants gets no role grants at all. Here role membership counts on
 ///   its own.
-/// - Python drops every result whose `dataset.tenant_id != user.tenant_id`.
-///   The mock has no dataset rows: [`AclDb::authorized_dataset_ids_in_tenant`]
-///   applies that filter against tenants registered with
-///   [`MockAclDb::set_dataset_tenant`]; a dataset never registered has no
-///   tenant. The other methods apply no tenant filter.
+/// - Python drops every result whose `dataset.tenant_id != user.tenant_id`
+///   (`get_all_user_permission_datasets.py:49-53@37f788bd2`). The mock has no
+///   dataset rows: [`AclDb::authorized_dataset_ids_in_tenant`] (and so
+///   [`AclDb::has_permission_in_tenant`]) applies that filter against tenants
+///   registered with [`MockAclDb::set_dataset_tenant`]; a dataset never
+///   registered has no tenant. The other methods ignore dataset tenants.
 pub struct MockAclDb {
     /// Set of granted permissions: (principal_id, dataset_id, permission_name).
     grants: Mutex<HashSet<(Uuid, Uuid, String)>>,
@@ -201,8 +205,9 @@ impl MockAclDb {
     ///
     /// Grants made to `tenant_id` (via [`AclDb::grant_permission`] with the
     /// tenant id as the principal) become visible to `user_id` through the
-    /// `_with_roles` variants only. Also registers `tenant_id` as a
-    /// `"tenant"` principal.
+    /// roles-aware methods only (`authorized_dataset_ids_with_roles`,
+    /// `authorized_dataset_ids_in_tenant`, `has_permission_in_tenant`). Also
+    /// registers `tenant_id` as a `"tenant"` principal.
     pub fn add_user_to_tenant(&self, user_id: Uuid, tenant_id: Uuid) {
         {
             let mut principals = self.principals.lock().unwrap(); // lock poison is unrecoverable
@@ -212,15 +217,10 @@ impl MockAclDb {
         memberships.entry(user_id).or_default().insert(tenant_id);
     }
 
-    /// Record that `user_id` holds `role_id`.
-    ///
-    /// Grants made to `role_id` (via [`AclDb::grant_permission`] with the
-    /// role id as the principal) become visible to `user_id` through the
-    /// `_with_roles` variants only. Also registers `role_id` as a `"role"`
-    /// principal.
     /// Record that `dataset_id` belongs to `tenant_id`, for
-    /// [`AclDb::authorized_dataset_ids_in_tenant`]. Datasets never registered
-    /// have no tenant.
+    /// [`AclDb::authorized_dataset_ids_in_tenant`] and
+    /// [`AclDb::has_permission_in_tenant`]. Datasets never registered have no
+    /// tenant.
     pub fn set_dataset_tenant(&self, dataset_id: Uuid, tenant_id: Uuid) {
         self.dataset_tenants
             .lock()
@@ -228,6 +228,12 @@ impl MockAclDb {
             .insert(dataset_id, tenant_id);
     }
 
+    /// Record that `user_id` holds `role_id`.
+    ///
+    /// Grants made to `role_id` (via [`AclDb::grant_permission`] with the
+    /// role id as the principal) become visible to `user_id` through the
+    /// roles-aware methods only. Also registers `role_id` as a `"role"`
+    /// principal.
     pub fn add_user_to_role(&self, user_id: Uuid, role_id: Uuid) {
         {
             let mut principals = self.principals.lock().unwrap(); // lock poison is unrecoverable
@@ -356,19 +362,6 @@ impl AclDb for MockAclDb {
         Ok(())
     }
 
-    async fn has_permission_with_roles(
-        &self,
-        user_id: Uuid,
-        dataset_id: Uuid,
-        permission_name: &str,
-    ) -> Result<bool, DatabaseError> {
-        let principals = self.inherited_principals(user_id);
-        let grants = self.grants.lock().unwrap(); // lock poison is unrecoverable
-        Ok(principals
-            .iter()
-            .any(|pid| grants.contains(&(*pid, dataset_id, permission_name.to_string()))))
-    }
-
     async fn authorized_dataset_ids_with_roles(
         &self,
         user_id: Uuid,
@@ -411,9 +404,10 @@ mod tests {
     use super::*;
 
     /// The property every consumer test relies on: a grant to a role or a
-    /// tenant is visible to a member only through the `_with_roles`
-    /// variants. If this ever regresses to delegation, tests that switch a
-    /// call site from the plain variant become vacuous.
+    /// tenant is visible to a member only through the roles-aware methods
+    /// (`authorized_dataset_ids_with_roles`, `has_permission_in_tenant`). If
+    /// this ever regresses to delegation, tests that switch a call site from
+    /// the plain variant become vacuous.
     #[tokio::test]
     async fn with_roles_variants_see_role_and_tenant_grants_plain_ones_do_not() {
         let acl = MockAclDb::new();
@@ -443,17 +437,17 @@ mod tests {
 
         // Roles-aware: direct ∪ tenant ∪ role.
         assert!(
-            acl.has_permission_with_roles(user, direct, "read")
+            acl.has_permission_in_tenant(user, direct, "read", None)
                 .await
                 .unwrap()
         );
         assert!(
-            acl.has_permission_with_roles(user, via_role, "read")
+            acl.has_permission_in_tenant(user, via_role, "read", None)
                 .await
                 .unwrap()
         );
         assert!(
-            acl.has_permission_with_roles(user, via_tenant, "read")
+            acl.has_permission_in_tenant(user, via_tenant, "read", None)
                 .await
                 .unwrap()
         );
@@ -486,7 +480,7 @@ mod tests {
         acl.grant_permission(role, via_role, "read").await.unwrap();
 
         assert!(
-            !acl.has_permission_with_roles(tenantless, via_role, "read")
+            !acl.has_permission_in_tenant(tenantless, via_role, "read", None)
                 .await
                 .unwrap(),
             "a role grant must not reach a user who belongs to no tenant"
@@ -502,7 +496,7 @@ mod tests {
         // Joining any tenant activates the role the user already held.
         acl.add_user_to_tenant(tenantless, Uuid::new_v4());
         assert!(
-            acl.has_permission_with_roles(tenantless, via_role, "read")
+            acl.has_permission_in_tenant(tenantless, via_role, "read", None)
                 .await
                 .unwrap(),
             "once the user is in a tenant, the role grant applies"
@@ -528,20 +522,20 @@ mod tests {
         // The grant that does exist is visible — this is what makes the
         // negatives below meaningful rather than vacuous.
         assert!(
-            acl.has_permission_with_roles(member, ds, "delete")
+            acl.has_permission_in_tenant(member, ds, "delete", None)
                 .await
                 .unwrap()
         );
         // Wrong permission name on the same role grant does not count.
         assert!(
-            !acl.has_permission_with_roles(member, ds, "read")
+            !acl.has_permission_in_tenant(member, ds, "read", None)
                 .await
                 .unwrap()
         );
         // A user who does not hold the role gets nothing from it, even though
         // they too belong to a tenant.
         assert!(
-            !acl.has_permission_with_roles(stranger, ds, "delete")
+            !acl.has_permission_in_tenant(stranger, ds, "delete", None)
                 .await
                 .unwrap()
         );
@@ -608,5 +602,155 @@ mod tests {
                 .unwrap(),
             vec![untenanted]
         );
+    }
+
+    /// W1: a grant on a dataset that lives in another tenant does not admit
+    /// the per-id check — for every permission type — exactly like Python's
+    /// `get_specific_user_permission_datasets` intersecting with the
+    /// tenant-filtered set (`get_specific_user_permission_datasets.py:27-38`,
+    /// `get_all_user_permission_datasets.py:49-53` @37f788bd2).
+    #[tokio::test]
+    async fn tenant_point_check_denies_a_grant_on_another_tenants_dataset() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let ds = Uuid::new_v4();
+        acl.set_dataset_tenant(ds, t2);
+        for perm in ["read", "write", "delete"] {
+            acl.grant_permission(user, ds, perm).await.unwrap();
+            assert!(
+                !acl.has_permission_in_tenant(user, ds, perm, Some(t1))
+                    .await
+                    .unwrap(),
+                "{perm}: a grant in T2 must not admit a T1 caller"
+            );
+            assert!(
+                !acl.has_permission_in_tenant(user, ds, perm, None)
+                    .await
+                    .unwrap(),
+                "{perm}: a grant in T2 must not admit a tenant-less caller"
+            );
+            assert!(
+                acl.has_permission_in_tenant(user, ds, perm, Some(t2))
+                    .await
+                    .unwrap(),
+                "{perm}: the same grant admits a T2 caller"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_point_check_reaches_role_and_tenant_grants_in_the_same_tenant() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let role = Uuid::new_v4();
+        let via_role = Uuid::new_v4();
+        let via_tenant = Uuid::new_v4();
+        acl.add_user_to_tenant(user, t1);
+        acl.add_user_to_role(user, role);
+        acl.set_dataset_tenant(via_role, t1);
+        acl.set_dataset_tenant(via_tenant, t1);
+        acl.grant_permission(role, via_role, "read").await.unwrap();
+        acl.grant_permission(t1, via_tenant, "read").await.unwrap();
+
+        for ds in [via_role, via_tenant] {
+            assert!(
+                acl.has_permission_in_tenant(user, ds, "read", Some(t1))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !acl.has_permission_in_tenant(user, ds, "read", Some(t2))
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    /// `None` ⇔ NULL: a tenant-less caller reaches only tenant-less datasets
+    /// (`dataset.tenant_id == user.tenant_id` with both `None`,
+    /// `get_all_user_permission_datasets.py:49-53@37f788bd2`).
+    #[tokio::test]
+    async fn tenantless_point_check_admits_only_tenantless_datasets() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let untenanted = Uuid::new_v4();
+        let tenanted = Uuid::new_v4();
+        acl.set_dataset_tenant(tenanted, t1);
+        acl.grant_permission(user, untenanted, "read")
+            .await
+            .unwrap();
+        acl.grant_permission(user, tenanted, "read").await.unwrap();
+
+        assert!(
+            acl.has_permission_in_tenant(user, untenanted, "read", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !acl.has_permission_in_tenant(user, tenanted, "read", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !acl.has_permission_in_tenant(user, untenanted, "read", Some(t1))
+                .await
+                .unwrap()
+        );
+        assert!(
+            acl.has_permission_in_tenant(user, tenanted, "read", Some(t1))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The default point check is defined as membership in the tenant
+    /// listing; pin that they agree on a mixed fixture, unknown ids included.
+    #[tokio::test]
+    async fn point_check_agrees_with_the_tenant_listing() {
+        let acl = MockAclDb::new();
+        let user = Uuid::new_v4();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+        let role = Uuid::new_v4();
+        acl.add_user_to_tenant(user, t1);
+        acl.add_user_to_role(user, role);
+
+        let direct_t1 = Uuid::new_v4();
+        let role_t2 = Uuid::new_v4();
+        let tenant_null = Uuid::new_v4();
+        let ungranted_t1 = Uuid::new_v4();
+        let unknown = Uuid::new_v4();
+        acl.set_dataset_tenant(direct_t1, t1);
+        acl.set_dataset_tenant(role_t2, t2);
+        acl.set_dataset_tenant(ungranted_t1, t1);
+        acl.grant_permission(user, direct_t1, "read").await.unwrap();
+        acl.grant_permission(role, role_t2, "read").await.unwrap();
+        acl.grant_permission(t1, tenant_null, "read").await.unwrap();
+
+        for tenant in [None, Some(t1), Some(t2)] {
+            let listed = acl
+                .authorized_dataset_ids_in_tenant(user, "read", tenant)
+                .await
+                .unwrap();
+            for ds in [direct_t1, role_t2, tenant_null, ungranted_t1, unknown] {
+                assert_eq!(
+                    acl.has_permission_in_tenant(user, ds, "read", tenant)
+                        .await
+                        .unwrap(),
+                    listed.contains(&ds),
+                    "point check and listing disagree for {ds} in {tenant:?}"
+                );
+            }
+            assert!(
+                !acl.has_permission_in_tenant(user, unknown, "read", tenant)
+                    .await
+                    .unwrap()
+            );
+        }
     }
 }

@@ -590,6 +590,12 @@ pub struct SearchArgs {
     /// waiting out its time floor.
     #[arg(long = "llm-max-retries", value_parser = clap::value_parser!(u32).range(0..))]
     pub llm_max_retries: Option<u32>,
+
+    /// Tenant to search as. Datasets are matched by strict tenant equality:
+    /// data added with `--tenant-id T` is found only with `--tenant-id T`;
+    /// without the flag only tenant-less data is reachable.
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Arguments for `cognee-cli remember` — one-call store (add + cognify + improve).
@@ -646,6 +652,10 @@ pub struct RecallArgs {
 
     #[arg(long = "output-format", short = 'f', default_value = "pretty")]
     pub output_format: OutputFormatArg,
+
+    /// Tenant to recall as (strict tenant equality, as for `search`).
+    #[arg(long = "tenant-id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Arguments for `cognee-cli forget` — remove memory.
@@ -852,6 +862,32 @@ mod tests {
         lower_logging_settings(&mut cfg, &Settings::default());
         assert_eq!(cfg.level_filter, None);
         assert_eq!(cfg.logs_dir_override, None);
+    }
+
+    /// `--tenant-id` reaches `search` and `recall` (symmetric with `add` /
+    /// `remember` / `improve`), so CLI-written tenanted data stays readable
+    /// under strict tenant matching.
+    #[test]
+    fn tenant_id_is_accepted_by_search_and_recall() {
+        let t = "6f1c2f8e-6a59-4a39-9f0e-3c1d6c1b2a10";
+        match parse(&["cognee-cli", "search", "q", "--tenant-id", t]).command {
+            Commands::Search(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected search, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "recall", "q", "--tenant-id", t]).command {
+            Commands::Recall(args) => assert_eq!(args.tenant_id.as_deref(), Some(t)),
+            other => panic!("expected recall, got {other:?}"),
+        }
+        match parse(&["cognee-cli", "search", "q"]).command {
+            Commands::Search(args) => assert_eq!(args.tenant_id, None),
+            other => panic!("expected search, got {other:?}"),
+        }
+        assert_eq!(
+            crate::commands::parse_tenant_id(Some(t)).unwrap(),
+            Some(uuid::Uuid::parse_str(t).unwrap())
+        );
+        assert_eq!(crate::commands::parse_tenant_id(None).unwrap(), None);
+        assert!(crate::commands::parse_tenant_id(Some("not-a-uuid")).is_err());
     }
 
     /// The regression this guards: the flag parsed fine before SDK-511 and was

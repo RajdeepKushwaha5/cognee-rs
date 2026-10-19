@@ -138,9 +138,17 @@ pub async fn forget(
 
     let db_ref: &dyn IngestDb = svc.database.as_ref();
 
-    let result = cognee_forget(target, owner_id, svc.delete_service.as_ref(), Some(db_ref))
-        .await
-        .map_err(|e| SdkError::Runtime(format!("forget failed: {e}")))?;
+    // The handle user is tenant-less (`None`): dataset references resolve
+    // among tenant-less datasets only (strict, Python D4).
+    let result = cognee_forget(
+        target,
+        owner_id,
+        state.tenant_id(),
+        svc.delete_service.as_ref(),
+        Some(db_ref),
+    )
+    .await
+    .map_err(|e| SdkError::Runtime(format!("forget failed: {e}")))?;
 
     let delete_result_json = serde_json::to_value(&result.delete_result)
         .map_err(|e| SdkError::Runtime(format!("failed to serialize DeleteResult: {e}")))?;
