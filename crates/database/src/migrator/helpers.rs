@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, QueryResult, Statement, Value};
 use sea_orm_migration::prelude::*;
 
 /// Does `table` already have `column`?
@@ -26,32 +26,135 @@ pub(super) async fn has_column(
             )));
         }
     };
-    let row = manager
-        .get_connection()
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            sql,
-            [table.into(), column.into()],
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("column-existence probe returned no row".to_owned()))?;
+    let row = probe_row(manager, &sql, [table.into(), column.into()]).await?;
     Ok(row.try_get::<i64>("", "cnt")? > 0)
 }
 
-/// Add `column` to `table` unless it already exists.
+/// Add `column` to `table`, or check that an existing one matches it.
 pub(super) async fn add_column_if_missing(
     manager: &SchemaManager<'_>,
     table: &str,
     mut column: ColumnDef,
 ) -> Result<(), DbErr> {
     if has_column(manager, table, &column.get_column_name()).await? {
-        return Ok(());
+        return ensure_column_matches(manager, table, &column).await;
     }
     let alter = Table::alter()
         .table(Alias::new(table))
         .add_column(&mut column)
         .to_owned();
     manager.alter_table(alter).await
+}
+
+/// Fail unless `table`'s existing column has `expected`'s nullability and, on
+/// Postgres, its type. SQLite types are not compared: SQLite does not enforce
+/// them, and other writers name them differently (`CHAR(32)` for `text`).
+async fn ensure_column_matches(
+    manager: &SchemaManager<'_>,
+    table: &str,
+    expected: &ColumnDef,
+) -> Result<(), DbErr> {
+    let column = expected.get_column_name();
+    let not_null = declares_not_null(expected);
+    if column_is_not_null(manager, table, &column).await? != not_null {
+        let wanted = if not_null { "NOT NULL" } else { "nullable" };
+        return Err(DbErr::Custom(format!(
+            "column {table}.{column} exists but is not {wanted}"
+        )));
+    }
+    if manager.get_database_backend() == DbBackend::Postgres {
+        ensure_postgres_type(manager, table, expected).await?;
+    }
+    Ok(())
+}
+
+/// Does `column` declare `NOT NULL`, directly or as a primary key?
+fn declares_not_null(column: &ColumnDef) -> bool {
+    column
+        .get_column_spec()
+        .iter()
+        .any(|spec| matches!(spec, ColumnSpec::NotNull | ColumnSpec::PrimaryKey))
+}
+
+/// Is `table`'s existing `column` declared `NOT NULL`?
+async fn column_is_not_null(
+    manager: &SchemaManager<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool, DbErr> {
+    let sql = match manager.get_database_backend() {
+        DbBackend::Sqlite => {
+            "SELECT \"notnull\" <> 0 AS not_null FROM pragma_table_info(?) WHERE name = ?"
+        }
+        DbBackend::Postgres => {
+            "SELECT is_nullable = 'NO' AS not_null \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2"
+        }
+        other => {
+            return Err(DbErr::Custom(format!(
+                "nullability probe does not support the {other:?} backend"
+            )));
+        }
+    };
+    let row = probe_row(manager, sql, [table.into(), column.into()]).await?;
+    row.try_get::<bool>("", "not_null")
+}
+
+/// Run a schema probe that returns exactly one row.
+async fn probe_row(
+    manager: &SchemaManager<'_>,
+    sql: &str,
+    values: impl IntoIterator<Item = Value>,
+) -> Result<QueryResult, DbErr> {
+    let statement = Statement::from_sql_and_values(manager.get_database_backend(), sql, values);
+    manager
+        .get_connection()
+        .query_one(statement)
+        .await?
+        .ok_or_else(|| DbErr::Custom(format!("schema probe returned no row: {sql}")))
+}
+
+/// Fail unless `table`'s existing Postgres column has `expected`'s base type,
+/// ignoring modifiers such as a `varchar` length.
+async fn ensure_postgres_type(
+    manager: &SchemaManager<'_>,
+    table: &str,
+    expected: &ColumnDef,
+) -> Result<(), DbErr> {
+    let column = expected.get_column_name();
+    let expected_type = postgres_type(expected)?;
+    let sql = "SELECT format_type(a.atttypid, a.atttypmod) AS actual, \
+         a.atttypid = CAST(CAST($3 AS text) AS regtype) AS matches \
+         FROM pg_attribute a \
+         WHERE a.attrelid = to_regclass(quote_ident($1)) AND a.attname = $2 \
+         AND NOT a.attisdropped";
+    let values = [
+        table.into(),
+        column.as_str().into(),
+        expected_type.as_str().into(),
+    ];
+    let row = probe_row(manager, sql, values).await?;
+    if !row.try_get::<bool>("", "matches")? {
+        let actual: String = row.try_get("", "actual")?;
+        return Err(DbErr::Custom(format!(
+            "column {table}.{column} exists as {actual}, not {expected_type}"
+        )));
+    }
+    Ok(())
+}
+
+/// `column`'s type as Postgres DDL spells it, e.g. `timestamp with time zone`.
+fn postgres_type(column: &ColumnDef) -> Result<String, DbErr> {
+    let column_type = column.get_column_type().ok_or_else(|| {
+        DbErr::Custom(format!(
+            "column {} declares no type",
+            column.get_column_name()
+        ))
+    })?;
+    let mut sql = String::new();
+    PostgresQueryBuilder.prepare_column_type(column_type, &mut sql);
+    Ok(sql)
 }
 
 /// Drop `column` from `table` if it exists.
@@ -139,6 +242,32 @@ mod tests {
                 .await
                 .expect("probe runs")
         );
+    }
+
+    #[tokio::test]
+    async fn add_column_if_missing_rejects_other_nullability() {
+        let db = db_with_table().await;
+        let manager = SchemaManager::new(&db);
+        let column = ColumnDef::new(Alias::new("id"))
+            .text()
+            .not_null()
+            .to_owned();
+
+        let error = add_column_if_missing(&manager, "t", column)
+            .await
+            .expect_err("a nullable `id` does not match NOT NULL");
+        assert!(error.to_string().contains("t.id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn add_column_if_missing_ignores_sqlite_types() {
+        let db = db_with_table().await;
+        let manager = SchemaManager::new(&db);
+        let column = ColumnDef::new(Alias::new("id")).integer().null().to_owned();
+
+        add_column_if_missing(&manager, "t", column)
+            .await
+            .expect("SQLite column types are not compared");
     }
 
     #[tokio::test]
