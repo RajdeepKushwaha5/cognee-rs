@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use cognee_models::{Data, Dataset};
 use cognee_utils::tracing_keys::{COGNEE_DB_ROW_COUNT, COGNEE_DB_SYSTEM};
 use sea_orm::{
@@ -85,6 +85,62 @@ pub async fn update_data(db: &DatabaseConnection, d: Data) -> Result<Data, Datab
     model.updated_at = Set(Some(Utc::now()));
     model.update(db).await.map_err(map_sea_err)?;
     Ok(d)
+}
+
+/// Update only the `node_set` and `external_metadata` columns of a Data
+/// record, stamping `updated_at`.
+///
+/// This is the re-add refresh of the ingest pipeline (Python's `ingest_data`
+/// update branch rewrites those two fields on a re-add of stored content). It
+/// is one targeted `UPDATE` rather than a full-row write from a snapshot so a
+/// `token_count`, `last_accessed` or `pipeline_status` written by a concurrent
+/// cognify or search between the pipeline's read and this write survives.
+///
+/// Returns the `updated_at` it wrote, so a caller holding the row it read
+/// before can patch that snapshot instead of reading the row back: the
+/// timestamp is truncated to microseconds, the finest precision every
+/// supported store keeps, so the returned value equals what a later read
+/// returns. (`UPDATE ... RETURNING` would serve the same purpose, but sea-orm
+/// only issues it on SQLite behind its `sqlite-use-returning-for-3_35`
+/// feature — which would switch every SQLite insert to RETURNING too — and
+/// panics with `unimplemented!` without it.)
+///
+/// Returns [`DatabaseError::NotFound`] when no row has `data_id`, like
+/// [`update_data_token_count`].
+#[instrument(
+    name = "cognee.db.relational.data.update_data_node_set",
+    level = "info",
+    skip_all,
+    fields(cognee.db.system = tracing::field::Empty),
+    err,
+)]
+pub async fn update_data_node_set(
+    db: &DatabaseConnection,
+    data_id: Uuid,
+    node_set: Option<&str>,
+    external_metadata: Option<&str>,
+) -> Result<DateTime<Utc>, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let updated_at = Utc::now().trunc_subsecs(6);
+    let result = data::Entity::update_many()
+        .col_expr(
+            data::Column::NodeSet,
+            Expr::value(node_set.map(str::to_owned)),
+        )
+        .col_expr(
+            data::Column::ExternalMetadata,
+            Expr::value(external_metadata.map(str::to_owned)),
+        )
+        .col_expr(data::Column::UpdatedAt, Expr::value(Some(updated_at)))
+        .filter(data::Column::Id.eq(uuid_hex::to_hex(data_id)))
+        .exec(db)
+        .await
+        .map_err(map_sea_err)?;
+
+    if result.rows_affected == 0 {
+        return Err(DatabaseError::NotFound(format!("Data {data_id} not found")));
+    }
+    Ok(updated_at)
 }
 
 #[instrument(
