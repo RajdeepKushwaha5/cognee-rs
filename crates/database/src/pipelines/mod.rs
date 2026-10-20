@@ -3,5 +3,8 @@ pub mod repository;
 pub mod sea_orm_impl;
 
 pub use noop::NoopPipelineRunRepository;
-pub use repository::{PipelineRunClaim, PipelineRunRepository, PipelineRunWithAttributionRow};
+pub use repository::{
+    PipelineRunClaim, PipelineRunEntry, PipelineRunListQuery, PipelineRunRepository,
+    PipelineRunVisibility, PipelineRunWithAttributionRow,
+};
 pub use sea_orm_impl::SeaOrmPipelineRunRepository;

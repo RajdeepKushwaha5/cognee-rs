@@ -30,6 +30,11 @@ pub struct Model {
     pub dataset_id: Option<String>,
     #[sea_orm(column_type = "Json", nullable)]
     pub run_info: Option<Json>,
+    /// The user who triggered the run (uuid hex), `NULL` for rows written
+    /// before the column existed and for system writes (Python
+    /// `PipelineRun.user_id`, `models/PipelineRun.py:73@37f788bd2`).
+    #[sea_orm(indexed, nullable)]
+    pub user_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

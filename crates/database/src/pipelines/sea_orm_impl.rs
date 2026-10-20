@@ -6,8 +6,8 @@ use chrono::Utc;
 use cognee_utils::sanitize::sanitize_json;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, RelationTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, JoinType,
+    QueryFilter, QueryOrder, QuerySelect, RelationTrait,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -18,7 +18,35 @@ use crate::pipelines::repository::PipelineRunClaim;
 use crate::types::{DatabaseError, PipelineRun, PipelineRunStatus};
 use crate::uuid_hex;
 
-use super::repository::{PipelineRunRepository, PipelineRunRow, PipelineRunWithAttributionRow};
+use super::repository::{
+    PipelineRunEntry, PipelineRunListQuery, PipelineRunRepository, PipelineRunRow,
+    PipelineRunWithAttributionRow,
+};
+
+/// Bound parameters [`PipelineRunRepository::list_runs`] puts into **one**
+/// statement for its visibility lists. SQLite (≥ 3.32) accepts 32 766 binds
+/// per statement and Postgres 65 535; this leaves headroom for the few other
+/// binds of the statement (dataset, pipeline name, limit, offset).
+pub const LIST_RUNS_MAX_BINDS: usize = 30_000;
+
+/// Largest `offset + limit` the listing serves once the visibility lists no
+/// longer fit one statement: each chunked statement then fetches that many
+/// rows to merge, so the window bounds the memory a single request can pin.
+pub const LIST_RUNS_CHUNKED_WINDOW: u64 = 5_000;
+
+/// A row of the runs projection, before conversion.
+type RawRunRow = (
+    String,
+    chrono::DateTime<Utc>,
+    pipeline_run::PipelineRunStatus,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// SeaORM-backed implementation of [`PipelineRunRepository`].
 ///
@@ -28,6 +56,8 @@ use super::repository::{PipelineRunRepository, PipelineRunRow, PipelineRunWithAt
 /// requirement.
 pub struct SeaOrmPipelineRunRepository {
     db: Arc<DatabaseConnection>,
+    /// See [`Self::with_list_bind_limit`].
+    list_bind_limit: usize,
 }
 
 impl SeaOrmPipelineRunRepository {
@@ -117,7 +147,109 @@ impl SeaOrmPipelineRunRepository {
 
     /// Create a new repository backed by the given database connection.
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            list_bind_limit: LIST_RUNS_MAX_BINDS,
+        }
+    }
+
+    /// Override [`LIST_RUNS_MAX_BINDS`], the visibility binds
+    /// [`PipelineRunRepository::list_runs`] puts into one statement before it
+    /// switches to the chunked path (at least 1). Lower it for a backend
+    /// built with a smaller bind limit, or to exercise the chunked path in
+    /// tests.
+    pub fn with_list_bind_limit(mut self, binds: usize) -> Self {
+        self.list_bind_limit = binds.max(1);
+        self
+    }
+
+    /// One statement of the runs projection (`pipeline_runs` LEFT JOIN
+    /// `datasets`), newest first with `id` breaking `created_at` ties (Python
+    /// `get_activity_router.py:164-167@37f788bd2`: without the tie-break,
+    /// OFFSET paging re-serves rows sharing a timestamp).
+    async fn fetch_runs(
+        &self,
+        dataset_id: Option<Uuid>,
+        pipeline_name: Option<&str>,
+        visibility: Option<Condition>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<PipelineRunWithAttributionRow>, DatabaseError> {
+        // The `users` table is not part of this schema: `owner_email` is
+        // always `None`, and callers resolve emails out of band.
+        let mut query = pipeline_run::Entity::find()
+            .select_only()
+            .column(pipeline_run::Column::Id)
+            .column(pipeline_run::Column::CreatedAt)
+            .column(pipeline_run::Column::Status)
+            .column(pipeline_run::Column::PipelineRunId)
+            .column(pipeline_run::Column::PipelineName)
+            .column(pipeline_run::Column::PipelineId)
+            .column(pipeline_run::Column::DatasetId)
+            .column_as(dataset::Column::Name, "dataset_name")
+            .column_as(dataset::Column::OwnerId, "dataset_owner_id")
+            .column(pipeline_run::Column::UserId)
+            .join(JoinType::LeftJoin, pipeline_run::Relation::Dataset.def())
+            .order_by_desc(pipeline_run::Column::CreatedAt)
+            .order_by_desc(pipeline_run::Column::Id)
+            .limit(limit);
+        if offset > 0 {
+            query = query.offset(offset);
+        }
+        if let Some(did) = dataset_id {
+            query = query.filter(pipeline_run::Column::DatasetId.eq(uuid_hex::to_hex(did)));
+        }
+        if let Some(name) = pipeline_name {
+            query = query.filter(pipeline_run::Column::PipelineName.eq(name));
+        }
+        if let Some(condition) = visibility {
+            query = query.filter(condition);
+        }
+
+        let raw: Vec<RawRunRow> = query
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| DatabaseError::QueryError(format!("pipeline-runs listing failed: {e}")))?;
+
+        let mut rows = Vec::with_capacity(raw.len());
+        for (
+            id_hex,
+            created_at,
+            status,
+            pipeline_run_hex,
+            pipeline_name,
+            pipeline_id_hex,
+            dataset_id_hex,
+            dataset_name,
+            owner_id_hex,
+            user_id_hex,
+        ) in raw
+        {
+            // `dataset_id` is nullable — an ad-hoc run without a dataset — and
+            // the LEFT JOIN yields NULL name/owner when the dataset is gone.
+            let lenient =
+                |hex: Option<String>| hex.as_deref().and_then(|s| uuid_hex::from_hex(s).ok());
+            rows.push(PipelineRunWithAttributionRow {
+                id: uuid_hex::from_hex(&id_hex)
+                    .map_err(|e| DatabaseError::QueryError(format!("invalid id hex: {e}")))?,
+                created_at,
+                status: entity_status_to_domain(status),
+                pipeline_run_id: uuid_hex::from_hex(&pipeline_run_hex).map_err(|e| {
+                    DatabaseError::QueryError(format!("invalid pipeline_run_id hex: {e}"))
+                })?,
+                pipeline_name,
+                pipeline_id: uuid_hex::from_hex(&pipeline_id_hex).map_err(|e| {
+                    DatabaseError::QueryError(format!("invalid pipeline_id hex: {e}"))
+                })?,
+                dataset_id: lenient(dataset_id_hex),
+                dataset_name,
+                owner_id: lenient(owner_id_hex),
+                owner_email: None,
+                user_id: lenient(user_id_hex),
+            });
+        }
+        Ok(rows)
     }
 }
 
@@ -132,6 +264,31 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
         status: PipelineRunStatus,
         run_info: Option<serde_json::Value>,
     ) -> Result<Uuid, DatabaseError> {
+        self.log_pipeline_run_entry(PipelineRunEntry {
+            pipeline_run_id,
+            pipeline_id,
+            pipeline_name,
+            dataset_id,
+            status,
+            run_info,
+            user_id: None,
+        })
+        .await
+    }
+
+    async fn log_pipeline_run_entry(
+        &self,
+        entry: PipelineRunEntry<'_>,
+    ) -> Result<Uuid, DatabaseError> {
+        let PipelineRunEntry {
+            pipeline_run_id,
+            pipeline_id,
+            pipeline_name,
+            dataset_id,
+            status,
+            run_info,
+            user_id,
+        } = entry;
         let row_id = Uuid::new_v4();
 
         // `dataset_id` is nullable post-08-01; ad-hoc runs without a dataset
@@ -155,6 +312,7 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
             // NUL would leave the run recorded as `Started` with the error
             // never stored.
             run_info: sea_orm::ActiveValue::Set(run_info.map(sanitize_json)),
+            user_id: sea_orm::ActiveValue::Set(uuid_hex::to_hex_opt(user_id)),
         };
 
         active.insert(self.db.as_ref()).await.map_err(|e| {
@@ -228,102 +386,85 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
         dataset_id: Option<Uuid>,
         limit: u32,
     ) -> Result<Vec<PipelineRunWithAttributionRow>, DatabaseError> {
-        use sea_orm::JoinType;
-
-        // SeaORM JOIN — uses the relationships defined on the entities. We
-        // perform a single LEFT JOIN to `datasets`. Owner-email attribution
-        // requires the `users` table, which is not part of this schema; callers
-        // receive `owner_email = None` and are expected to resolve emails
-        // out-of-band (e.g. through a downstream user repository). The
-        // dataset/owner_id columns continue to flow through this query so
-        // downstream UIs can render attribution without the email.
-        let mut query = pipeline_run::Entity::find()
-            .select_only()
-            .column(pipeline_run::Column::Id)
-            .column(pipeline_run::Column::CreatedAt)
-            .column(pipeline_run::Column::Status)
-            .column(pipeline_run::Column::PipelineRunId)
-            .column(pipeline_run::Column::PipelineName)
-            .column(pipeline_run::Column::PipelineId)
-            .column(pipeline_run::Column::DatasetId)
-            .column_as(dataset::Column::Name, "dataset_name")
-            .column_as(dataset::Column::OwnerId, "dataset_owner_id")
-            .join(JoinType::LeftJoin, pipeline_run::Relation::Dataset.def())
-            .order_by_desc(pipeline_run::Column::CreatedAt)
-            .limit(u64::from(limit));
-
-        if let Some(did) = dataset_id {
-            query = query.filter(pipeline_run::Column::DatasetId.eq(uuid_hex::to_hex(did)));
-        }
-
-        let raw = query
-            .into_tuple::<(
-                String,
-                chrono::DateTime<Utc>,
-                pipeline_run::PipelineRunStatus,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            )>()
-            .all(self.db.as_ref())
+        self.fetch_runs(dataset_id, None, None, u64::from(limit), 0)
             .await
-            .map_err(|e| {
-                DatabaseError::QueryError(format!("list_recent_with_attribution query failed: {e}"))
-            })?;
+    }
 
-        let mut rows = Vec::with_capacity(raw.len());
-        for (
-            id_hex,
-            created_at,
-            status,
-            pipeline_run_hex,
-            pipeline_name,
-            pipeline_id_hex,
-            dataset_id_hex,
-            dataset_name,
-            owner_id_hex,
-        ) in raw
-        {
-            // `dataset_id` is nullable post-08-01 — the column may genuinely
-            // be NULL (ad-hoc run without a dataset), and the LEFT JOIN may
-            // also yield NULL when the referenced dataset has been deleted.
-            // Both cases collapse to `None` in the projection.
-            let dataset_uuid = dataset_id_hex
-                .as_deref()
-                .and_then(|s| uuid_hex::from_hex(s).ok());
-            let owner_uuid = owner_id_hex
-                .as_deref()
-                .and_then(|s| uuid_hex::from_hex(s).ok());
-            // Determine dataset attribution presence: when dataset_name is
-            // None the LEFT JOIN didn't match (orphan or NULL dataset_id).
-            let (dataset_id_field, dataset_name_field) = if dataset_name.is_some() {
-                (dataset_uuid, dataset_name)
-            } else {
-                (dataset_uuid, None)
-            };
-
-            rows.push(PipelineRunWithAttributionRow {
-                id: uuid_hex::from_hex(&id_hex)
-                    .map_err(|e| DatabaseError::QueryError(format!("invalid id hex: {e}")))?,
-                created_at,
-                status: entity_status_to_domain(status),
-                pipeline_run_id: uuid_hex::from_hex(&pipeline_run_hex).map_err(|e| {
-                    DatabaseError::QueryError(format!("invalid pipeline_run_id hex: {e}"))
-                })?,
-                pipeline_name,
-                pipeline_id: uuid_hex::from_hex(&pipeline_id_hex).map_err(|e| {
-                    DatabaseError::QueryError(format!("invalid pipeline_id hex: {e}"))
-                })?,
-                dataset_id: dataset_id_field,
-                dataset_name: dataset_name_field,
-                owner_id: owner_uuid,
-                owner_email: None,
-            });
+    /// One statement with database-side `LIMIT` / `OFFSET` whenever the
+    /// visibility lists fit [`LIST_RUNS_MAX_BINDS`] (see
+    /// [`Self::with_list_bind_limit`]) — every realistic caller. Above that,
+    /// the lists are split into chunks of at most that many ids, each chunk
+    /// fetches its newest `offset + limit` rows, and the union is
+    /// de-duplicated, re-sorted and re-paged here; that path requires
+    /// `offset + limit <= LIST_RUNS_CHUNKED_WINDOW` and answers a
+    /// `QueryError` beyond it rather than buffering an unbounded window.
+    async fn list_runs(
+        &self,
+        query: &PipelineRunListQuery,
+    ) -> Result<Vec<PipelineRunWithAttributionRow>, DatabaseError> {
+        let name = query.pipeline_name.as_deref();
+        let Some(visibility) = &query.visibility else {
+            return self
+                .fetch_runs(query.dataset_id, name, None, query.limit, query.offset)
+                .await;
+        };
+        if visibility.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(rows)
+        let hex =
+            |ids: &[Uuid]| -> Vec<String> { ids.iter().map(|id| uuid_hex::to_hex(*id)).collect() };
+        let user_hex = hex(&visibility.user_ids);
+        let dataset_hex = hex(&visibility.dataset_ids);
+        let user_term = |ids: &[String]| pipeline_run::Column::UserId.is_in(ids.to_vec());
+        let dataset_term = |ids: &[String]| pipeline_run::Column::DatasetId.is_in(ids.to_vec());
+
+        if user_hex.len() + dataset_hex.len() <= self.list_bind_limit {
+            let mut any = Condition::any();
+            if !user_hex.is_empty() {
+                any = any.add(user_term(&user_hex));
+            }
+            if !dataset_hex.is_empty() {
+                any = any.add(dataset_term(&dataset_hex));
+            }
+            return self
+                .fetch_runs(query.dataset_id, name, Some(any), query.limit, query.offset)
+                .await;
+        }
+
+        let window = query.offset.saturating_add(query.limit);
+        if window > LIST_RUNS_CHUNKED_WINDOW {
+            return Err(DatabaseError::QueryError(format!(
+                "pipeline-runs listing: offset + limit ({window}) exceeds \
+                 {LIST_RUNS_CHUNKED_WINDOW} for a visibility set of {} ids",
+                user_hex.len() + dataset_hex.len()
+            )));
+        }
+        let per = self.list_bind_limit;
+        let conditions = user_hex
+            .chunks(per)
+            .map(|chunk| Condition::all().add(user_term(chunk)))
+            .chain(
+                dataset_hex
+                    .chunks(per)
+                    .map(|chunk| Condition::all().add(dataset_term(chunk))),
+            );
+        let mut merged: std::collections::BTreeMap<Uuid, PipelineRunWithAttributionRow> =
+            std::collections::BTreeMap::new();
+        for condition in conditions {
+            for row in self
+                .fetch_runs(query.dataset_id, name, Some(condition), window, 0)
+                .await?
+            {
+                merged.entry(row.id).or_insert(row);
+            }
+        }
+        let mut rows: Vec<_> = merged.into_values().collect();
+        // The statement's own order: `created_at DESC, id DESC`. Hex ids sort
+        // like the `Uuid`s they encode (fixed width, lowercase).
+        rows.sort_by(|a, b| (b.created_at, b.id).cmp(&(a.created_at, a.id)));
+        let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
+        let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn list_orphan_runs(&self) -> Result<Vec<PipelineRunRow>, DatabaseError> {
@@ -373,6 +514,7 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
                     pipeline_id: sea_orm::ActiveValue::Set(orphan.pipeline_id),
                     dataset_id: sea_orm::ActiveValue::Set(orphan.dataset_id),
                     run_info: sea_orm::ActiveValue::Set(Some(reason_info.clone())),
+                    user_id: sea_orm::ActiveValue::Set(orphan.user_id),
                 };
                 active.insert(self.db.as_ref()).await.map_err(|e| {
                     DatabaseError::QueryError(format!("reset_orphans insert failed: {e}"))
@@ -757,6 +899,7 @@ impl PipelineRunRepository for SeaOrmPipelineRunRepository {
             // parser rejects the `\u0000` escape — the same reason
             // `reset_orphans` sanitizes its own literal reason.
             run_info: sea_orm::ActiveValue::Set(Some(sanitize_json(json!({"reason": reason})))),
+            user_id: sea_orm::ActiveValue::Set(uuid_hex::to_hex_opt(latest.user_id)),
         };
         active.insert(self.db.as_ref()).await.map_err(|e| {
             DatabaseError::QueryError(format!("reset_orphan_run insert failed: {e}"))

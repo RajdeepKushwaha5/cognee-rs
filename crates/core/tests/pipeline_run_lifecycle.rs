@@ -100,6 +100,8 @@ async fn execute_writes_four_state_trail_on_success() {
 
     let inputs: Vec<Arc<dyn Value>> = vec![Arc::new(7_i32)];
     let ctx = stub_ctx(Arc::clone(&db)).await;
+    let triggered_by = ctx.pipeline_ctx.as_ref().and_then(|p| p.user_id);
+    assert!(triggered_by.is_some());
 
     let outputs = execute(&pipeline, inputs, ctx, &watcher)
         .await
@@ -119,6 +121,13 @@ async fn execute_writes_four_state_trail_on_success() {
     assert_eq!(rows[0].status, PipelineRunStatus::Completed);
     assert_eq!(rows[1].status, PipelineRunStatus::Started);
     assert_eq!(rows[2].status, PipelineRunStatus::Initiated);
+
+    // Every row records who triggered the run (`pipeline_runs.user_id`,
+    // Python `log_pipeline_run_start.py:35@37f788bd2`).
+    assert!(
+        rows.iter().all(|r| r.user_id == triggered_by),
+        "every status row carries the triggering user: {rows:?}"
+    );
 
     // All three rows share the same pipeline_run_id (decision 12).
     assert_eq!(rows[0].pipeline_run_id, rows[1].pipeline_run_id);

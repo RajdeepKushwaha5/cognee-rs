@@ -240,6 +240,38 @@ impl SearchOrchestrator {
         self.acl_db.is_some()
     }
 
+    /// How the retriever registered for `search_type` can be restricted to
+    /// datasets, or `None` when no retriever is registered for it (a search of
+    /// that type fails with `UnsupportedSearchType`). For
+    /// `HybridCompletion` this is the hybrid retriever's scoping; the
+    /// `GraphCompletion` retriever it may fall back to is scoped the same way
+    /// (`Membership`) in the built-in registry.
+    pub fn dataset_scoping(&self, search_type: SearchType) -> Option<DatasetScoping> {
+        self.registry
+            .get(search_type)
+            .ok()
+            .map(|retriever| retriever.dataset_scoping())
+    }
+
+    /// Whether this orchestrator refuses a dataset-scoped search of
+    /// `search_type` — with an ACL wired, every search that reads dataset data
+    /// is dataset-scoped, so this is "refused whenever the caller can read
+    /// at least one dataset". It is the predicate [`Self::search`] applies
+    /// (`SearchError::InvalidInput`), exposed so a caller choosing a search
+    /// type (e.g. an auto-router) does not have to mirror the refused set.
+    /// `false` for a type with no registered retriever.
+    pub fn refuses_dataset_scope(&self, search_type: SearchType) -> bool {
+        self.dataset_scoping(search_type)
+            .is_some_and(|scoping| self.refuses_scoping(scoping))
+    }
+
+    /// The refusal rule itself, shared by [`Self::refuses_dataset_scope`] and
+    /// the check in [`Self::search`]: an ACL is wired and the retriever's
+    /// results carry no dataset membership.
+    fn refuses_scoping(&self, scoping: DatasetScoping) -> bool {
+        self.acl_db.is_some() && scoping == DatasetScoping::Unsupported
+    }
+
     pub fn with_session_manager(mut self, session_manager: Arc<SessionManager>) -> Self {
         self.session_manager = Some(session_manager);
         self
@@ -755,7 +787,7 @@ impl SearchOrchestrator {
         // context (`search.py:330` at f154b32), which a shared store cannot
         // do. With access control wired that choice is a security boundary,
         // so the search is refused rather than answered either way.
-        if self.acl_db.is_some() && use_dataset_scope && scoping == DatasetScoping::Unsupported {
+        if use_dataset_scope && self.refuses_scoping(scoping) {
             return Err(SearchError::InvalidInput(format!(
                 "search type {:?} cannot be restricted to datasets: its results carry no \
                  dataset membership, and access control requires every search to be limited to \
@@ -3418,6 +3450,57 @@ mod tests {
             item_texts(&response.result),
             vec!["no membership".to_string()]
         );
+    }
+
+    /// Cloud S3 finding #7. Scenario: every scoping × ACL wired / not wired.
+    /// Expected: `refuses_dataset_scope` is `true` exactly when `search`
+    /// refuses a dataset-scoped request of that type with `InvalidInput`, and
+    /// `dataset_scoping` reports the registered retriever's scoping (`None`,
+    /// and no refusal, for an unregistered type).
+    /// Verification: run the same search the accessor predicts for and
+    /// compare.
+    #[tokio::test]
+    async fn the_scoping_accessor_matches_the_refusal_search_applies() {
+        use crate::retrievers::DatasetScoping as S;
+        let caller = Uuid::new_v4();
+        let readable = Uuid::new_v4();
+        for scoping in [S::Membership, S::NotDatasetData, S::Unsupported] {
+            for with_acl in [false, true] {
+                let acl = if with_acl {
+                    let acl = Arc::new(cognee_test_utils::MockAclDb::new());
+                    acl.grant_permission(caller, readable, "read")
+                        .await
+                        .expect("grant");
+                    Some(acl as Arc<dyn AclDb>)
+                } else {
+                    None
+                };
+                let (orchestrator, _retriever) = scoping_orchestrator(scoping, acl);
+                assert_eq!(
+                    orchestrator.dataset_scoping(SearchType::Temporal),
+                    Some(scoping)
+                );
+                assert_eq!(orchestrator.dataset_scoping(SearchType::Cypher), None);
+                assert!(!orchestrator.refuses_dataset_scope(SearchType::Cypher));
+
+                let predicted = orchestrator.refuses_dataset_scope(SearchType::Temporal);
+                let outcome = orchestrator
+                    .search(&SearchRequest {
+                        search_type: SearchType::Temporal,
+                        dataset_ids: Some(vec![readable]),
+                        user_id: Some(caller),
+                        only_context: Some(true),
+                        ..dataset_request_template()
+                    })
+                    .await;
+                let refused = matches!(outcome, Err(SearchError::InvalidInput(_)));
+                assert_eq!(
+                    predicted, refused,
+                    "{scoping:?}, acl={with_acl}: accessor says {predicted}, search gave {outcome:?}"
+                );
+                assert_eq!(predicted, with_acl && scoping == S::Unsupported);
+            }
+        }
     }
 
     /// SDK-689. Scenario: an ACL is wired; the caller holds `read` on three

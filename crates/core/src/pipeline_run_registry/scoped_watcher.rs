@@ -106,14 +106,15 @@ impl PipelineWatcher for ScopedRunWatcher {
         let run_info = Some(super::run_info_for_initiated());
         let db_result = self
             .db
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Initiated,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Initiated,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await;
 
         if let Err(e) = db_result {
@@ -135,14 +136,15 @@ impl PipelineWatcher for ScopedRunWatcher {
         let run_info = Some(super::run_info_for_running(&run.data_ids));
         let db_result = self
             .db
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                core_to_db_status(&run.status),
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: core_to_db_status(&run.status),
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await;
 
         if let Err(e) = db_result {
@@ -169,14 +171,15 @@ impl PipelineWatcher for ScopedRunWatcher {
         let run_info = Some(super::run_info_for_running(&run.data_ids));
         let db_result = self
             .db
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Completed,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Completed,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await;
 
         if let Err(e) = db_result {
@@ -212,14 +215,15 @@ impl PipelineWatcher for ScopedRunWatcher {
         let run_info = Some(super::run_info_for_errored(&run.data_ids, error));
         let db_result = self
             .db
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Errored,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Errored,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await;
 
         if let Err(e) = db_result {

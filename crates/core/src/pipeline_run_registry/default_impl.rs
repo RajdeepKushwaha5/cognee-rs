@@ -393,14 +393,15 @@ impl DefaultPipelineRunRegistry {
             let run_info = Some(super::run_info_for_running(data_ids));
             let result = self
                 .repo
-                .log_pipeline_run(
-                    run_id,
+                .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                    pipeline_run_id: run_id,
                     pipeline_id,
-                    &m.pipeline_name,
-                    m.dataset_id,
-                    DbStatus::Started,
+                    pipeline_name: &m.pipeline_name,
+                    dataset_id: m.dataset_id,
+                    status: DbStatus::Started,
                     run_info,
-                )
+                    user_id: m.user_id,
+                })
                 .await;
             if let Err(e) = result {
                 tracing::warn!(run_id = %run_id, "registry: DB write for Started failed (non-fatal): {e}");
@@ -436,14 +437,15 @@ impl DefaultPipelineRunRegistry {
             };
             let result = self
                 .repo
-                .log_pipeline_run(
-                    run_id,
+                .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                    pipeline_run_id: run_id,
                     pipeline_id,
-                    &m.pipeline_name,
-                    m.dataset_id,
-                    db_status,
+                    pipeline_name: &m.pipeline_name,
+                    dataset_id: m.dataset_id,
+                    status: db_status,
                     run_info,
-                )
+                    user_id: m.user_id,
+                })
                 .await;
             if let Err(e) = result {
                 tracing::warn!(run_id = %run_id, "registry: DB write for terminal status failed (non-fatal): {e}");
@@ -510,14 +512,15 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
                     Uuid::new_v5(&Uuid::NAMESPACE_OID, pipeline_name_clone.as_bytes());
                 let started_run_info = Some(super::run_info_for_running(&data_ids));
                 let result = repo
-                    .log_pipeline_run(
-                        run_id,
+                    .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                        pipeline_run_id: run_id,
                         pipeline_id,
-                        &pipeline_name_clone,
+                        pipeline_name: &pipeline_name_clone,
                         dataset_id,
-                        DbStatus::Started,
-                        started_run_info,
-                    )
+                        status: DbStatus::Started,
+                        run_info: started_run_info,
+                        user_id,
+                    })
                     .await;
                 if let Err(e) = result {
                     tracing::warn!(run_id = %run_id, "registry background: DB write for Started failed (non-fatal): {e}");
@@ -547,14 +550,15 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
                     _ => (DbStatus::Errored, None),
                 };
                 let result = repo
-                    .log_pipeline_run(
-                        run_id,
+                    .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                        pipeline_run_id: run_id,
                         pipeline_id,
-                        &pipeline_name_clone,
+                        pipeline_name: &pipeline_name_clone,
                         dataset_id,
-                        db_status,
+                        status: db_status,
                         run_info,
-                    )
+                        user_id,
+                    })
                     .await;
                 if let Err(e) = result {
                     tracing::warn!(run_id = %run_id, "registry background: DB write for terminal status failed (non-fatal): {e}");
@@ -645,7 +649,6 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
 
         // Suppress unused variable warnings.
         let _ = cfg;
-        let _ = user_id;
 
         Ok(meta)
     }
@@ -778,7 +781,7 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
 
         // Optionally write an ERRORED row.
         if self.cfg.abort_writes_errored_row {
-            let (pipeline_name, dataset_id, data_ids) = {
+            let (pipeline_name, dataset_id, data_ids, user_id) = {
                 let runs = self.runs.read().await;
                 runs.get(&run_id)
                     .map(|s| {
@@ -786,6 +789,7 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
                             s.meta.pipeline_name.clone(),
                             s.meta.dataset_id,
                             s.data_ids.clone(),
+                            s.meta.user_id,
                         )
                     })
                     .unwrap_or_default()
@@ -798,14 +802,15 @@ impl PipelineRunRegistry for DefaultPipelineRunRegistry {
             let run_info = Some(super::run_info_for_errored(&data_ids, "abort"));
             let result = self
                 .repo
-                .log_pipeline_run(
-                    run_id,
+                .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                    pipeline_run_id: run_id,
                     pipeline_id,
-                    &pipeline_name,
+                    pipeline_name: &pipeline_name,
                     dataset_id,
-                    DbStatus::Errored,
+                    status: DbStatus::Errored,
                     run_info,
-                )
+                    user_id,
+                })
                 .await;
             if let Err(e) = result {
                 tracing::warn!(run_id = %run_id, "registry abort: DB write failed (non-fatal): {e}");

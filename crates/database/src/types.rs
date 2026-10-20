@@ -71,6 +71,10 @@ pub struct PipelineRun {
     pub pipeline_id: Uuid,
     pub dataset_id: Option<Uuid>,
     pub run_info: Option<serde_json::Value>,
+    /// The user who triggered the run; `None` for rows from before
+    /// `pipeline_runs.user_id` existed and for system writes.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -27,6 +27,69 @@ pub struct PipelineRunWithAttributionRow {
     pub dataset_name: Option<String>,
     pub owner_id: Option<Uuid>,
     pub owner_email: Option<String>,
+    /// The user who triggered the run (`pipeline_runs.user_id`); `None` for
+    /// rows written before the column existed and for system writes.
+    pub user_id: Option<Uuid>,
+}
+
+/// One `pipeline_runs` row to write, for
+/// [`PipelineRunRepository::log_pipeline_run_entry`].
+#[derive(Debug, Clone)]
+pub struct PipelineRunEntry<'a> {
+    pub pipeline_run_id: Uuid,
+    pub pipeline_id: Uuid,
+    pub pipeline_name: &'a str,
+    pub dataset_id: Option<Uuid>,
+    pub status: PipelineRunStatus,
+    pub run_info: Option<serde_json::Value>,
+    /// Who triggered the run (Python writes `user.id` on every status row,
+    /// `log_pipeline_run_start.py:35`, `log_pipeline_run_complete.py:37`,
+    /// `log_pipeline_run_error.py:56@37f788bd2`). `None` for system writes.
+    pub user_id: Option<Uuid>,
+}
+
+/// Who may see which runs, for [`PipelineRunRepository::list_runs`]: a run
+/// is visible when it was triggered by one of `user_ids` **or** is on one of
+/// `dataset_ids` — Python's activity-feed predicate `PipelineRun.user_id IN
+/// visible_user_ids OR PipelineRun.dataset_id IN permitted`
+/// (`get_activity_router.py:141-146@37f788bd2`). A row with a `NULL`
+/// `user_id` (written before the column existed) matches only through its
+/// dataset.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineRunVisibility {
+    /// Typically the caller plus its child agents (Python
+    /// `get_visible_user_ids`).
+    pub user_ids: Vec<Uuid>,
+    /// Typically the datasets the caller may read.
+    pub dataset_ids: Vec<Uuid>,
+}
+
+impl PipelineRunVisibility {
+    /// Whether no row can be visible.
+    pub fn is_empty(&self) -> bool {
+        self.user_ids.is_empty() && self.dataset_ids.is_empty()
+    }
+
+    /// Whether `row` satisfies the predicate.
+    pub fn admits(&self, row: &PipelineRunWithAttributionRow) -> bool {
+        row.user_id.is_some_and(|u| self.user_ids.contains(&u))
+            || row
+                .dataset_id
+                .is_some_and(|d| self.dataset_ids.contains(&d))
+    }
+}
+
+/// A page of the runs listing, for [`PipelineRunRepository::list_runs`].
+#[derive(Debug, Clone, Default)]
+pub struct PipelineRunListQuery {
+    /// Only runs on this dataset.
+    pub dataset_id: Option<Uuid>,
+    /// Only runs whose `pipeline_name` equals this.
+    pub pipeline_name: Option<String>,
+    /// `None`: every run (no visibility filter).
+    pub visibility: Option<PipelineRunVisibility>,
+    pub limit: u64,
+    pub offset: u64,
 }
 
 /// Persistence abstraction for pipeline run status rows.
@@ -96,7 +159,68 @@ pub trait PipelineRunRepository: Send + Sync {
                 dataset_name: None,
                 owner_id: None,
                 owner_email: None,
+                user_id: r.user_id,
             })
+            .collect())
+    }
+
+    /// Write one status row like [`Self::log_pipeline_run`], also recording
+    /// who triggered the run (`pipeline_runs.user_id`).
+    ///
+    /// The default implementation forwards to [`Self::log_pipeline_run`] and
+    /// drops `user_id`, so an implementation that does not persist it keeps
+    /// working (its rows simply carry no triggerer).
+    async fn log_pipeline_run_entry(&self, entry: PipelineRunEntry<'_>) -> Result<Uuid, DbError> {
+        self.log_pipeline_run(
+            entry.pipeline_run_id,
+            entry.pipeline_id,
+            entry.pipeline_name,
+            entry.dataset_id,
+            entry.status,
+            entry.run_info,
+        )
+        .await
+    }
+
+    /// The runs listing behind `GET /api/v1/activity/pipeline-runs`: rows
+    /// joined to their dataset (attribution), filtered by `query`'s dataset,
+    /// pipeline name and [`PipelineRunVisibility`], newest first (`created_at
+    /// DESC, id DESC`), paged by `limit` / `offset` (Python
+    /// `get_activity_router.py:126-171@37f788bd2`).
+    ///
+    /// An empty visibility returns no rows. The SeaORM implementation answers
+    /// in one statement with database-side paging; see
+    /// `SeaOrmPipelineRunRepository` for the bind-limit fallback.
+    ///
+    /// The default implementation (mocks) filters
+    /// [`Self::list_recent_with_attribution`] in memory.
+    async fn list_runs(
+        &self,
+        query: &PipelineRunListQuery,
+    ) -> Result<Vec<PipelineRunWithAttributionRow>, DbError> {
+        if query
+            .visibility
+            .as_ref()
+            .is_some_and(PipelineRunVisibility::is_empty)
+        {
+            return Ok(Vec::new());
+        }
+        let window = u32::try_from(query.offset.saturating_add(query.limit)).unwrap_or(u32::MAX);
+        let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
+        let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
+        Ok(self
+            .list_recent_with_attribution(query.dataset_id, window)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                query
+                    .pipeline_name
+                    .as_deref()
+                    .is_none_or(|name| row.pipeline_name == name)
+            })
+            .filter(|row| query.visibility.as_ref().is_none_or(|v| v.admits(row)))
+            .skip(offset)
+            .take(limit)
             .collect())
     }
 

@@ -490,7 +490,15 @@ pub async fn persist_data_with_acl_and_locks(
     let dataset_guard = match dataset_locks {
         Some(locks) => Some(match target_dataset_id {
             Some(ds_id) => locks.lock(ds_id).await,
-            None => locks.lock_for_name(dataset_name, owner_id, tenant_id).await,
+            None => {
+                crate::dataset_locks::lock_dataset_identity(
+                    locks,
+                    dataset_name,
+                    owner_id,
+                    tenant_id,
+                )
+                .await
+            }
         }),
         None => None,
     };

@@ -84,14 +84,15 @@ impl PipelineWatcher for DbPipelineWatcher {
         let run_info = Some(run_info_for_initiated());
         if let Err(e) = self
             .repo
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Initiated,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Initiated,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await
         {
             tracing::warn!(
@@ -106,14 +107,15 @@ impl PipelineWatcher for DbPipelineWatcher {
         let run_info = Some(run_info_for_running(&run.data_ids));
         if let Err(e) = self
             .repo
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                Self::core_to_db_status(&run.status),
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: Self::core_to_db_status(&run.status),
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await
         {
             tracing::warn!(
@@ -128,14 +130,15 @@ impl PipelineWatcher for DbPipelineWatcher {
         let run_info = Some(run_info_for_running(&run.data_ids));
         if let Err(e) = self
             .repo
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Completed,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Completed,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await
         {
             tracing::warn!(
@@ -150,14 +153,15 @@ impl PipelineWatcher for DbPipelineWatcher {
         let run_info = Some(run_info_for_errored(&run.data_ids, error));
         if let Err(e) = self
             .repo
-            .log_pipeline_run(
-                run.run_id,
-                run.pipeline_id,
-                &run.pipeline_name,
-                run.dataset_id,
-                DbStatus::Errored,
+            .log_pipeline_run_entry(cognee_database::PipelineRunEntry {
+                pipeline_run_id: run.run_id,
+                pipeline_id: run.pipeline_id,
+                pipeline_name: &run.pipeline_name,
+                dataset_id: run.dataset_id,
+                status: DbStatus::Errored,
                 run_info,
-            )
+                user_id: run.user_id,
+            })
             .await
         {
             tracing::warn!(

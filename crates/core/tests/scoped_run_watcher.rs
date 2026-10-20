@@ -193,9 +193,19 @@ async fn started_and_completed_write_db_rows() {
     let mut run = fake_run(run_id, CoreStatus::Started);
     run.dataset_id = Some(ds);
     run.pipeline_name = "db_write_test".to_string();
+    let triggered_by = Uuid::new_v4();
+    run.user_id = Some(triggered_by);
 
     watcher.on_pipeline_run_started(&run).await;
     watcher.on_pipeline_run_completed(&run, 1).await;
+
+    // Both rows record who triggered the run (`pipeline_runs.user_id`).
+    let rows = repo.list_recent(Some(ds), 10).await.expect("list_recent");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|r| r.user_id == Some(triggered_by)),
+        "{rows:?}"
+    );
 
     // Verify rows were written.
     let statuses = repo

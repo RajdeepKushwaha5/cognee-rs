@@ -18,6 +18,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **Delete lock hook, search scoping accessor, pipeline-runs listing +
+  `pipeline_runs.user_id`.** Python serializes deletes against pipeline runs
+  with one per-dataset lock (`dataset_lock.py`, cognee 37f788bd2); its
+  activity feed filters runs by the triggering user.
+
+  | Item | Before | After |
+  |---|---|---|
+  | `DatasetLocks` / `DatasetLockGuard` | defined in `cognee-ingestion` | moved to `cognee_core::dataset_locks` (still re-exported by `cognee-ingestion`); re-entrant per task through the new `DatasetLocks::hold(ids, fut)` (+ `is_held`, `DatasetLockGuard::is_reentrant`) |
+  | `DatasetLocks::lock_for_name` | method | **removed**; `cognee_ingestion::lock_dataset_identity(&locks, name, owner, tenant)` |
+  | `DeleteService::with_dataset_locks` | — | new: every dataset-scoped delete takes the dataset's lock (none without it) |
+  | `DeleteService::execute_datasets_by_id` | a dataset missing at its turn failed the loop | re-read under its lock and **skipped** when gone; a real failure still stops with `Partial` (now "nothing completed yet" → the error as is) |
+  | `SearchOrchestrator::{dataset_scoping, refuses_dataset_scope}` | — | new; the refusal `search` applies |
+  | `pipeline_runs.user_id` | — | new nullable column + `ix_pipeline_runs_user_id` (migration `m20261020_000001_pipeline_runs_user_id`, guarded for a Python-first shared SQLite); written by the run watchers / registry from `PipelineRunInfo.user_id` |
+  | `PipelineRun`, `PipelineRunWithAttributionRow`, `entities::pipeline_run::Model` | — | `+ user_id` (struct literals must set it) |
+  | `PipelineRunRepository::{log_pipeline_run_entry, list_runs}` | — | new provided methods (`PipelineRunEntry`, `PipelineRunListQuery`, `PipelineRunVisibility`); `SeaOrmPipelineRunRepository::with_list_bind_limit` |
+
 - **Delete parity: tenant-strict names, tenant-scoped delete-all, grant
   reach by id only (SDK-936).** Every by-name dataset lookup is now
   tenant-strict (there is no tenant-loose lookup left), the owner-scoped

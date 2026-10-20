@@ -14,6 +14,7 @@
 //!   fan-out batching and retry support.
 
 pub mod cancellation;
+pub mod dataset_locks;
 pub mod error;
 pub mod exec_status;
 pub mod pipeline;
@@ -30,6 +31,7 @@ pub mod thread_pool;
 pub mod pipeline_run_registry;
 
 pub use cancellation::{CancellationHandle, CancellationToken, cancellation_pair};
+pub use dataset_locks::{DatasetLockGuard, DatasetLocks};
 pub use error::CoreError;
 pub use exec_status::{ExecStatusManager, NoopExecStatusManager};
 pub use pipeline::{

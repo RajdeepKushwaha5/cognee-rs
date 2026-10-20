@@ -133,6 +133,7 @@ async fn dataset_is_cached(
 /// own rows, written from the filtered input, carry the exact set.
 async fn record_dataset_run(
     database: &dyn RelationalDb,
+    user_id: Uuid,
     dataset_id: Uuid,
     data_ids: &[Uuid],
     result: &CognifyResult,
@@ -157,6 +158,7 @@ async fn record_dataset_run(
         pipeline_id: pipeline_run_id,
         dataset_id: Some(dataset_id),
         run_info,
+        user_id: Some(user_id),
     };
     database.create_pipeline_run(run).await?;
     Ok(())
@@ -257,7 +259,7 @@ pub async fn cognify_datasets(
         .await?;
 
         // --- Record successful pipeline run ---
-        record_dataset_run(&*database, dataset.id, &data_ids, &result).await?;
+        record_dataset_run(&*database, user_id, dataset.id, &data_ids, &result).await?;
 
         results.push(result);
     }
@@ -378,7 +380,7 @@ pub async fn cognify_dataset_refs(
         )
         .await?;
 
-        record_dataset_run(&*database, dataset.id, &data_ids, &result).await?;
+        record_dataset_run(&*database, user_id, dataset.id, &data_ids, &result).await?;
 
         results.push(result);
     }

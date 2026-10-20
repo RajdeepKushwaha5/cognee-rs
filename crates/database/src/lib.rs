@@ -53,10 +53,12 @@ pub use ops::checkpoint::{CheckpointStore, SeaOrmCheckpointStore};
 /// should not have to name `ops::graph_storage` to build one.
 pub use ops::graph_storage::RunScope;
 pub use ops::session_lifecycle::DEFAULT_ABANDON_AFTER_SECONDS;
-pub use pipelines::sea_orm_impl::SeaOrmPipelineRunRepository;
+pub use pipelines::sea_orm_impl::{
+    LIST_RUNS_CHUNKED_WINDOW, LIST_RUNS_MAX_BINDS, SeaOrmPipelineRunRepository,
+};
 pub use pipelines::{
-    NoopPipelineRunRepository, PipelineRunClaim, PipelineRunRepository,
-    PipelineRunWithAttributionRow,
+    NoopPipelineRunRepository, PipelineRunClaim, PipelineRunEntry, PipelineRunListQuery,
+    PipelineRunRepository, PipelineRunVisibility, PipelineRunWithAttributionRow,
 };
 pub use sea_orm::DatabaseConnection;
 pub use session_qa::{SessionQaPatch, SessionQaRow, SessionTraceRow};

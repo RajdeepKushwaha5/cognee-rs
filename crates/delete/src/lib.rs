@@ -21,6 +21,7 @@ pub use sweep::{RunSweeper, SweepOutcome, SweepScope};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use cognee_core::dataset_locks::DatasetLocks;
 use cognee_core::pipeline_run_registry::{
     ids::{pipeline_id, pipeline_run_id},
     run_info_for_initiated,
@@ -326,6 +327,7 @@ pub struct DeleteService {
     vector_db: Option<Arc<dyn VectorDB>>,
     session_store: Option<Arc<dyn SessionStore>>,
     pipeline_run_repo: Option<Arc<dyn PipelineRunRepository>>,
+    dataset_locks: Option<Arc<DatasetLocks>>,
 }
 
 impl DeleteService {
@@ -337,7 +339,33 @@ impl DeleteService {
             vector_db: None,
             session_store: None,
             pipeline_run_repo: None,
+            dataset_locks: None,
         }
+    }
+
+    /// Take the per-dataset lock of every dataset a delete touches, from the
+    /// shared registry `locks` — the one the embedder's pipelines and creates
+    /// use (`AddPipeline::with_dataset_locks`), so a delete waits for them and
+    /// they wait for it, as Python's `dataset_lock` does for every delete
+    /// (`cognee/api/v1/datasets/datasets.py:198, 244`,
+    /// `cognee/api/v1/forget/forget.py:298, 399@37f788bd2`).
+    ///
+    /// Locked, by dataset row id: `DatasetById`, `DataInDataset`, `Dataset`
+    /// (the id its name resolves to), `Data` (its named dataset, or every
+    /// dataset of the owner in the tenant the item is linked to), and each
+    /// dataset of `User` / [`Self::execute_datasets_by_id`] in turn. The
+    /// plain store-wide `All` and every `preview*` take no lock. Targets are
+    /// resolved again under the lock, so the delete never acts on what it saw
+    /// before waiting.
+    ///
+    /// Re-entrant through [`DatasetLocks::hold`]: a caller that already holds
+    /// a dataset that way (an operation that deletes then re-adds) does not
+    /// wait on itself. A caller holding a plain [`DatasetLocks::lock`] guard on
+    /// the same dataset **would** — use `hold` for that. Without this hook
+    /// nothing is locked (the default).
+    pub fn with_dataset_locks(mut self, locks: Arc<DatasetLocks>) -> Self {
+        self.dataset_locks = Some(locks);
+        self
     }
 
     pub fn with_graph_db(mut self, graph_db: Arc<dyn GraphDBTrait>) -> Self {
@@ -468,10 +496,19 @@ impl DeleteService {
     /// (`DeleteScope::DatasetById`, whoever owns it — no authorization here,
     /// see [`AuthorizedDeleteService`]). Stops at the first failure like
     /// Python's `datasets.delete_all`
-    /// (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`): a failure on
-    /// the first dataset is returned as is; a later one returns
+    /// (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`): a failure
+    /// before any dataset was deleted is returned as is; a later one returns
     /// [`DeleteError::Partial`] with the sum of the completed results (the
     /// datasets before it stay deleted).
+    ///
+    /// Each dataset's row is re-read first — under its lock when
+    /// [`Self::with_dataset_locks`] is wired — and a dataset that no longer
+    /// exists (deleted concurrently between the caller's listing and here) is
+    /// **skipped**, not a failure: what the delete was for already happened.
+    /// Python would raise for it (`get_authorized_dataset` finds no such
+    /// dataset); this is a deliberate divergence, since a concurrent delete is
+    /// exactly what the lock makes the loop wait for. Any other error still
+    /// stops the loop.
     #[tracing::instrument(name = "cognee.delete.execute_datasets_by_id", skip_all)]
     pub async fn execute_datasets_by_id(
         &self,
@@ -480,21 +517,29 @@ impl DeleteService {
         memory_only: bool,
     ) -> Result<DeleteResult, DeleteError> {
         let mut total = DeleteResult::default();
-        for (done, dataset_id) in dataset_ids.iter().enumerate() {
-            let request = DeleteRequest {
-                scope: DeleteScope::DatasetById {
-                    dataset_id: *dataset_id,
-                },
-                mode: mode.clone(),
-                memory_only,
+        let mut completed = 0usize;
+        for dataset_id in dataset_ids {
+            let attempt = self.delete_dataset_if_present(*dataset_id, mode.clone(), memory_only);
+            let outcome = match &self.dataset_locks {
+                Some(locks) => locks.hold([*dataset_id], attempt).await,
+                None => attempt.await,
             };
-            match self.execute_resolved(&request).await {
-                Ok(result) => total += result,
-                Err(error) if done == 0 => return Err(error),
+            match outcome {
+                Ok(Some(result)) => {
+                    total += result;
+                    completed += 1;
+                }
+                Ok(None) => {
+                    info!(
+                        dataset_id = %dataset_id,
+                        "dataset no longer exists; skipped by the per-dataset delete"
+                    );
+                }
+                Err(error) if completed == 0 => return Err(error),
                 Err(error) => {
                     tracing::warn!(
                         failed_dataset = %dataset_id,
-                        completed_datasets = done,
+                        completed_datasets = completed,
                         "per-dataset delete stopped at the first failing dataset"
                     );
                     return Err(DeleteError::Partial {
@@ -506,6 +551,85 @@ impl DeleteService {
             }
         }
         Ok(total)
+    }
+
+    /// One step of [`Self::execute_datasets_by_id`]: `None` when the dataset
+    /// row is gone, else the by-id delete's result.
+    async fn delete_dataset_if_present(
+        &self,
+        dataset_id: Uuid,
+        mode: DeleteMode,
+        memory_only: bool,
+    ) -> Result<Option<DeleteResult>, DeleteError> {
+        let exists = self
+            .database
+            .get_dataset_by_id(dataset_id)
+            .await
+            .map_err(|error| {
+                DeleteError::Runtime(format!("Failed to resolve dataset {dataset_id}: {error}"))
+            })?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let request = DeleteRequest {
+            scope: DeleteScope::DatasetById { dataset_id },
+            mode,
+            memory_only,
+        };
+        self.execute_resolved(&request).await.map(Some)
+    }
+
+    /// The datasets whose locks a delete of `scope` takes (see
+    /// [`Self::with_dataset_locks`]). A name that resolves to nothing yields
+    /// no key; the delete then reports the missing dataset as usual.
+    async fn lock_keys(&self, scope: &DeleteScope) -> Result<Vec<Uuid>, DeleteError> {
+        let by_name = |owner_id: Uuid, name: String, tenant_id: Option<Uuid>| async move {
+            self.database
+                .get_dataset_by_name_in_tenant(&name, owner_id, tenant_id)
+                .await
+                .map(|found| found.map(|ds| ds.id).into_iter().collect::<Vec<_>>())
+                .map_err(|error| {
+                    DeleteError::Runtime(format!("Failed to resolve dataset '{name}': {error}"))
+                })
+        };
+        match scope {
+            DeleteScope::DatasetById { dataset_id }
+            | DeleteScope::DataInDataset { dataset_id, .. } => Ok(vec![*dataset_id]),
+            DeleteScope::Dataset {
+                owner_id,
+                dataset_name,
+                tenant_id,
+            }
+            | DeleteScope::Data {
+                owner_id,
+                dataset_name: Some(dataset_name),
+                tenant_id,
+                ..
+            } => by_name(*owner_id, dataset_name.clone(), *tenant_id).await,
+            DeleteScope::Data {
+                owner_id,
+                data_id,
+                dataset_name: None,
+                tenant_id,
+                ..
+            } => Ok(self
+                .database
+                .list_datasets_for_data(*data_id)
+                .await
+                .map_err(|error| {
+                    DeleteError::Runtime(format!(
+                        "Failed to list datasets for data {data_id}: {error}"
+                    ))
+                })?
+                .into_iter()
+                .filter(|ds| ds.owner_id == *owner_id && ds.tenant_id == *tenant_id)
+                .map(|ds| ds.id)
+                .collect()),
+            // `User` is locked per dataset by `execute_datasets_by_id`; the
+            // store-wide `All` is not dataset-scoped.
+            DeleteScope::User { .. } | DeleteScope::All => Ok(Vec::new()),
+        }
     }
 
     async fn preview_targets(
@@ -570,7 +694,13 @@ impl DeleteService {
                 .execute_datasets_by_id(&ids, request.mode.clone(), request.memory_only)
                 .await;
         }
-        self.execute_resolved(request).await
+        match &self.dataset_locks {
+            Some(locks) => {
+                let keys = self.lock_keys(&request.scope).await?;
+                locks.hold(keys, self.execute_resolved(request)).await
+            }
+            None => self.execute_resolved(request).await,
+        }
     }
 
     /// [`Self::execute`] for every scope but `User` (expanded per dataset
@@ -4897,6 +5027,7 @@ mod tests {
             pipeline_id: Uuid::new_v4(),
             dataset_id: Some(dataset_id),
             run_info: None,
+            user_id: None,
         };
         ops::pipeline_runs::create_pipeline_run(&db, pipeline_run)
             .await
@@ -4967,6 +5098,7 @@ mod tests {
             pipeline_id: Uuid::new_v4(),
             dataset_id: Some(dataset_id),
             run_info: None,
+            user_id: None,
         };
         ops::pipeline_runs::create_pipeline_run(&db, pipeline_run)
             .await

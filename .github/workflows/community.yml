@@ -559,6 +559,13 @@ jobs:
           cargo test -p cognee-database --features sqlite,postgres \
             --test pipeline_run_nul_bytes -- --nocapture 2>&1 | tee pg-nul-bytes.log
 
+      # Same feature pair, same reason — see the ci.yml twin.
+      - name: Run pipeline-runs listing tests (Postgres case)
+        run: |
+          set -o pipefail
+          cargo test -p cognee-database --features sqlite,postgres \
+            --test pipeline_run_listing -- --nocapture 2>&1 | tee pg-run-listing.log
+
       - name: Run single-database coexistence test
         run: |
           set -o pipefail
@@ -570,9 +577,11 @@ jobs:
           bash scripts/ci/assert_pg_suite_ran.sh --label "Postgres single-database" \
             --log pg-provenance.log   --min-tests 3 \
             --log pg-nul-bytes.log    --min-tests 5 \
+            --log pg-run-listing.log  --min-tests 5 \
             --log pg-single-stack.log --min-tests 1 \
             --require-test upsert_batch_with_duplicate_ids_dedups_keeping_last \
             --require-test errored_run_info_with_nul_is_written_to_postgres \
+            --require-test listing_and_user_id_postgres \
             --require-test temp_database_supports_back_to_back_initialize \
             --require-test relational_pgvector_pggraph_coexist_in_one_database
 

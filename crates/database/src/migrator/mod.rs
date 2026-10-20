@@ -11,6 +11,7 @@ mod m20260917_000001_graph_slug_indexes;
 mod m20260918_000001_align_node_index_names;
 mod m20261015_000001_search_history_dataset_id;
 mod m20261016_000001_search_history_python_columns;
+mod m20261020_000001_pipeline_runs_user_id;
 
 pub struct Migrator;
 
@@ -57,6 +58,7 @@ pub fn core_migrations() -> Vec<Box<dyn MigrationTrait>> {
         Box::new(m20260918_000001_align_node_index_names::Migration),
         Box::new(m20261015_000001_search_history_dataset_id::Migration),
         Box::new(m20261016_000001_search_history_python_columns::Migration),
+        Box::new(m20261020_000001_pipeline_runs_user_id::Migration),
     ]
 }
 

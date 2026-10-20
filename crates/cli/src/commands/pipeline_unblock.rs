@@ -375,6 +375,7 @@ mod tests {
             pipeline_id: Uuid::nil(),
             dataset_id: None,
             run_info: None,
+            user_id: None,
         }
     }
 
