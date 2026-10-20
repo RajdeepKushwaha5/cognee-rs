@@ -86,7 +86,11 @@ one model, an optional model, a union of models, or a list of any of these;
 `null` list items are skipped. A union value is stored as the first declared
 model whose fields cover the object's keys and that validates. Other shapes that
 reach a model — a union mixing models with scalars, a dictionary of models, a
-nested list — are rejected rather than stored as opaque properties. External
+nested list — are rejected rather than stored as opaque properties. A `$defs`
+entry that is not a model — an `enum`, a `const` or a non-object scalar type —
+is a value, as Python generates an `Enum` or `RootModel` for it: a field that
+references one is a scalar property, an answer outside the enum is rejected, and
+the enum stays in the schema sent to the LLM. External
 references are rejected so the schema is self-contained and deterministic. The
 `metadata` property is consumed by the storage walk and removed from the schema
 sent to the LLM; descriptive JSON Schema annotations remain available to guide
@@ -104,9 +108,53 @@ Policy lives in the `metadata` property's default object:
 
 `identity_fields` determine the stable UUID, and `index_fields` select the
 scalar fields written to `{Model}_{field}` vector collections; a `null` or blank
-value is not indexed, as in Python. `transparent: true` makes a structural
+value is not indexed, as in Python. An `index_fields` name that is not a scalar
+field of the model is skipped with a warning, as Python's `index_data_points`
+skips it. The UUID is `uuid5(NAMESPACE_OID, "{Model}:{values}")` over each
+identity value as Python `str()`s it after Pydantic validation: a `number` is a
+float (`3` becomes `3.0`), an `integer` field accepts `3.0` as `3`, a
+`date-time` is a timezone-aware datetime (`2024-03-01 00:00:00+00:00`), an enum
+member prints as `Enum.member` with datamodel-code-generator's member name
+(`"_x"` is `field_x`, `"mro"` is `mro_`, `1e20` is `number_1e_20`), lists use
+Python `repr` quoting, and only plain strings are lower-cased with spaces turned
+into `_`. An omitted optional identity field contributes `None`. A field
+filled from its schema `default` keeps the raw JSON value, because Pydantic does
+not validate defaults: a `number` default `2` contributes `2`, not `2.0`, and a
+`date-time` or enum default is a plain string. A DataPoint
+base field the schema does not declare contributes the value a fresh Python
+instance holds: `type` is the model name, `metadata` the declared default,
+`version` `1`, `ontology_valid` `False`, the `source_*` fields `None`, and so
+on. `id`, `created_at`, `updated_at` and any name that is neither a field nor a
+base field make every node fall back to a random UUID, as in Python (a warning
+is logged).
+
+Edge sentences (`"{source} {field} {target}."`) and triplet text label a custom
+node with the same Python `str()` of its first non-blank index field, trimmed to
+80 characters with whitespace collapsed (`Role.lead_dev`, `True`,
+`['x', 'y']`), else its `name` stripped but otherwise untouched, else the model
+name. For a union of models (`anyOf` of `$ref`s) the first declared model the
+value validates against wins, keys it does not declare being ignored: the
+generated `DataPoint` subclasses keep Pydantic from ranking candidates.
+
+Answers are validated as Pydantic validates the generated model: a `date-time`
+must be an ISO 8601 datetime with an offset, as speedate accepts it (`T`, `t`,
+`_` or space separator, `.` or `,` fraction, no surrounding whitespace, no
+second 60); an `integer` accepts an integral float below 2^63 in magnitude. A
+non-object `$defs` entry that wraps a model (`People = list[Person]`) is
+rejected at compile time. Known gaps: Unix-timestamp values for a `date-time`
+field and integer literals beyond the u64 range are refused, though Pydantic
+accepts both, and enum member names use Rust's Unicode tables, so a few
+non-ASCII values (combining marks, numeric ideographs) can be named differently
+from Python.
+
+Within one storage batch (one data item's `chunks_per_batch` chunks, as Python's
+`add_data_points` call) a node id is claimed by its first occurrence: a later
+occurrence with the same id, in the same answer or another chunk's, contributes
+neither its properties nor its outgoing edges, though the edge leading to it is
+kept. `transparent: true` makes a structural
 container disappear during persistence so its DataPoint descendants take its
-place. Python's `GraphSchemaSpec` compiler never emits `transparent`, so it only
+place; a truthy scalar it carries is dropped with one warning per type and
+field. Python's `GraphSchemaSpec` compiler never emits `transparent`, so it only
 comes from a hand-written or `BaseModel` schema. For useful output, a
 transparent root must have at least one reachable non-transparent descendant;
 otherwise the custom graph intentionally stores no nodes.
