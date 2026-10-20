@@ -118,14 +118,15 @@ async fn test_triplet_vector_cleanup_after_data_delete() {
         .expect("ingest ds_quantum");
     assert_eq!(data_q.len(), 1);
 
-    let ds_ai = ops::datasets::get_dataset_by_name(&database, "ds_ai", owner_id, None)
+    let ds_ai = ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_ai", owner_id, None)
         .await
         .expect("get ds_ai")
         .expect("ds_ai should exist");
-    let ds_q = ops::datasets::get_dataset_by_name(&database, "ds_quantum", owner_id, None)
-        .await
-        .expect("get ds_quantum")
-        .expect("ds_quantum should exist");
+    let ds_q =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_quantum", owner_id, None)
+            .await
+            .expect("get ds_quantum")
+            .expect("ds_quantum should exist");
 
     // ── Step 2: Cognify both ────────────────────────────────────────────
     let _result_ai = match cognify(
@@ -276,6 +277,7 @@ async fn test_triplet_vector_cleanup_after_data_delete() {
                 data_id: data_ai_id,
                 dataset_name: Some("ds_ai".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -315,10 +317,11 @@ async fn test_triplet_vector_cleanup_after_data_delete() {
     );
 
     // ds_quantum should still be intact in the DB
-    let ds_q_after = ops::datasets::get_dataset_by_name(&database, "ds_quantum", owner_id, None)
-        .await
-        .expect("get ds_quantum after delete")
-        .expect("ds_quantum should still exist");
+    let ds_q_after =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_quantum", owner_id, None)
+            .await
+            .expect("get ds_quantum after delete")
+            .expect("ds_quantum should still exist");
     let q_data = ops::datasets::get_dataset_data(&database, ds_q_after.id)
         .await
         .expect("get ds_quantum data");

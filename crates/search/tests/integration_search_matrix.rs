@@ -174,10 +174,11 @@ async fn test_search_type_matrix() {
         .await
         .expect("ingest quantum");
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, "test_dataset", owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "test_dataset", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
     let data_items = ops::datasets::get_dataset_data(&database, dataset.id)
         .await
         .expect("get_dataset_data");

@@ -1,6 +1,6 @@
 /**
- * Repro for bug: `datasets.has()` throws on a non-UUID string instead of
- * returning `false`. Offline setup (MOCK_EMBEDDING, dummy key, temp SQLite),
+ * `datasets.has()` on ids that are not the caller's datasets: both a non-UUID
+ * string and an unknown UUID are refused, like Python's `datasets.has_data`. Offline setup (MOCK_EMBEDDING, dummy key, temp SQLite),
  * mirroring datasets.test.ts, but via the high-level Cognee class.
  */
 import * as fs from "fs";
@@ -9,7 +9,7 @@ import * as path from "path";
 
 import { Cognee } from "../src/cognee";
 
-describe("datasets.has() with a non-UUID id (repro)", () => {
+describe("datasets.has() with an id that is not the caller's dataset", () => {
   let tmpDir: string;
   let c: Cognee;
 
@@ -33,13 +33,17 @@ describe("datasets.has() with a non-UUID id (repro)", () => {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
-  it("returns false for a non-UUID id instead of throwing", async () => {
-    await expect(c.datasets.has("nonexistent-id")).resolves.toBe(false);
+  // Like Python's `datasets.has_data` and `listData`, a non-UUID id is a
+  // validation error, not `false` (SDK-936).
+  it("rejects a non-UUID id", async () => {
+    await expect(c.datasets.has("nonexistent-id")).rejects.toThrow();
   });
 
-  it("returns false for a valid but unknown UUID", async () => {
+  // A valid UUID that is not one of the caller's datasets is refused, like
+  // Python's `datasets.has_data` (PermissionDeniedError).
+  it("rejects a valid but unknown UUID", async () => {
     await expect(
       c.datasets.has("00000000-0000-0000-0000-000000000001")
-    ).resolves.toBe(false);
+    ).rejects.toThrow();
   });
 });

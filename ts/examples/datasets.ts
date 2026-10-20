@@ -106,8 +106,10 @@ async function main(): Promise<void> {
   const deleteResult = await cognee.datasets.empty(firstId);
   console.log("Delete result:", JSON.stringify(deleteResult, null, 2));
 
-  const stillHas = await cognee.datasets.has(firstId);
-  console.log(`has("${firstId}") after empty: ${stillHas}`);
+  // `empty()` deletes the dataset itself, so `has()` on its id now rejects
+  // (an unknown id is not the caller's dataset); list instead.
+  const remaining = (await cognee.datasets.list()).map((ds) => ds.id);
+  console.log(`"${firstId}" still listed after empty: ${remaining.includes(firstId)}`);
 }
 
 main().catch((err) => {

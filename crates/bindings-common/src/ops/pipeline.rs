@@ -179,10 +179,14 @@ pub async fn existing_data_ids(
     owner_id: Uuid,
     tenant_id: Option<Uuid>,
 ) -> Result<HashSet<Uuid>, SdkError> {
-    let dataset =
-        cognee::database::IngestDb::get_dataset_by_name(&*svc.database, name, owner_id, tenant_id)
-            .await
-            .map_err(|e| SdkError::Runtime(format!("failed to resolve dataset '{name}': {e}")))?;
+    let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
+        &*svc.database,
+        name,
+        owner_id,
+        tenant_id,
+    )
+    .await
+    .map_err(|e| SdkError::Runtime(format!("failed to resolve dataset '{name}': {e}")))?;
     let Some(dataset) = dataset else {
         return Ok(HashSet::new());
     };
@@ -213,14 +217,19 @@ pub async fn resolve_dataset(
     owner_id: Uuid,
     tenant_id: Option<Uuid>,
 ) -> Result<Dataset, SdkError> {
-    cognee::database::IngestDb::get_dataset_by_name(&*svc.database, name, owner_id, tenant_id)
-        .await
-        .map_err(|e| SdkError::Runtime(format!("failed to resolve dataset '{name}': {e}")))?
-        .ok_or_else(|| {
-            SdkError::Validation(format!(
-                "dataset '{name}' was not found for owner {owner_id}"
-            ))
-        })
+    cognee::database::IngestDb::get_dataset_by_name_in_tenant(
+        &*svc.database,
+        name,
+        owner_id,
+        tenant_id,
+    )
+    .await
+    .map_err(|e| SdkError::Runtime(format!("failed to resolve dataset '{name}': {e}")))?
+    .ok_or_else(|| {
+        SdkError::Validation(format!(
+            "dataset '{name}' was not found for owner {owner_id}"
+        ))
+    })
 }
 
 /// Best-effort `User.email` lookup for cognify provenance stamping.

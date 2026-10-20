@@ -40,14 +40,6 @@ struct DefaultsOnly<'a>(&'a DatabaseConnection);
 
 #[async_trait::async_trait]
 impl IngestDb for DefaultsOnly<'_> {
-    async fn get_dataset_by_name(
-        &self,
-        name: &str,
-        owner_id: Uuid,
-        tenant_id: Option<Uuid>,
-    ) -> Result<Option<Dataset>, DatabaseError> {
-        IngestDb::get_dataset_by_name(self.0, name, owner_id, tenant_id).await
-    }
     async fn get_dataset(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError> {
         IngestDb::get_dataset(self.0, id).await
     }

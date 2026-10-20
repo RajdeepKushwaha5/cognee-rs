@@ -170,11 +170,15 @@ async fn test_default_backend_add_cognify_search_delete() {
         .with_summarization(true)
         .with_triplet_embeddings(false);
 
-    let dataset =
-        ops::datasets::get_dataset_by_name(&database, "artificial_intelligence", owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset should exist after ingest");
+    let dataset = ops::datasets::get_dataset_by_name_in_tenant(
+        &database,
+        "artificial_intelligence",
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant")
+    .expect("dataset should exist after ingest");
 
     let result = match cognify(
         data_items,

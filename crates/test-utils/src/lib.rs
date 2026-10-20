@@ -17,6 +17,7 @@
     reason = "test infrastructure: drives configuration through the process env for the tests that use it"
 )]
 
+pub mod failing_delete_db;
 pub mod mock_acl_db;
 pub mod mock_llm;
 pub mod mock_transcriber;
@@ -32,6 +33,7 @@ use cognee_llm::OpenAIAdapter;
 pub use cognee_graph::MockGraphDB;
 pub use cognee_storage::MockStorage;
 pub use cognee_vector::MockVectorDB;
+pub use failing_delete_db::FailingDeleteDb;
 pub use mock_acl_db::{GrantGate, MockAclDb};
 pub use mock_llm::MockLlm;
 pub use mock_transcriber::MockTranscriber;

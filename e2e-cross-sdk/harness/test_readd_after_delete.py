@@ -198,7 +198,12 @@ def test_readd_after_cross_sdk_delete(tmp_path):
     )
 
     # ── Step 3: Rust deletes ─────────────────────────────────────────────
-    result = run_rust_cli(rust_ws, ["delete", "--all", "-f"], check=False)
+    # `delete --all` deletes the acting user's datasets in its tenant (Python's
+    # `datasets.delete_all`), so pass the tenant the rows were written with.
+    delete_args = ["delete", "--all", "-f"]
+    if tenant_id_str:
+        delete_args.extend(["--tenant-id", tenant_id_str])
+    result = run_rust_cli(rust_ws, delete_args, check=False)
     assert result.returncode == 0, (
         f"Rust delete failed:\n{result.stdout}\n{result.stderr}"
     )

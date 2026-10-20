@@ -173,6 +173,7 @@ async fn hard_delete_removes_document_graph_node() {
                 data_id,
                 dataset_name: Some("doc_delete_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,

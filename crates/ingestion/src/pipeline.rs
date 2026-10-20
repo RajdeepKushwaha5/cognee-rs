@@ -487,7 +487,7 @@ pub async fn persist_data_with_acl_and_locks(
     } else {
         let generated_id = generate_dataset_id(dataset_name, owner_id, tenant_id);
         match database
-            .get_dataset_by_name(dataset_name, owner_id, tenant_id)
+            .get_dataset_by_name_in_tenant(dataset_name, owner_id, tenant_id)
             .await?
         {
             Some(ds) => {
@@ -2043,11 +2043,15 @@ mod tests {
         assert_eq!(result1[0].id, result2[0].id);
         assert_eq!(result1[0].content_hash, result2[0].content_hash);
 
-        let dataset =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "test_dataset", owner_id, None)
-                .await
-                .unwrap()
-                .unwrap();
+        let dataset = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "test_dataset",
+            owner_id,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let ds_data = cognee_database::DeleteDb::get_dataset_data(&*db, dataset.id)
             .await
             .unwrap();
@@ -2938,11 +2942,15 @@ mod tests {
             metadata_json(&fourth[0]),
             serde_json::json!({"node_set": ["beta", "gamma"]})
         );
-        let dataset =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "re_add_ds", owner_id, None)
-                .await
-                .unwrap()
-                .unwrap();
+        let dataset = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "re_add_ds",
+            owner_id,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let rows = cognee_database::DeleteDb::get_dataset_data(&*db, dataset.id)
             .await
             .unwrap();
@@ -3039,10 +3047,15 @@ mod tests {
 
         // Nothing was stored: the dataset was never created.
         assert!(
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "invalid_set_ds", owner_id, None)
-                .await
-                .unwrap()
-                .is_none()
+            cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+                &*db,
+                "invalid_set_ds",
+                owner_id,
+                None
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
 
         // `null` means no node set, as `validate_node_set_names(None)` does.

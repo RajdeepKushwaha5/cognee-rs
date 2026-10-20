@@ -190,7 +190,7 @@ async fn persist_tags_nodes_with_user_sessions_node_set() {
     // `user_sessions_from_cache`. Cognify may succeed or fail internally
     // depending on the mock backends, but the Stage-2 invariant is that
     // the session text was ingested with the correct `node_set`.
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_persist", owner, None)
+    let ds = ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_persist", owner, None)
         .await
         .unwrap()
         .expect("dataset exists after persist_sessions");
@@ -210,5 +210,95 @@ async fn persist_tags_nodes_with_user_sessions_node_set() {
     assert!(
         has_tag,
         "expected at least one Data row tagged with {USER_SESSIONS_NODE_SET}"
+    );
+}
+
+/// SDK-936: a tenant-less persist never touches a tenanted dataset of
+/// the same name. The add and the follow-up lookup both resolve the name with
+/// strict tenant equality (`get_dataset_ids.py:29-34@37f788bd2`,
+/// `create_dataset.py:16-22@37f788bd2`). The tenanted row is seeded **first**
+/// so a tenant-loose lookup would have returned it.
+#[tokio::test]
+async fn persist_sessions_tenantless_never_touches_a_tenanted_same_named_dataset() {
+    let h = make_harness().await;
+    let owner = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+    let user_id = owner.to_string();
+    let session_id = "session_persist_tenant";
+
+    let tenanted = ds_ops::create_dataset(
+        h.db.as_ref(),
+        cognee_models::Dataset::new(
+            "ds_persist".to_string(),
+            owner,
+            Some(t1),
+            cognee_ingestion::generate_dataset_id("ds_persist", owner, Some(t1)),
+        ),
+    )
+    .await
+    .unwrap();
+
+    h.session_store
+        .create_qa_entry(
+            session_id,
+            Some(&user_id),
+            "Who is Alice?",
+            "Alice is a software engineer.",
+            None,
+        )
+        .await
+        .unwrap();
+    let llm: Arc<dyn Llm> = Arc::new(
+        MockLlm::new(vec![r#"{"nodes":[],"relationships":[]}"#.to_string()])
+            .with_summary_response(r#"{"summary":"s","description":"d"}"#.to_string()),
+    );
+    let config = CognifyConfig::default();
+
+    let _ = persist_sessions_in_knowledge_graph(
+        &[session_id.to_string()],
+        "ds_persist",
+        owner,
+        None,
+        Arc::clone(&h.session_store),
+        &h.add_pipeline,
+        llm,
+        Arc::clone(&h.storage),
+        h.graph_db.clone() as Arc<_>,
+        h.vector_db.clone() as Arc<_>,
+        h.embedding_engine.clone() as Arc<_>,
+        h.db.clone(),
+        Arc::new(cognee_database::NoopPipelineRunRepository::new())
+            as Arc<dyn cognee_database::PipelineRunRepository>,
+        Arc::new(
+            cognee_core::RayonThreadPool::with_default_threads().expect("RayonThreadPool init"),
+        ) as Arc<dyn cognee_core::CpuPool>,
+        Arc::clone(&h.ontology),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        ds_ops::get_dataset_data(h.db.as_ref(), tenanted.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the tenanted same-named dataset must not receive tenant-less session data"
+    );
+    let tenantless =
+        ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_persist", owner, None)
+            .await
+            .unwrap()
+            .expect("a tenant-less ds_persist must exist");
+    assert_ne!(tenantless.id, tenanted.id);
+    let data_items = ds_ops::get_dataset_data(h.db.as_ref(), tenantless.id)
+        .await
+        .unwrap();
+    assert!(
+        data_items.iter().any(|d| d
+            .node_set
+            .as_deref()
+            .is_some_and(|s| s.contains(USER_SESSIONS_NODE_SET))),
+        "the tenant-less dataset must hold the tagged session data"
     );
 }

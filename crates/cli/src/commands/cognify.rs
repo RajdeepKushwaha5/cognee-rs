@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use cognee::cognify::{CognifyResult, FailureReport, cognify};
 use cognee::database::{PipelineRunRepository, RelationalDb};
+use cognee::models::Dataset;
 use cognee::{ComponentManager, PipelineContext};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -173,6 +174,7 @@ pub fn run(args: CognifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
         }
     }
 
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
     let requested_datasets = args.datasets.clone();
 
     crate::teardown::run_command(Arc::clone(&cm), async {
@@ -182,7 +184,8 @@ pub fn run(args: CognifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let dataset_names = resolve_dataset_names(&*database, owner_id, requested_datasets).await?;
+        let datasets =
+            resolve_datasets(&*database, owner_id, tenant_id, requested_datasets).await?;
 
         let storage = cm
             .storage()
@@ -241,24 +244,8 @@ pub fn run(args: CognifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
         let mut total_summaries = 0usize;
         let mut total_embeddings = 0usize;
 
-        for dataset_name in &dataset_names {
-            let dataset = cognee::database::IngestDb::get_dataset_by_name(
-                &*database,
-                dataset_name,
-                owner_id,
-                None,
-            )
-            .await
-            .map_err(|error| {
-                CliError::Runtime(format!(
-                    "Failed to resolve dataset '{dataset_name}': {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                CliError::Validation(format!(
-                    "Dataset '{dataset_name}' was not found for owner {owner_id}"
-                ))
-            })?;
+        for dataset in &datasets {
+            let dataset_name = &dataset.name;
 
             let data_items = cognee::database::DeleteDb::get_dataset_data(&*database, dataset.id)
                 .await
@@ -338,30 +325,67 @@ pub fn run(args: CognifyArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
     })
 }
 
-pub(crate) async fn resolve_dataset_names(
+/// The datasets a dataset-wide command (`cognify`, `memify`) runs on, for
+/// `owner_id` in `tenant_id` with **strict** tenant equality (`None` ⇔ a
+/// tenant-less row).
+///
+/// - With names: one strict lookup each — Python resolves names to the
+///   owner's datasets in the caller's tenant
+///   (`cognee/modules/pipelines/operations/pipeline.py:103` →
+///   `resolve_authorized_user_datasets.py:39` → `get_dataset_ids.py:29-34`,
+///   all @37f788bd2). A miss is a validation error.
+/// - Without names: the owner's datasets in `tenant_id` — Python falls back to
+///   the user's authorized datasets, which are tenant-filtered
+///   (`resolve_authorized_user_datasets.py:39-43`,
+///   `get_all_user_permission_datasets.py:49-53` @37f788bd2).
+pub(crate) async fn resolve_datasets(
     database: &dyn RelationalDb,
     owner_id: Uuid,
+    tenant_id: Option<Uuid>,
     requested_datasets: Vec<String>,
-) -> Result<Vec<String>, CliError> {
-    if !requested_datasets.is_empty() {
-        return Ok(requested_datasets);
+) -> Result<Vec<Dataset>, CliError> {
+    if requested_datasets.is_empty() {
+        let datasets: Vec<Dataset> =
+            cognee::database::IngestDb::list_datasets_by_owner(database, owner_id)
+                .await
+                .map_err(|error| {
+                    CliError::Runtime(format!(
+                        "Failed to list datasets for owner {owner_id}: {error}"
+                    ))
+                })?
+                .into_iter()
+                .filter(|dataset| dataset.tenant_id == tenant_id)
+                .collect();
+        if datasets.is_empty() {
+            return Err(CliError::Validation(format!(
+                "No datasets found for owner {owner_id}. Add data first or pass --datasets."
+            )));
+        }
+        return Ok(datasets);
     }
 
-    let datasets = cognee::database::IngestDb::list_datasets_by_owner(database, owner_id)
+    let mut datasets = Vec::with_capacity(requested_datasets.len());
+    for dataset_name in &requested_datasets {
+        let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
+            database,
+            dataset_name,
+            owner_id,
+            tenant_id,
+        )
         .await
         .map_err(|error| {
             CliError::Runtime(format!(
-                "Failed to list datasets for owner {owner_id}: {error}"
+                "Failed to resolve dataset '{dataset_name}': {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            CliError::Validation(format!(
+                "Dataset '{dataset_name}' was not found for owner {owner_id}"
             ))
         })?;
-
-    if datasets.is_empty() {
-        return Err(CliError::Validation(format!(
-            "No datasets found for owner {owner_id}. Add data first or pass --datasets."
-        )));
+        datasets.push(dataset);
     }
-
-    Ok(datasets.into_iter().map(|dataset| dataset.name).collect())
+    Ok(datasets)
 }
 
 #[cfg(test)]

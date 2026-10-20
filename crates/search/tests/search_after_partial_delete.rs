@@ -183,10 +183,11 @@ async fn test_search_returns_empty_for_deleted_doc_and_non_empty_for_remaining()
         .expect("ingest Quantum");
     assert_eq!(quantum_data.len(), 1);
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, "search_test", owner_id, None)
-        .await
-        .expect("get dataset")
-        .expect("dataset should exist");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "search_test", owner_id, None)
+            .await
+            .expect("get dataset")
+            .expect("dataset should exist");
 
     // ── Step 2: Cognify both documents together ─────────────────────────
     let all_items = [germany_data, quantum_data].concat();
@@ -266,6 +267,7 @@ async fn test_search_returns_empty_for_deleted_doc_and_non_empty_for_remaining()
                 data_id: germany_data_id,
                 dataset_name: Some("search_test".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

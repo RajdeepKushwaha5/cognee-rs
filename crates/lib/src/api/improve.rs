@@ -433,7 +433,7 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
                                 Ok(data_rows) if !data_rows.is_empty() => {
                                     // Resolve dataset_id the same way persist_sessions does.
                                     let dataset_id_opt =
-                                        cognee_database::IngestDb::get_dataset_by_name(
+                                        cognee_database::IngestDb::get_dataset_by_name_in_tenant(
                                             &*database,
                                             &dataset_name,
                                             owner_id,
@@ -596,7 +596,7 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
             .expect("has_sessions guarantees session_ids is Some with non-empty vec");
         if let Some(database) = db.as_ref() {
             // Resolve the dataset the same way Stage 4 does.
-            match cognee_database::IngestDb::get_dataset_by_name(
+            match cognee_database::IngestDb::get_dataset_by_name_in_tenant(
                 &**database,
                 &dataset_name,
                 owner_id,
@@ -769,7 +769,7 @@ pub async fn improve(params: ImproveParams<'_>) -> Result<ImproveResult, ApiErro
         ) {
             (Some(dbc), Some(mgr), Some(ckstore)) => {
                 // Stage 4 requires a dataset UUID. Resolve from the name.
-                let dataset_id_opt = cognee_database::IngestDb::get_dataset_by_name(
+                let dataset_id_opt = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
                     &**dbc,
                     &dataset_name,
                     owner_id,

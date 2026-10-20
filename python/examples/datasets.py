@@ -115,9 +115,10 @@ async def main() -> None:
     delete_result = await cognee.datasets.empty(first_id)
     print("Delete result:", json.dumps(delete_result, indent=2, default=str))
 
-    # Confirm it's gone.
-    still_has = await cognee.datasets.has(first_id)
-    print(f"has({first_id!r}) after empty: {still_has}")
+    # Confirm it's gone. `empty()` deletes the dataset itself, so `has()` on its
+    # id now raises (an unknown id is not the caller's dataset); list instead.
+    remaining = [ds["id"] for ds in await cognee.datasets.list()]
+    print(f"{first_id!r} still listed after empty: {first_id in remaining}")
 
 
 if __name__ == "__main__":

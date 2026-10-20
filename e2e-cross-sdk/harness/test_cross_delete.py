@@ -83,7 +83,12 @@ def test_python_add_rust_delete_relational(tmp_path):
     )
 
     # ── Rust: delete --all -f ───────────────────────────────────────────
-    result = run_rust_cli(rust_ws, ["delete", "--all", "-f"], check=False)
+    # `delete --all` deletes the acting user's datasets in its tenant (Python's
+    # `datasets.delete_all`), so pass the tenant the rows were written with.
+    delete_args = ["delete", "--all", "-f"]
+    if tenant_id_str:
+        delete_args.extend(["--tenant-id", tenant_id_str])
+    result = run_rust_cli(rust_ws, delete_args, check=False)
     assert result.returncode == 0, (
         f"Rust delete on Python-created DB failed (exit {result.returncode}):\n"
         f"--- stdout ---\n{result.stdout}\n"

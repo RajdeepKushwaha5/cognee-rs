@@ -152,10 +152,11 @@ async fn cognify_e2e_stamps_with_expected_task_names() {
         .await
         .expect("ingest.add");
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, "provenance_e2e", owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "provenance_e2e", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
 
     // ── Step 2: cognify ──────────────────────────────────────────────────
     let user_email = Some("alice@example.com".to_string());

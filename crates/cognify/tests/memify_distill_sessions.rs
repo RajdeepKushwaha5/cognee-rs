@@ -195,7 +195,7 @@ async fn distill_no_qa_returns_no_qa_entries() {
     assert_eq!(res.status, DistillationStatus::NoQaEntries);
     assert!(res.documents.is_empty());
     // No dataset was created (add never ran).
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_noqa", owner, None)
+    let ds = ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_noqa", owner, None)
         .await
         .unwrap();
     assert!(ds.is_none(), "no dataset should exist when there is no Q&A");
@@ -296,7 +296,7 @@ async fn distill_writer_rejects_yields_no_accepted_lessons() {
     assert_eq!(res.status, DistillationStatus::NoAcceptedLessons);
     assert!(res.documents.is_empty());
     // No dataset created — add never ran.
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_reject", owner, None)
+    let ds = ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_reject", owner, None)
         .await
         .unwrap();
     assert!(ds.is_none(), "rejected lessons must not create a dataset");
@@ -360,9 +360,10 @@ async fn distill_writer_failopen_yields_no_accepted_lessons() {
     assert!(res.dataset_id.is_none());
     // No dataset created — the fail-open writer produced no accepted lesson, so
     // add/cognify never ran.
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_writer_failopen", owner, None)
-        .await
-        .unwrap();
+    let ds =
+        ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_writer_failopen", owner, None)
+            .await
+            .unwrap();
     assert!(
         ds.is_none(),
         "a fail-open (Err→None) writer call must not create a dataset"
@@ -434,7 +435,7 @@ async fn distill_sessions_failopen_isolates_sessions() {
 
     // A's dataset holds the single rendered lesson Data row, tagged with BOTH the
     // generic and the per-session node-set.
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_iso", owner, None)
+    let ds = ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_iso", owner, None)
         .await
         .unwrap()
         .expect("dataset exists after session A publishes");
@@ -519,7 +520,7 @@ async fn distill_happy_path_tags_both_node_sets() {
 
     // The dataset exists and holds the rendered lesson Data row, tagged with
     // BOTH the generic and the per-session node-set.
-    let ds = ds_ops::get_dataset_by_name(h.db.as_ref(), "ds_happy", owner, None)
+    let ds = ds_ops::get_dataset_by_name_in_tenant(h.db.as_ref(), "ds_happy", owner, None)
         .await
         .unwrap()
         .expect("dataset exists after publish");

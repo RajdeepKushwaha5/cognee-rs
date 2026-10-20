@@ -315,11 +315,16 @@ impl Harness {
     }
 
     async fn dataset_id(&self, dataset_name: &str) -> Uuid {
-        ops::datasets::get_dataset_by_name(&self.database, dataset_name, self.owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset exists")
-            .id
+        ops::datasets::get_dataset_by_name_in_tenant(
+            &self.database,
+            dataset_name,
+            self.owner_id,
+            None,
+        )
+        .await
+        .expect("get_dataset_by_name_in_tenant")
+        .expect("dataset exists")
+        .id
     }
 
     async fn cognify(

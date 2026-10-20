@@ -742,11 +742,15 @@ async fn phase_cognify(
     let embedding_engine = cm.embedding_engine().await.map_err(|e| e.to_string())?;
     let llm = cm.llm().await.map_err(|e| e.to_string())?;
 
-    let dataset =
-        cognee::database::IngestDb::get_dataset_by_name(&*database, dataset_name, owner_id, None)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("dataset '{dataset_name}' not found for owner {owner_id}"))?;
+    let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
+        &*database,
+        dataset_name,
+        owner_id,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("dataset '{dataset_name}' not found for owner {owner_id}"))?;
 
     let data_items = cognee::database::DeleteDb::get_dataset_data(&*database, dataset.id)
         .await
@@ -955,10 +959,14 @@ async fn phase_dataset_delete(
     // Python guards this with `if found:` — a failed add leaves nothing to
     // delete, and the phase still reports its (near-zero) elapsed rather than
     // failing a run that has already recorded the real failure in `add`.
-    let Some(dataset) =
-        cognee::database::IngestDb::get_dataset_by_name(&*database, dataset_name, owner_id, None)
-            .await
-            .map_err(|e| e.to_string())?
+    let Some(dataset) = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
+        &*database,
+        dataset_name,
+        owner_id,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?
     else {
         warn!("dataset '{dataset_name}' not found — nothing to delete");
         return Ok(());

@@ -138,10 +138,11 @@ async fn test_entity_ids_are_stable_across_cognify_runs() {
         .await
         .expect("ingest");
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, dataset_name, owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset exists");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, dataset_name, owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset exists");
 
     let run = |items: Vec<cognee_models::Data>| {
         let (llm, storage, graph_db, vector_db, embedding_engine, database, ontology, config) = (

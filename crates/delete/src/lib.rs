@@ -79,10 +79,14 @@ const FALLBACK_VECTOR_COLLECTIONS: &[(&str, &str)] = &[
 
 /// What a delete removes.
 ///
-/// `Data` and `Dataset` name their target through an **owner**: the dataset
-/// is resolved by `(name, owner)` and data links are limited to datasets that
-/// owner owns. They are the owner-scoped forms, right where ownership is the
-/// authorization (no ACL wired).
+/// `Data`, `Dataset` and `User` name their target through an **owner** in a
+/// **tenant**: the dataset is resolved by `(name, owner, tenant_id)` with
+/// strict tenant equality (`None` ⇔ a tenant-less row), data links are limited
+/// to datasets that owner owns in that tenant, and `User` covers the owner's
+/// datasets in that tenant only — Python's `get_dataset_ids` rule
+/// (`cognee/modules/data/methods/get_dataset_ids.py:29-34@37f788bd2`). They are
+/// the owner-scoped forms, right where ownership is the authorization (no ACL
+/// wired); a name never reaches a dataset of another owner or tenant.
 ///
 /// `DataInDataset` and `DatasetById` name the dataset **by id**, whoever owns
 /// it — Python's `datasets.delete_data(dataset_id, data_id)` and
@@ -105,10 +109,18 @@ pub enum DeleteScope {
         /// `delete_dataset_if_empty` parameter. Defaults to `false`.
         #[serde(default)]
         delete_dataset_if_empty: bool,
+        /// The tenant `dataset_name` (or, without a name, the owner's linked
+        /// datasets) resolves in — strict equality, `None` ⇔ tenant-less.
+        #[serde(default)]
+        tenant_id: Option<Uuid>,
     },
     Dataset {
         owner_id: Uuid,
         dataset_name: String,
+        /// The tenant `dataset_name` resolves in — strict equality, `None` ⇔
+        /// tenant-less.
+        #[serde(default)]
+        tenant_id: Option<Uuid>,
     },
     /// One data item of the dataset `dataset_id`, whoever owns either. The item
     /// must be attached to that dataset; only that link is detached.
@@ -121,12 +133,25 @@ pub enum DeleteScope {
         delete_dataset_if_empty: bool,
     },
     /// The dataset `dataset_id` and everything in it, whoever owns it.
-    DatasetById {
-        dataset_id: Uuid,
-    },
+    DatasetById { dataset_id: Uuid },
+    /// Every dataset `owner_id` owns **in `tenant_id`** (strict equality),
+    /// deleted one after another by id, stopping at the first failure — like
+    /// Python's `forget(everything=True)` → `datasets.delete_all(user)`
+    /// (`cognee/api/v1/forget/forget.py:191-205@37f788bd2`,
+    /// `cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). Like Python
+    /// it does **not** delete search history: the history table has no tenant
+    /// or dataset column, so clearing it here would reach the owner's other
+    /// tenants.
     User {
         owner_id: Uuid,
+        /// The tenant whose datasets are deleted; `None` ⇔ tenant-less ones.
+        #[serde(default)]
+        tenant_id: Option<Uuid>,
     },
+    /// The plain service's **store-wide** wipe (every dataset, the whole graph
+    /// and vector store, all search history, the session cache).
+    /// [`AuthorizedDeleteService`] instead expands it to the caller's
+    /// `delete`-authorized datasets in its tenant.
     All,
 }
 
@@ -357,17 +382,29 @@ impl DeleteService {
         )
     )]
     pub async fn preview(&self, request: &DeleteRequest) -> Result<DeletePreview, DeleteError> {
+        if let DeleteScope::User {
+            owner_id,
+            tenant_id,
+        } = &request.scope
+        {
+            let ids = self
+                .owner_dataset_ids_in_tenant(*owner_id, *tenant_id)
+                .await?;
+            return self.preview_datasets_by_id(&ids).await;
+        }
+        self.preview_resolved(request).await
+    }
+
+    /// [`Self::preview`] for every scope but `User` (expanded per dataset
+    /// before it gets here).
+    async fn preview_resolved(
+        &self,
+        request: &DeleteRequest,
+    ) -> Result<DeletePreview, DeleteError> {
         let targets = self.resolve_targets(request).await?;
         let search_queries_to_delete = match &request.scope {
-            DeleteScope::User { owner_id } => self
-                .database
-                .count_search_history_for_user(*owner_id)
-                .await
-                .map_err(|e| {
-                    DeleteError::Runtime(format!(
-                        "Failed to count search history for user {owner_id}: {e}"
-                    ))
-                })? as usize,
+            // Expanded by `preview` per dataset; never counts history.
+            DeleteScope::User { .. } => 0,
             DeleteScope::All => self
                 .database
                 .count_all_search_history()
@@ -402,6 +439,73 @@ impl DeleteService {
         }
         let targets = self.resolve_dataset_list(datasets).await?;
         self.preview_targets(targets, 0).await
+    }
+
+    /// The ids of the datasets `owner_id` owns in `tenant_id` (strict
+    /// equality, `None` ⇔ tenant-less), in listing order — the `User` scope's
+    /// target set (`get_dataset_ids.py:29-34@37f788bd2`).
+    pub(crate) async fn owner_dataset_ids_in_tenant(
+        &self,
+        owner_id: Uuid,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, DeleteError> {
+        Ok(self
+            .database
+            .list_datasets_by_owner(owner_id)
+            .await
+            .map_err(|error| {
+                DeleteError::Runtime(format!(
+                    "Failed to list datasets for owner {owner_id}: {error}"
+                ))
+            })?
+            .into_iter()
+            .filter(|ds| ds.tenant_id == tenant_id)
+            .map(|ds| ds.id)
+            .collect())
+    }
+
+    /// Delete the datasets `dataset_ids`, one after another, each **by id**
+    /// (`DeleteScope::DatasetById`, whoever owns it — no authorization here,
+    /// see [`AuthorizedDeleteService`]). Stops at the first failure like
+    /// Python's `datasets.delete_all`
+    /// (`cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`): a failure on
+    /// the first dataset is returned as is; a later one returns
+    /// [`DeleteError::Partial`] with the sum of the completed results (the
+    /// datasets before it stay deleted).
+    #[tracing::instrument(name = "cognee.delete.execute_datasets_by_id", skip_all)]
+    pub async fn execute_datasets_by_id(
+        &self,
+        dataset_ids: &[Uuid],
+        mode: DeleteMode,
+        memory_only: bool,
+    ) -> Result<DeleteResult, DeleteError> {
+        let mut total = DeleteResult::default();
+        for (done, dataset_id) in dataset_ids.iter().enumerate() {
+            let request = DeleteRequest {
+                scope: DeleteScope::DatasetById {
+                    dataset_id: *dataset_id,
+                },
+                mode: mode.clone(),
+                memory_only,
+            };
+            match self.execute_resolved(&request).await {
+                Ok(result) => total += result,
+                Err(error) if done == 0 => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        failed_dataset = %dataset_id,
+                        completed_datasets = done,
+                        "per-dataset delete stopped at the first failing dataset"
+                    );
+                    return Err(DeleteError::Partial {
+                        completed: Box::new(total),
+                        failed_dataset_id: *dataset_id,
+                        source: Box::new(error),
+                    });
+                }
+            }
+        }
+        Ok(total)
     }
 
     async fn preview_targets(
@@ -454,6 +558,25 @@ impl DeleteService {
         )
     )]
     pub async fn execute(&self, request: &DeleteRequest) -> Result<DeleteResult, DeleteError> {
+        if let DeleteScope::User {
+            owner_id,
+            tenant_id,
+        } = &request.scope
+        {
+            let ids = self
+                .owner_dataset_ids_in_tenant(*owner_id, *tenant_id)
+                .await?;
+            return self
+                .execute_datasets_by_id(&ids, request.mode.clone(), request.memory_only)
+                .await;
+        }
+        self.execute_resolved(request).await
+    }
+
+    /// [`Self::execute`] for every scope but `User` (expanded per dataset
+    /// before it gets here). Never calls [`Self::execute`], so the per-dataset
+    /// loops built on it do not recurse.
+    async fn execute_resolved(&self, request: &DeleteRequest) -> Result<DeleteResult, DeleteError> {
         let targets = self.resolve_targets(request).await?;
 
         info!(
@@ -746,15 +869,9 @@ impl DeleteService {
         // ------------------------------------------------------------------
 
         let deleted_search_queries = match &request.scope {
-            DeleteScope::User { owner_id } => self
-                .database
-                .delete_search_history_for_user(*owner_id)
-                .await
-                .map_err(|e| {
-                    DeleteError::Runtime(format!(
-                        "Failed to delete search history for user {owner_id}: {e}"
-                    ))
-                })? as usize,
+            // Expanded by `execute` per dataset; history is never deleted for
+            // `User` (Python `delete_all` does not, and the table has no tenant).
+            DeleteScope::User { .. } => 0,
             DeleteScope::All => self
                 .database
                 .delete_all_search_history()
@@ -1586,11 +1703,13 @@ impl DeleteService {
                 data_id,
                 dataset_name,
                 delete_dataset_if_empty,
+                tenant_id,
             } => {
                 self.resolve_data_scope(
                     *owner_id,
                     *data_id,
                     dataset_name.as_deref(),
+                    *tenant_id,
                     *delete_dataset_if_empty,
                 )
                 .await
@@ -1598,7 +1717,11 @@ impl DeleteService {
             DeleteScope::Dataset {
                 owner_id,
                 dataset_name,
-            } => self.resolve_dataset_scope(*owner_id, dataset_name).await,
+                tenant_id,
+            } => {
+                self.resolve_dataset_scope(*owner_id, dataset_name, *tenant_id)
+                    .await
+            }
             DeleteScope::DataInDataset {
                 dataset_id,
                 data_id,
@@ -1611,39 +1734,65 @@ impl DeleteService {
                 let dataset = self.dataset_by_id(*dataset_id).await?;
                 self.resolve_dataset_list(vec![dataset]).await
             }
-            DeleteScope::User { owner_id } => self.resolve_user_scope(*owner_id).await,
+            // `execute` / `preview` expand `User` per dataset (by id) first.
+            DeleteScope::User { .. } => Err(DeleteError::Runtime(
+                "DeleteScope::User is expanded per dataset before target resolution".to_string(),
+            )),
             DeleteScope::All => self.resolve_all_scope().await,
         }
     }
 
+    /// `DeleteScope::Data`: the item `data_id` of `owner_id`, in the dataset
+    /// `dataset_name` resolved in `tenant_id` (strict), or — without a name —
+    /// detached from every dataset the owner owns **in `tenant_id`**
+    /// (`get_dataset_ids.py:34@37f788bd2`; Python has no dataset-less item
+    /// delete, this Rust extension keeps the same tenant rule).
     #[tracing::instrument(level = "debug", skip(self))]
     async fn resolve_data_scope(
         &self,
         owner_id: Uuid,
         data_id: Uuid,
         dataset_name: Option<&str>,
+        tenant_id: Option<Uuid>,
         delete_dataset_if_empty: bool,
     ) -> Result<ResolvedDeleteTargets, DeleteError> {
+        // A named dataset is resolved before the ghost check, so a missing
+        // Data row inside it can honour `delete_dataset_if_empty`.
+        let named_dataset = match dataset_name {
+            Some(dataset_name) => Some(
+                self.dataset_by_name_in_tenant(owner_id, dataset_name, tenant_id)
+                    .await?,
+            ),
+            None => None,
+        };
+
         let data = self.database.get_data(data_id).await.map_err(|error| {
             DeleteError::Runtime(format!("Failed to fetch data {data_id}: {error}"))
         })?;
 
-        // Python behaviour (datasets.py:165-176): when the Data row is absent the
-        // caller may be using a custom graph model that didn't go through the
-        // standard ingestion pipeline. In that case we still attempt graph/vector
-        // cleanup using a minimal ghost targets struct (candidate_data_ids set, no
-        // links to detach, no datasets to delete) and return success rather than
-        // an error.
+        // Python behaviour (`datasets.py:253-273@37f788bd2`): when the Data
+        // row is absent the caller may be using a custom graph model that
+        // didn't go through the standard ingestion pipeline. In that case we
+        // still attempt graph/vector cleanup using a minimal ghost targets
+        // struct (candidate_data_ids set, no links to detach) and return
+        // success rather than an error. With a named dataset, the dataset is
+        // deleted too when the flag is set and it holds no data.
         let Some(data) = data else {
             tracing::warn!(
                 data_id = %data_id,
                 "Data row not found — assuming custom graph model; attempting orphan cleanup"
             );
-            return Ok(ResolvedDeleteTargets {
-                datasets_to_delete: Vec::new(),
-                links_to_detach: Vec::new(),
-                candidate_data_ids: vec![data_id],
-            });
+            return match named_dataset {
+                Some(dataset) => {
+                    self.ghost_targets(dataset, data_id, delete_dataset_if_empty)
+                        .await
+                }
+                None => Ok(ResolvedDeleteTargets {
+                    datasets_to_delete: Vec::new(),
+                    links_to_detach: Vec::new(),
+                    candidate_data_ids: vec![data_id],
+                }),
+            };
         };
 
         if data.owner_id != owner_id {
@@ -1658,22 +1807,7 @@ impl DeleteService {
         let mut affected_datasets: Vec<(cognee_models::Dataset, Vec<cognee_models::Data>)> =
             Vec::new();
 
-        if let Some(dataset_name) = dataset_name {
-            let dataset = self
-                .database
-                .get_dataset_by_name(dataset_name, owner_id, None)
-                .await
-                .map_err(|error| {
-                    DeleteError::Runtime(format!(
-                        "Failed to resolve dataset '{dataset_name}': {error}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    DeleteError::Validation(format!(
-                        "Dataset '{dataset_name}' was not found for owner {owner_id}"
-                    ))
-                })?;
-
+        if let Some(dataset) = named_dataset {
             let data_items = self
                 .database
                 .get_dataset_data(dataset.id)
@@ -1706,7 +1840,7 @@ impl DeleteService {
                 })?;
 
             for dataset in datasets {
-                if dataset.owner_id == owner_id {
+                if dataset.owner_id == owner_id && dataset.tenant_id == tenant_id {
                     links_to_detach.push((dataset.id, data_id));
                     if delete_dataset_if_empty {
                         let data_items =
@@ -1750,6 +1884,67 @@ impl DeleteService {
         })
     }
 
+    /// The dataset `dataset_name` of `owner_id` in `tenant_id` (strict
+    /// equality, `None` ⇔ tenant-less; `get_dataset_ids.py:29-34@37f788bd2`),
+    /// or a validation error naming it.
+    async fn dataset_by_name_in_tenant(
+        &self,
+        owner_id: Uuid,
+        dataset_name: &str,
+        tenant_id: Option<Uuid>,
+    ) -> Result<Dataset, DeleteError> {
+        self.database
+            .get_dataset_by_name_in_tenant(dataset_name, owner_id, tenant_id)
+            .await
+            .map_err(|error| {
+                DeleteError::Runtime(format!(
+                    "Failed to resolve dataset '{dataset_name}': {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DeleteError::Validation(format!(
+                    "Dataset '{dataset_name}' was not found for owner {owner_id}"
+                ))
+            })
+    }
+
+    /// Targets for an item with no `Data` row inside `dataset`: Python
+    /// `delete_data` finds no such item among the dataset's data, cleans up
+    /// the graph for it, then deletes the dataset when it holds no data and
+    /// `delete_dataset_if_empty` is set
+    /// (`cognee/api/v1/datasets/datasets.py:253-273@37f788bd2`).
+    ///
+    /// The graph cleanup is a no-op in practice: with no link, `cleanup_data`
+    /// never runs, and no Rust path writes provenance without a Data row.
+    async fn ghost_targets(
+        &self,
+        dataset: Dataset,
+        data_id: Uuid,
+        delete_dataset_if_empty: bool,
+    ) -> Result<ResolvedDeleteTargets, DeleteError> {
+        let delete_dataset = delete_dataset_if_empty
+            && self
+                .database
+                .get_dataset_data(dataset.id)
+                .await
+                .map_err(|error| {
+                    DeleteError::Runtime(format!(
+                        "Failed to load data for dataset '{}': {}",
+                        dataset.name, error
+                    ))
+                })?
+                .is_empty();
+        Ok(ResolvedDeleteTargets {
+            datasets_to_delete: if delete_dataset {
+                vec![dataset]
+            } else {
+                Vec::new()
+            },
+            links_to_detach: Vec::new(),
+            candidate_data_ids: vec![data_id],
+        })
+    }
+
     /// The dataset `dataset_id`, or a validation error naming it.
     async fn dataset_by_id(&self, dataset_id: Uuid) -> Result<Dataset, DeleteError> {
         self.database
@@ -1766,11 +1961,15 @@ impl DeleteService {
     /// among *that dataset's* data, and only that link detached.
     ///
     /// A missing `Data` row is the custom-graph-model case and gets the same
-    /// orphan cleanup as [`DeleteScope::Data`]. An existing item that is not
-    /// in the dataset is refused: Python then cleans up graph nodes inside that
-    /// dataset's own databases, which cannot reach other datasets, but here
-    /// the graph and vector stores are shared and the cleanup would reach every
-    /// dataset the item belongs to.
+    /// orphan cleanup as [`DeleteScope::Data`]; like Python, the dataset is
+    /// then deleted when it holds no data and `delete_dataset_if_empty` is set
+    /// (`datasets.py:259-273@37f788bd2`, see `ghost_targets`).
+    ///
+    /// An existing item that is not in the dataset is refused — a documented
+    /// divergence until datasets get their own storage: Python returns success
+    /// there after a graph cleanup inside that dataset's own databases, which
+    /// cannot reach other datasets, but here the graph and vector stores are
+    /// shared and the cleanup would reach every dataset the item belongs to.
     #[tracing::instrument(level = "debug", skip(self))]
     async fn resolve_data_in_dataset_scope(
         &self,
@@ -1787,11 +1986,9 @@ impl DeleteService {
                 data_id = %data_id,
                 "Data row not found — assuming custom graph model; attempting orphan cleanup"
             );
-            return Ok(ResolvedDeleteTargets {
-                datasets_to_delete: Vec::new(),
-                links_to_detach: Vec::new(),
-                candidate_data_ids: vec![data_id],
-            });
+            return self
+                .ghost_targets(dataset, data_id, delete_dataset_if_empty)
+                .await;
         }
 
         let data_items = self
@@ -1828,41 +2025,12 @@ impl DeleteService {
         &self,
         owner_id: Uuid,
         dataset_name: &str,
+        tenant_id: Option<Uuid>,
     ) -> Result<ResolvedDeleteTargets, DeleteError> {
         let dataset = self
-            .database
-            .get_dataset_by_name(dataset_name, owner_id, None)
-            .await
-            .map_err(|error| {
-                DeleteError::Runtime(format!(
-                    "Failed to resolve dataset '{dataset_name}': {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                DeleteError::Validation(format!(
-                    "Dataset '{dataset_name}' was not found for owner {owner_id}"
-                ))
-            })?;
-
+            .dataset_by_name_in_tenant(owner_id, dataset_name, tenant_id)
+            .await?;
         self.resolve_dataset_list(vec![dataset]).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn resolve_user_scope(
-        &self,
-        owner_id: Uuid,
-    ) -> Result<ResolvedDeleteTargets, DeleteError> {
-        let datasets = self
-            .database
-            .list_datasets_by_owner(owner_id)
-            .await
-            .map_err(|error| {
-                DeleteError::Runtime(format!(
-                    "Failed to list datasets for owner {owner_id}: {error}"
-                ))
-            })?;
-
-        self.resolve_dataset_list(datasets).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -2312,6 +2480,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "test_dataset".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2322,10 +2491,14 @@ mod tests {
         assert_eq!(result.deleted_datasets, 1);
         assert_eq!(result.deleted_data, 1);
 
-        let still_exists =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "test_dataset", owner, None)
-                .await
-                .unwrap();
+        let still_exists = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "test_dataset",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(still_exists.is_none(), "dataset should be gone");
     }
 
@@ -2339,6 +2512,7 @@ mod tests {
             scope: DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "test_dataset".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -2349,10 +2523,14 @@ mod tests {
         assert_eq!(preview.datasets_to_delete, 1);
         assert_eq!(preview.data_to_delete, 1);
 
-        let still_exists =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "test_dataset", owner, None)
-                .await
-                .unwrap();
+        let still_exists = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "test_dataset",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             still_exists.is_some(),
             "dataset should still exist after preview"
@@ -2373,6 +2551,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: Uuid::new_v4(),
                     dataset_name: "nonexistent".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2427,6 +2606,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "dataset1".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2484,6 +2664,7 @@ mod tests {
             scope: DeleteScope::Dataset {
                 owner_id: owner,
                 dataset_name: "dataset1".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -2496,6 +2677,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "dataset2".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2525,6 +2707,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner_b,
                     dataset_name: "owner_a_dataset".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2579,6 +2762,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "graph_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2631,6 +2815,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "vector_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2764,6 +2949,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "no_graph_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -2860,6 +3046,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "edge_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3007,6 +3194,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "described_edge_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3114,6 +3302,7 @@ mod tests {
                 data_id,
                 dataset_name: Some("two_owners_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -3274,6 +3463,7 @@ mod tests {
                 data_id,
                 dataset_name: Some("two_edge_owners_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -3328,6 +3518,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "no_prov_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3437,6 +3628,7 @@ mod tests {
                     data_id: data_id_1,
                     dataset_name: Some("shared_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3508,6 +3700,7 @@ mod tests {
                     data_id,
                     dataset_name: Some("prov_data_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3574,6 +3767,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "prov_ds_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3696,6 +3890,7 @@ mod tests {
                     data_id: data_id_1,
                     dataset_name: Some("sibling_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -3813,6 +4008,7 @@ mod tests {
                     scope: DeleteScope::Dataset {
                         owner_id: owner,
                         dataset_name: "acl_ok_ds".to_string(),
+                        tenant_id: None,
                     },
                     mode: DeleteMode::Soft,
                     memory_only: false,
@@ -3931,6 +4127,7 @@ mod tests {
                     scope: DeleteScope::Dataset {
                         owner_id: owner,
                         dataset_name: "acl_fail_ds".to_string(),
+                        tenant_id: None,
                     },
                     mode: DeleteMode::Soft,
                     memory_only: false,
@@ -3968,6 +4165,7 @@ mod tests {
                     scope: DeleteScope::Dataset {
                         owner_id: owner_a,
                         dataset_name: "acl_wrong_principal".to_string(),
+                        tenant_id: None,
                     },
                     mode: DeleteMode::Soft,
                     memory_only: false,
@@ -4008,10 +4206,9 @@ mod tests {
         let result = svc
             .execute(
                 &DeleteRequest {
-                    scope: DeleteScope::Dataset {
-                        owner_id: owner_a,
-                        dataset_name: "acl_delegated".to_string(),
-                    },
+                    // Grant reach goes only through ids: a by-name scope
+                    // must name the caller's own dataset.
+                    scope: DeleteScope::DatasetById { dataset_id },
                     mode: DeleteMode::Soft,
                     memory_only: false,
                 },
@@ -4083,7 +4280,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Scenario: `delete` granted to a *role*; the caller holds the role.
-    /// Exercises `require_delete_permission` (Dataset scope →
+    /// Exercises `require_delete_permission` (by-id scope →
     /// `has_permission_in_tenant`).
     #[tokio::test]
     async fn authorized_delete_via_role_grant_dataset_scope() {
@@ -4110,10 +4307,9 @@ mod tests {
         let result = svc
             .execute(
                 &DeleteRequest {
-                    scope: DeleteScope::Dataset {
-                        owner_id: owner,
-                        dataset_name: "acl_role_ds".to_string(),
-                    },
+                    // Grant reach goes only through ids: a by-name scope
+                    // must name the caller's own dataset.
+                    scope: DeleteScope::DatasetById { dataset_id },
                     mode: DeleteMode::Soft,
                     memory_only: false,
                 },
@@ -4153,6 +4349,7 @@ mod tests {
                     scope: DeleteScope::Dataset {
                         owner_id: owner,
                         dataset_name: "acl_role_read_only".to_string(),
+                        tenant_id: None,
                     },
                     mode: DeleteMode::Soft,
                     memory_only: false,
@@ -4194,7 +4391,10 @@ mod tests {
             .unwrap();
 
         let request = DeleteRequest {
-            scope: DeleteScope::User { owner_id: owner },
+            scope: DeleteScope::User {
+                owner_id: owner,
+                tenant_id: None,
+            },
             mode: DeleteMode::Soft,
             memory_only: false,
         };
@@ -4281,6 +4481,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "no_acl_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4309,6 +4510,7 @@ mod tests {
                     scope: DeleteScope::Dataset {
                         owner_id: owner,
                         dataset_name: "preview_acl_ds".to_string(),
+                        tenant_id: None,
                     },
                     mode: DeleteMode::Soft,
                     memory_only: false,
@@ -4380,6 +4582,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "hard_del_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Hard,
                 memory_only: false,
@@ -4435,6 +4638,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "soft_del_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4512,6 +4716,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "hard_preserve_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Hard,
                 memory_only: false,
@@ -4566,6 +4771,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "ps_clear_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4640,6 +4846,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "ps_ds1".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4713,6 +4920,7 @@ mod tests {
                     data_id,
                     dataset_name: Some("pr_invalidate_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4780,6 +4988,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "pr_cascade_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4832,7 +5041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_scoped_delete_clears_search_history() {
+    async fn user_scoped_delete_keeps_search_history() {
         let (svc, storage, db) = make_service().await;
         let user_a = Uuid::new_v4();
         let user_b = Uuid::new_v4();
@@ -4858,22 +5067,29 @@ mod tests {
         // Delete user A
         let result = svc
             .execute(&DeleteRequest {
-                scope: DeleteScope::User { owner_id: user_a },
+                scope: DeleteScope::User {
+                    owner_id: user_a,
+                    tenant_id: None,
+                },
                 mode: DeleteMode::Soft,
                 memory_only: false,
             })
             .await
             .expect("execute should succeed");
 
-        assert_eq!(result.deleted_search_queries, 3);
+        // Python's `delete_all` never deletes search history
+        // (`datasets.py:316-323@37f788bd2`), and the history table has no
+        // tenant: clearing it from a tenant-scoped `User` delete would reach
+        // the user's other tenants.
+        assert_eq!(result.deleted_search_queries, 0);
+        assert_eq!(result.deleted_datasets, 1);
 
-        // User A's search history should be gone
         let count_a_after = ops::search_history::count_queries_by_user(&db, user_a)
             .await
             .unwrap();
         assert_eq!(
-            count_a_after, 0,
-            "user A's search history should be deleted"
+            count_a_after, 3,
+            "user A's search history must survive a User-scoped delete"
         );
 
         // User B's search history should remain
@@ -4937,6 +5153,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "sh_ds_notouch".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -4969,7 +5186,10 @@ mod tests {
         // User-scoped preview
         let preview = svc
             .preview(&DeleteRequest {
-                scope: DeleteScope::User { owner_id: owner },
+                scope: DeleteScope::User {
+                    owner_id: owner,
+                    tenant_id: None,
+                },
                 mode: DeleteMode::Soft,
                 memory_only: false,
             })
@@ -4977,8 +5197,8 @@ mod tests {
             .expect("preview should succeed");
 
         assert_eq!(
-            preview.search_queries_to_delete, 5,
-            "preview should show correct search query count for user scope"
+            preview.search_queries_to_delete, 0,
+            "a User-scoped delete never deletes search history"
         );
 
         // All-scoped preview
@@ -5002,6 +5222,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "sh_preview_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5154,6 +5375,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id,
                     dataset_name: "test_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5328,6 +5550,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "edge_type_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Hard,
                 memory_only: false,
@@ -5507,6 +5730,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "soft_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5542,6 +5766,7 @@ mod tests {
                     data_id,
                     dataset_name: Some("auto_del_ds".to_string()),
                     delete_dataset_if_empty: true,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5556,9 +5781,14 @@ mod tests {
         );
 
         // Verify the dataset is actually gone from the DB
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "auto_del_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "auto_del_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(ds.is_none(), "dataset should be gone from DB");
     }
 
@@ -5616,6 +5846,7 @@ mod tests {
                     data_id: data_id_1,
                     dataset_name: Some("multi_data_ds".to_string()),
                     delete_dataset_if_empty: true,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5630,9 +5861,14 @@ mod tests {
         );
 
         // Verify the dataset still exists
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "multi_data_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "multi_data_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(ds.is_some(), "dataset should still exist in DB");
     }
 
@@ -5650,6 +5886,7 @@ mod tests {
                     data_id,
                     dataset_name: Some("no_flag_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,
@@ -5664,9 +5901,14 @@ mod tests {
         );
 
         // Verify the dataset still exists (even though it's now empty)
-        let ds = cognee_database::IngestDb::get_dataset_by_name(&*db, "no_flag_ds", owner, None)
-            .await
-            .unwrap();
+        let ds = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "no_flag_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             ds.is_some(),
             "dataset should still exist despite being empty"
@@ -5674,11 +5916,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // tenant_id filtering in DeleteDb::get_dataset_by_name
+    // DeleteDb::get_dataset_by_name_in_tenant is tenant-strict
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn delete_db_get_dataset_by_name_filters_by_tenant_id() {
+    async fn delete_db_by_name_lookup_is_tenant_strict() {
         use cognee_database::DeleteDb;
 
         let db = cognee_database::connect("sqlite::memory:").await.unwrap();
@@ -5708,16 +5950,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Without tenant_id (None), the query returns one of them (ambiguous).
-        let any = db
-            .get_dataset_by_name("shared_name", owner, None)
+        // `None` matches only a tenant-less row: with only tenanted rows it
+        // finds nothing (strict, `get_dataset_ids.py:34@37f788bd2`).
+        let none_yet = db
+            .get_dataset_by_name_in_tenant("shared_name", owner, None)
             .await
             .unwrap();
-        assert!(any.is_some(), "should find at least one dataset");
+        assert!(
+            none_yet.is_none(),
+            "a tenant-less lookup must not return a tenanted row"
+        );
 
         // With tenant_a, only the first dataset is returned.
         let found_a = db
-            .get_dataset_by_name("shared_name", owner, Some(tenant_a))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(tenant_a))
             .await
             .unwrap();
         assert_eq!(
@@ -5728,7 +5974,7 @@ mod tests {
 
         // With tenant_b, only the second dataset is returned.
         let found_b = db
-            .get_dataset_by_name("shared_name", owner, Some(tenant_b))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(tenant_b))
             .await
             .unwrap();
         assert_eq!(
@@ -5739,12 +5985,27 @@ mod tests {
 
         // With a nonexistent tenant_id, nothing is returned.
         let found_none = db
-            .get_dataset_by_name("shared_name", owner, Some(Uuid::new_v4()))
+            .get_dataset_by_name_in_tenant("shared_name", owner, Some(Uuid::new_v4()))
             .await
             .unwrap();
         assert!(
             found_none.is_none(),
             "should find no dataset for unknown tenant"
+        );
+
+        // Add a tenant-less row: `None` now finds exactly it.
+        let ds_none = Dataset::new("shared_name".to_string(), owner, None, Uuid::new_v4());
+        ops::datasets::create_dataset(&db, ds_none.clone())
+            .await
+            .unwrap();
+        let found_tenantless = db
+            .get_dataset_by_name_in_tenant("shared_name", owner, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            found_tenantless.map(|d| d.id),
+            Some(ds_none.id),
+            "`None` must resolve exactly the tenant-less row"
         );
     }
 
@@ -5814,6 +6075,7 @@ mod tests {
                 scope: DeleteScope::Dataset {
                     owner_id: owner,
                     dataset_name: "memory_only_ds".to_string(),
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: true,
@@ -5840,10 +6102,14 @@ mod tests {
         );
 
         // Dataset row still exists in the DB.
-        let ds_still =
-            cognee_database::IngestDb::get_dataset_by_name(&*db, "memory_only_ds", owner, None)
-                .await
-                .unwrap();
+        let ds_still = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+            &*db,
+            "memory_only_ds",
+            owner,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             ds_still.is_some(),
             "Dataset row must survive memory-only forget"
@@ -5951,6 +6217,7 @@ mod tests {
                     data_id,
                     dataset_name: Some("memory_only_item_ds".to_string()),
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: true,
@@ -5967,7 +6234,7 @@ mod tests {
         );
 
         // Dataset row still exists.
-        let ds_still = cognee_database::IngestDb::get_dataset_by_name(
+        let ds_still = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
             &*db,
             "memory_only_item_ds",
             owner,
@@ -6028,7 +6295,7 @@ mod tests {
     /// graph model or orphaned graph data), `DeleteScope::Data` must succeed and
     /// return a best-effort cleanup result rather than a validation error.
     ///
-    /// Python parity: `datasets.py:165-176`.
+    /// Python parity: `datasets.py:253-273@37f788bd2`.
     #[tokio::test]
     async fn delete_data_without_relational_row_returns_success() {
         let (svc, _storage, _db) = make_service().await;
@@ -6043,6 +6310,7 @@ mod tests {
                     data_id: ghost_data_id,
                     dataset_name: None,
                     delete_dataset_if_empty: false,
+                    tenant_id: None,
                 },
                 mode: DeleteMode::Soft,
                 memory_only: false,

@@ -183,10 +183,11 @@ async fn test_hard_mode_sweeps_orphan_entities() {
         .with_summarization(false)
         .with_triplet_embeddings(false);
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, "orphan_sweep_ds", owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "orphan_sweep_ds", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
 
     let mut all_data_items = data_items_1;
     all_data_items.extend(data_items_2);
@@ -258,6 +259,7 @@ async fn test_hard_mode_sweeps_orphan_entities() {
                 data_id: doc1_data_id,
                 dataset_name: Some("orphan_sweep_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,
@@ -365,10 +367,11 @@ async fn test_soft_mode_preserves_orphan_entities() {
         .with_summarization(false)
         .with_triplet_embeddings(false);
 
-    let dataset = ops::datasets::get_dataset_by_name(&database, "soft_sweep_ds", owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "soft_sweep_ds", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
 
     let mut all_data_items = data_items_1;
     all_data_items.extend(data_items_2);
@@ -420,6 +423,7 @@ async fn test_soft_mode_preserves_orphan_entities() {
                 data_id: doc1_data_id,
                 dataset_name: Some("soft_sweep_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

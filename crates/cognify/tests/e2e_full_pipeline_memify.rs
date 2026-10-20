@@ -160,11 +160,15 @@ async fn test_full_pipeline_add_cognify_memify_search_delete() {
     assert_eq!(data_items.len(), 1, "Expected exactly 1 ingested data item");
     println!("Step 1 OK: Ingested {} data item(s)", data_items.len());
 
-    let dataset =
-        ops::datasets::get_dataset_by_name(&database, "artificial_intelligence", owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset should exist after ingest");
+    let dataset = ops::datasets::get_dataset_by_name_in_tenant(
+        &database,
+        "artificial_intelligence",
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant")
+    .expect("dataset should exist after ingest");
 
     // ── Step 2: Cognify (triplet_embeddings=false so memify creates them) ────
     let config = CognifyConfig::default()

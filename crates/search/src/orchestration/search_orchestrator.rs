@@ -581,8 +581,8 @@ impl SearchOrchestrator {
                 // `dataset.tenant_id == request.tenant_id` with `None` ⇔ NULL —
                 // Python's `get_dataset_ids` rule
                 // (`get_dataset_ids.py:30-34@37f788bd2`). Not
-                // `get_dataset_by_name(.., None)`: with `None` it applies no
-                // tenant predicate, and of two same-named rows it may return
+                // the former tenant-loose name lookup (removed, SDK-936): it applied no
+                // tenant predicate for `None`, and of two same-named rows it may return
                 // the tenanted one the strict readable set excludes.
                 let mut resolved = Vec::with_capacity(names.len());
                 let mut missing = Vec::new();
@@ -2365,15 +2365,15 @@ mod tests {
     /// W20/D4. Scenario: the owner has `"shared"` without a tenant and
     /// `"shared"` in T1; a tenant-less caller searches by that name.
     /// Expected: only the tenant-less row resolves (strict equality). Verified
-    /// to fail against the pre-S1 per-name `get_dataset_by_name(.., None)`
-    /// loop with this seed order.
+    /// to fail against the earlier per-name loop over the former tenant-loose
+    /// name lookup (removed, SDK-936) with this seed order.
     #[tokio::test]
     async fn tenantless_name_resolves_only_the_tenantless_row() {
         let owner = Uuid::new_v4();
         let t1 = Uuid::new_v4();
         let db = fresh_db().await;
         // The T1 row is seeded **first**: an unordered by-name lookup with no
-        // tenant predicate (`get_dataset_by_name(.., None)`) then tends to
+        // tenant predicate (the former tenant-loose name lookup, removed, SDK-936) then tends to
         // return it, so this test fails on the loose resolution.
         let tenanted = seed_dataset_in_tenant(&db, "shared", owner, t1).await;
         let untenanted = seed_dataset(&db, "shared", owner).await;

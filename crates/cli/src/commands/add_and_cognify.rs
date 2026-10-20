@@ -32,6 +32,9 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         ))
     })?;
     let summarization_model = cm.settings().summarization_model.clone();
+    // One tenant for the add and the lookup: Python creates/resolves the
+    // dataset in the caller's tenant (`create_dataset.py:16-22@37f788bd2`).
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
 
     match args.chunker {
         ChunkerArg::Text => {}
@@ -91,7 +94,7 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
             .collect::<Vec<_>>();
 
         let added_data = ingest
-            .add(inputs, &dataset_name, owner_id, None)
+            .add(inputs, &dataset_name, owner_id, tenant_id)
             .await
             .map_err(|error| CliError::Runtime(format!("Add operation failed: {error}")))?;
 
@@ -107,11 +110,11 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         }
 
         // ── Cognify only the newly-added items ──────────────────────────────
-        let dataset = cognee::database::IngestDb::get_dataset_by_name(
+        let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
             &*database,
             &dataset_name,
             owner_id,
-            None,
+            tenant_id,
         )
         .await
         .map_err(|error| {

@@ -26,8 +26,8 @@ impl<T: IngestDb + DeleteDb + Send + Sync> DatasetDb for T {}
 /// implements this trait and is registered as a relational factory.
 ///
 /// Several domain traits declare a method of the same name (for example
-/// `get_dataset_by_name` on both [`IngestDb`] and [`DeleteDb`]); call those
-/// through the trait (`IngestDb::get_dataset_by_name(&*db, …)`).
+/// `get_dataset_by_name_in_tenant` on both [`IngestDb`] and [`DeleteDb`]);
+/// call those through the trait (`IngestDb::get_dataset_by_name_in_tenant(&*db, …)`).
 ///
 /// [`AclDb`](crate::AclDb) is not part of it: no OSS backend implements it, a
 /// downstream ACL layer owns it.

@@ -121,11 +121,11 @@ async fn test_shared_entity_graph_delete() {
         .expect("ingest ds_ml");
     assert_eq!(data_ml.len(), 1);
 
-    let ds_ai = ops::datasets::get_dataset_by_name(&database, "ds_ai", owner_id, None)
+    let ds_ai = ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_ai", owner_id, None)
         .await
         .expect("get ds_ai")
         .expect("ds_ai should exist");
-    let ds_ml = ops::datasets::get_dataset_by_name(&database, "ds_ml", owner_id, None)
+    let ds_ml = ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_ml", owner_id, None)
         .await
         .expect("get ds_ml")
         .expect("ds_ml should exist");
@@ -254,6 +254,7 @@ async fn test_shared_entity_graph_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "ds_ai".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,
@@ -323,19 +324,21 @@ async fn test_shared_entity_graph_delete() {
     }
 
     // 5d. ds_ai should no longer exist in the database
-    let ds_ai_after = ops::datasets::get_dataset_by_name(&database, "ds_ai", owner_id, None)
-        .await
-        .expect("get ds_ai after delete");
+    let ds_ai_after =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_ai", owner_id, None)
+            .await
+            .expect("get ds_ai after delete");
     assert!(
         ds_ai_after.is_none(),
         "ds_ai should not exist after deletion"
     );
 
     // 5e. ds_ml should still exist with its data
-    let ds_ml_after = ops::datasets::get_dataset_by_name(&database, "ds_ml", owner_id, None)
-        .await
-        .expect("get ds_ml after delete")
-        .expect("ds_ml should still exist");
+    let ds_ml_after =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "ds_ml", owner_id, None)
+            .await
+            .expect("get ds_ml after delete")
+            .expect("ds_ml should still exist");
 
     let ml_data = ops::datasets::get_dataset_data(&database, ds_ml_after.id)
         .await

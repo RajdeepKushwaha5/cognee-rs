@@ -282,10 +282,11 @@ async fn test_recognify_after_content_update() {
     println!("Step 1: Ingested text_v1, data_id={data_id_v1}");
 
     // ── Step 2: Cognify text_v1 ─────────────────────────────────────────────
-    let dataset = ops::datasets::get_dataset_by_name(&database, dataset_name, owner_id, None)
-        .await
-        .expect("get_dataset_by_name")
-        .expect("dataset should exist after ingest");
+    let dataset =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, dataset_name, owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant")
+            .expect("dataset should exist after ingest");
 
     let result_v1 = match cognify(
         data_items_v1,
@@ -452,6 +453,7 @@ async fn test_recognify_after_content_update() {
                 data_id: data_id_v1,
                 dataset_name: Some(dataset_name.to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,

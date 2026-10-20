@@ -77,18 +77,18 @@ pub async fn list_data(
 /// Check whether a dataset has any data.
 ///
 /// `dataset_id_str` is a UUID string. Returns a JSON bool (`true` / `false`).
-/// A non-existent dataset UUID returns `false` (COUNT=0, no error).
+/// The read is authorized like Python's `datasets.has_data`
+/// (`cognee/api/v1/datasets/datasets.py:160-166@37f788bd2`), which never
+/// answers `false` for a dataset it cannot read: a non-UUID string is a
+/// validation error (as for `list_data`), and a UUID that is not one of the
+/// handle user's datasets in its tenant (unknown, foreign or other-tenant) is
+/// a runtime error.
 pub async fn has_data(
     state: &HandleState,
     dataset_id_str: &str,
 ) -> Result<serde_json::Value, SdkError> {
-    let dataset_id = match Uuid::parse_str(dataset_id_str) {
-        Ok(id) => id,
-        // An unparseable id can never match a real dataset (all dataset ids are
-        // UUIDs), so it is simply "not present" → false. This matches the
-        // documented contract above and parity with an unknown-but-valid UUID.
-        Err(_) => return Ok(serde_json::Value::Bool(false)),
-    };
+    let dataset_id = Uuid::parse_str(dataset_id_str)
+        .map_err(|e| SdkError::Validation(format!("invalid dataset id UUID: {e}")))?;
     let svc = state.services().await?;
     let owner_id = state.owner_id().await?;
 

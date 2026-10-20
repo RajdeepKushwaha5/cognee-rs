@@ -168,7 +168,7 @@ pub async fn persist_sessions_in_knowledge_graph(
         // not currently return the dataset_id directly, so we derive it from
         // the node_set-tagged Data entries through the same helper that
         // cognify_dataset_refs uses: look up by name/owner.
-        let dataset_id = match cognee_database::IngestDb::get_dataset_by_name(
+        let dataset_id = match cognee_database::IngestDb::get_dataset_by_name_in_tenant(
             &*database,
             dataset_name,
             owner_id,

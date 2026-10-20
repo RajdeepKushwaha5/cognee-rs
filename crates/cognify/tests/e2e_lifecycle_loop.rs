@@ -157,10 +157,11 @@ async fn test_readd_and_recognify_after_delete() {
     );
     let original_data_id = data_items_1[0].id;
 
-    let dataset_1 = ops::datasets::get_dataset_by_name(&database, "lifecycle_test", owner_id, None)
-        .await
-        .expect("get_dataset_by_name after first add")
-        .expect("dataset should exist after first add");
+    let dataset_1 =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "lifecycle_test", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant after first add")
+            .expect("dataset should exist after first add");
     let original_dataset_id = dataset_1.id;
 
     println!("First cycle: data_id={original_data_id}, dataset_id={original_dataset_id}");
@@ -243,6 +244,7 @@ async fn test_readd_and_recognify_after_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "lifecycle_test".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Hard,
             memory_only: false,
@@ -279,9 +281,9 @@ async fn test_readd_and_recognify_after_delete() {
 
     // Verify dataset no longer exists in DB
     let dataset_after_delete =
-        ops::datasets::get_dataset_by_name(&database, "lifecycle_test", owner_id, None)
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "lifecycle_test", owner_id, None)
             .await
-            .expect("get_dataset_by_name after delete");
+            .expect("get_dataset_by_name_in_tenant after delete");
     assert!(
         dataset_after_delete.is_none(),
         "Dataset 'lifecycle_test' should not exist after delete"
@@ -324,10 +326,11 @@ async fn test_readd_and_recognify_after_delete() {
          original={original_data_id}, readded={readded_data_id}"
     );
 
-    let dataset_2 = ops::datasets::get_dataset_by_name(&database, "lifecycle_test", owner_id, None)
-        .await
-        .expect("get_dataset_by_name after second add")
-        .expect("dataset should exist after second add");
+    let dataset_2 =
+        ops::datasets::get_dataset_by_name_in_tenant(&database, "lifecycle_test", owner_id, None)
+            .await
+            .expect("get_dataset_by_name_in_tenant after second add")
+            .expect("dataset should exist after second add");
 
     // CRITICAL: UUID5 determinism for dataset
     assert_eq!(

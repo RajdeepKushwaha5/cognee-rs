@@ -156,7 +156,7 @@ async fn add_does_not_ingest_into_a_dataset_that_is_being_rolled_back() {
         .expect("add reports success");
     creator.await.expect("simulated create");
 
-    let dataset = IngestDb::get_dataset_by_name(&*db, DATASET, owner, None)
+    let dataset = IngestDb::get_dataset_by_name_in_tenant(&*db, DATASET, owner, None)
         .await
         .expect("lookup");
     assert!(
@@ -217,7 +217,7 @@ async fn without_locks_the_window_is_still_open() {
     creator.await.expect("simulated create");
 
     assert!(
-        IngestDb::get_dataset_by_name(&*db, DATASET, owner, None)
+        IngestDb::get_dataset_by_name_in_tenant(&*db, DATASET, owner, None)
             .await
             .expect("lookup")
             .is_none(),
@@ -295,7 +295,7 @@ async fn add_by_id_is_locked_too() {
     }
     if let Ok(ingested) = result {
         assert!(
-            IngestDb::get_dataset_by_name(&*db, DATASET, owner, None)
+            IngestDb::get_dataset_by_name_in_tenant(&*db, DATASET, owner, None)
                 .await
                 .expect("lookup")
                 .is_some(),

@@ -82,11 +82,11 @@ async fn same_content_reused_across_datasets() {
     );
 
     // Two distinct datasets exist
-    let ds_a = ops::datasets::get_dataset_by_name(&database, "A", owner, None)
+    let ds_a = ops::datasets::get_dataset_by_name_in_tenant(&database, "A", owner, None)
         .await
         .expect("get ds A")
         .expect("dataset A should exist");
-    let ds_b = ops::datasets::get_dataset_by_name(&database, "B", owner, None)
+    let ds_b = ops::datasets::get_dataset_by_name_in_tenant(&database, "B", owner, None)
         .await
         .expect("get ds B")
         .expect("dataset B should exist");
@@ -191,7 +191,7 @@ async fn dedup_file_copies_with_different_names() {
     );
 
     // Only 1 row in the dataset_data junction
-    let ds = ops::datasets::get_dataset_by_name(&database, "file_dedup", owner, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&database, "file_dedup", owner, None)
         .await
         .expect("get dataset")
         .expect("dataset should exist");
@@ -234,7 +234,7 @@ async fn dedup_across_multiple_add_calls() {
     );
 
     // Only 1 junction row (no duplicate attachment)
-    let ds = ops::datasets::get_dataset_by_name(&database, "ds", owner, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&database, "ds", owner, None)
         .await
         .expect("get dataset")
         .expect("dataset should exist");

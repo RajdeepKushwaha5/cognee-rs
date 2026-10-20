@@ -98,8 +98,9 @@ impl PyCogneeDatasets {
     ///
     /// ``dataset_id`` must be a valid UUID string.
     /// Returns ``True`` if the dataset contains at least one data item,
-    /// ``False`` otherwise (including for a non-existent dataset UUID).
-    /// Raises ``CogneeValidationError`` for an invalid UUID.
+    /// ``False`` if it is empty. Like Python cognee's ``datasets.has_data``,
+    /// a UUID that is not one of the caller's datasets in its tenant raises
+    /// ``CogneeRuntimeError``; an invalid UUID raises ``CogneeValidationError``.
     fn has<'py>(&self, py: Python<'py>, dataset_id: String) -> PyResult<Bound<'py, PyAny>> {
         validate_uuid(&dataset_id, "dataset_id")?;
         let handle = Arc::clone(&self.inner);

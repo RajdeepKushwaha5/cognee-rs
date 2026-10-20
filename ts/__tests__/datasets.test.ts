@@ -132,10 +132,11 @@ describe("Phase-5 DatasetManager, forget, prune, sessions, notebooks (Tier-A)", 
       expect(items.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("hasData returns false for an unknown dataset id", async () => {
+    // An unknown id is not the caller's dataset: like Python's
+    // `datasets.has_data` (PermissionDeniedError), the read is refused.
+    it("hasData rejects an unknown dataset id", async () => {
       const fakeId = "00000000-0000-0000-0000-000000000001";
-      const has = await native.cogneeHasData(handle, fakeId);
-      expect(has).toBe(false);
+      await expect(native.cogneeHasData(handle, fakeId)).rejects.toThrow();
     });
 
     it("hasData returns true after adding data", async () => {

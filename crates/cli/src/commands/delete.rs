@@ -14,21 +14,19 @@ use crate::error::CliError;
 pub fn run(args: DeleteArgs, cm: Arc<cognee::ComponentManager>) -> Result<(), CliError> {
     let dry_run = args.dry_run;
     let force = args.force;
-    let enforce_acl = args.enforce_acl;
 
     validate_scope_selection(&args)?;
+    // OSS has no `AclDb` implementation: grant-based deletes
+    // (`RequestAuthorization::Grant`) are served by the cloud CLI.
+    if args.enforce_acl {
+        return Err(CliError::Validation(
+            "--enforce-acl is not supported by this build".to_string(),
+        ));
+    }
 
-    let owner_id = if let Some(user_id) = &args.user_id {
-        Uuid::parse_str(user_id).map_err(|error| {
-            CliError::Validation(format!("Invalid --user-id '{user_id}': {error}"))
-        })?
-    } else {
-        Uuid::parse_str(&cm.settings().default_user_id).map_err(|error| {
-            CliError::Validation(format!(
-                "Invalid default_user_id '{}': {error}",
-                cm.settings().default_user_id
-            ))
-        })?
+    let (owner_id, tenant_id) = {
+        let settings = cm.settings();
+        resolve_caller(&args, &settings.default_user_id)?
     };
 
     crate::teardown::run_command(Arc::clone(&cm), async {
@@ -37,16 +35,16 @@ pub fn run(args: DeleteArgs, cm: Arc<cognee::ComponentManager>) -> Result<(), Cl
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let request =
-            build_request_async(args, owner_id, database.clone() as Arc<dyn IngestDb>).await?;
+        let request = build_request_async(
+            args,
+            owner_id,
+            tenant_id,
+            database.clone() as Arc<dyn IngestDb>,
+            RequestAuthorization::Ownership,
+        )
+        .await?;
 
         let service = super::build_delete_service(&cm).await?;
-
-        if enforce_acl {
-            return Err(CliError::Validation(
-                "--enforce-acl is not supported by this build".to_string(),
-            ));
-        }
 
         let preview = service
             .preview(&request)
@@ -122,27 +120,32 @@ pub fn confirm_deletion() -> Result<(), CliError> {
     Ok(())
 }
 
+/// Check the delete flags. The **target selectors** are `--all`,
+/// `--data-id` and `--dataset-name`/`--dataset-id`:
+///
+/// - `--all` cannot be combined with another target;
+/// - `--data-id` may name its dataset (`--dataset-name`/`--dataset-id`): one
+///   target, "this item in that dataset";
+/// - with no target selector, `--user-id` is required and selects the whole
+///   `User` scope; with a target selector it only names the **acting user**,
+///   as Python's `--user-id` does (`cli/commands/delete_command.py:89-91@37f788bd2`);
+/// - `--delete-dataset-if-empty` applies only with `--data-id`.
 pub fn validate_scope_selection(args: &DeleteArgs) -> Result<(), CliError> {
-    let mut selected = 0usize;
-    if args.data_id.is_some() {
-        selected += 1;
-    }
     // --dataset-name and --dataset-id are mutually exclusive (enforced by
-    // clap's `conflicts_with`), and together count as one scope selector.
-    if args.dataset_name.is_some() || args.dataset_id.is_some() {
-        selected += 1;
-    }
-    if args.user_id.is_some() {
-        selected += 1;
-    }
-    if args.all {
-        selected += 1;
+    // clap's `conflicts_with`), and together count as one dataset reference.
+    let has_dataset = args.dataset_name.is_some() || args.dataset_id.is_some();
+    let has_target = args.all || args.data_id.is_some() || has_dataset;
+
+    if !has_target && args.user_id.is_none() {
+        return Err(CliError::Validation(
+            "Specify exactly one delete scope: --data-id (optionally with --dataset-name/--dataset-id), --dataset-name/--dataset-id, --user-id, or --all"
+                .to_string(),
+        ));
     }
 
-    if selected != 1 {
+    if args.all && (args.data_id.is_some() || has_dataset) {
         return Err(CliError::Validation(
-            "Specify exactly one delete scope: --data-id, --dataset-name/--dataset-id, --user-id, or --all"
-                .to_string(),
+            "--all cannot be combined with --data-id, --dataset-name or --dataset-id".to_string(),
         ));
     }
 
@@ -170,49 +173,177 @@ fn parse_dataset_ref(args: &DeleteArgs) -> Result<Option<DatasetRef>, CliError> 
     }
 }
 
+/// Who authorizes the request [`build_request_async`] produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAuthorization {
+    /// No ACL: ownership in `tenant_id` is the authorization (plain
+    /// `DeleteService`). Every dataset reference is resolved here, to a
+    /// dataset the caller owns in `tenant_id`, and the request names it by id.
+    Ownership,
+    /// An `AuthorizedDeleteService` checks a `delete` grant in `tenant_id`
+    /// (`--enforce-acl`). Dataset ids are passed through unresolved — the
+    /// grant check decides, so another user's dataset is reachable by id;
+    /// names stay the caller's own and are resolved by the service.
+    Grant,
+}
+
+/// The acting user and tenant: `--user-id` (else `default_user_id`) and
+/// `--tenant-id` (Python resolves the acting user from `--user-id`,
+/// `cli/commands/delete_command.py:89-91@37f788bd2`).
+pub fn resolve_caller(
+    args: &DeleteArgs,
+    default_user_id: &str,
+) -> Result<(Uuid, Option<Uuid>), CliError> {
+    let owner_id = match &args.user_id {
+        Some(user_id) => Uuid::parse_str(user_id).map_err(|error| {
+            CliError::Validation(format!("Invalid --user-id '{user_id}': {error}"))
+        })?,
+        None => Uuid::parse_str(default_user_id).map_err(|error| {
+            CliError::Validation(format!(
+                "Invalid default_user_id '{default_user_id}': {error}"
+            ))
+        })?,
+    };
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
+    Ok((owner_id, tenant_id))
+}
+
+/// The id of the caller's own dataset `dref` in `tenant_id` (strict). A
+/// dataset that does not exist, is another user's or is in another tenant gets
+/// one `Validation` answer (no existence oracle); a failed lookup is a
+/// `Runtime` error.
+async fn own_dataset_id(
+    dref: &DatasetRef,
+    owner_id: Uuid,
+    tenant_id: Option<Uuid>,
+    db: &dyn IngestDb,
+) -> Result<Uuid, CliError> {
+    let found = match dref {
+        DatasetRef::Id(id) => db
+            .get_dataset(*id)
+            .await
+            .map_err(|e| CliError::Runtime(format!("Failed to look up dataset {id}: {e}")))?
+            .filter(|ds| ds.owner_id == owner_id && ds.tenant_id == tenant_id),
+        DatasetRef::Name(name) => db
+            .get_dataset_by_name_in_tenant(name, owner_id, tenant_id)
+            .await
+            .map_err(|e| CliError::Runtime(format!("Failed to look up dataset '{name}': {e}")))?,
+    };
+    found.map(|ds| ds.id).ok_or_else(|| {
+        let what = match dref {
+            DatasetRef::Id(id) => id.to_string(),
+            DatasetRef::Name(name) => format!("'{name}'"),
+        };
+        CliError::Validation(format!(
+            "Dataset {what} was not found for this user in this tenant"
+        ))
+    })
+}
+
+/// Build the [`DeleteRequest`] for `args`, acting as `owner_id` in
+/// `tenant_id`.
+///
+/// | Args | `Ownership` | `Grant` |
+/// |---|---|---|
+/// | `--dataset-id D` | D must be the caller's, in the tenant → `DatasetById` | `DatasetById{D}` (no lookup) |
+/// | `--dataset-name N` | strict lookup → `DatasetById` | `Dataset{owner, N, tenant}` |
+/// | `--data-id X` + dataset | resolved as above → `DataInDataset` | `DataInDataset` (id) / `Data{.., Some(N), tenant}` (name) |
+/// | `--data-id X` alone | `Data{owner, X, None, tenant}` | validation error |
+/// | `--user-id U` alone | `User{U, tenant}` | `User{U, tenant}` |
+/// | `--all` | `User{owner, tenant}` | `All` |
+///
+/// Names stay **owner-scoped** in both modes — Python's CLI resolves
+/// `get_datasets_by_name(name, user.id)` and then deletes in the caller's
+/// tenant (`cli/commands/delete_command.py:96-101`,
+/// `api/v1/datasets/datasets.py:190`,
+/// `get_all_user_permission_datasets.py:49-53` @37f788bd2); grant reach goes
+/// only through ids (`get_unique_dataset_id.py:15-24@37f788bd2`). `--all` is
+/// Python's `datasets.delete_all(user)` (`delete_command.py:93-94`,
+/// `datasets.py:316-323` @37f788bd2): the caller's datasets in its tenant,
+/// never a store-wide wipe.
 pub async fn build_request_async(
     args: DeleteArgs,
     owner_id: Uuid,
+    tenant_id: Option<Uuid>,
     db: Arc<dyn IngestDb>,
+    authorization: RequestAuthorization,
 ) -> Result<DeleteRequest, CliError> {
+    validate_scope_selection(&args)?;
     let mode = match args.mode {
         DeleteModeArg::Soft => DeleteMode::Soft,
         DeleteModeArg::Hard => DeleteMode::Hard,
     };
-
-    // Resolve any dataset reference (name or UUID) to a name. The forget
-    // API would normally do this, but the CLI goes directly through
-    // `DeleteService::execute` to retain dry-run / preview semantics.
     let dataset_ref = parse_dataset_ref(&args)?;
-    let dataset_name_opt = match dataset_ref {
-        Some(dref) => Some(
-            dref.to_name(owner_id, Some(db.as_ref()))
-                .await
-                .map_err(|e| CliError::Validation(format!("{e}")))?,
-        ),
-        None => None,
-    };
+    let data_id = args
+        .data_id
+        .as_deref()
+        .map(|raw| {
+            Uuid::parse_str(raw).map_err(|error| {
+                CliError::Validation(format!("Invalid --data-id '{raw}': {error}"))
+            })
+        })
+        .transpose()?;
+    let delete_dataset_if_empty = args.delete_dataset_if_empty;
 
-    let scope = if let Some(data_id) = args.data_id {
-        let parsed_data_id = Uuid::parse_str(&data_id).map_err(|error| {
-            CliError::Validation(format!("Invalid --data-id '{data_id}': {error}"))
-        })?;
-
-        DeleteScope::Data {
-            owner_id,
-            data_id: parsed_data_id,
-            dataset_name: dataset_name_opt,
-            delete_dataset_if_empty: args.delete_dataset_if_empty,
+    let scope = match authorization {
+        RequestAuthorization::Ownership => {
+            let dataset_id = match &dataset_ref {
+                Some(dref) => Some(own_dataset_id(dref, owner_id, tenant_id, db.as_ref()).await?),
+                None => None,
+            };
+            match (data_id, dataset_id) {
+                (Some(data_id), Some(dataset_id)) => DeleteScope::DataInDataset {
+                    dataset_id,
+                    data_id,
+                    delete_dataset_if_empty,
+                },
+                (Some(data_id), None) => DeleteScope::Data {
+                    owner_id,
+                    data_id,
+                    dataset_name: None,
+                    delete_dataset_if_empty,
+                    tenant_id,
+                },
+                (None, Some(dataset_id)) => DeleteScope::DatasetById { dataset_id },
+                // `--all` or `--user-id` alone: the caller's datasets in its
+                // tenant.
+                (None, None) => DeleteScope::User {
+                    owner_id,
+                    tenant_id,
+                },
+            }
         }
-    } else if let Some(dataset_name) = dataset_name_opt {
-        DeleteScope::Dataset {
-            owner_id,
-            dataset_name,
-        }
-    } else if args.user_id.is_some() {
-        DeleteScope::User { owner_id }
-    } else {
-        DeleteScope::All
+        RequestAuthorization::Grant => match (data_id, dataset_ref) {
+            (Some(data_id), Some(DatasetRef::Id(dataset_id))) => DeleteScope::DataInDataset {
+                dataset_id,
+                data_id,
+                delete_dataset_if_empty,
+            },
+            (Some(data_id), Some(DatasetRef::Name(dataset_name))) => DeleteScope::Data {
+                owner_id,
+                data_id,
+                dataset_name: Some(dataset_name),
+                delete_dataset_if_empty,
+                tenant_id,
+            },
+            (Some(_), None) => {
+                return Err(CliError::Validation(
+                    "--data-id under --enforce-acl requires --dataset-name or --dataset-id"
+                        .to_string(),
+                ));
+            }
+            (None, Some(DatasetRef::Id(dataset_id))) => DeleteScope::DatasetById { dataset_id },
+            (None, Some(DatasetRef::Name(dataset_name))) => DeleteScope::Dataset {
+                owner_id,
+                dataset_name,
+                tenant_id,
+            },
+            (None, None) if args.all => DeleteScope::All,
+            (None, None) => DeleteScope::User {
+                owner_id,
+                tenant_id,
+            },
+        },
     };
 
     Ok(DeleteRequest {

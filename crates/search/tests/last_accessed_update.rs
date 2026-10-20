@@ -102,11 +102,15 @@ async fn test_search_updates_last_accessed_timestamp() {
         .await
         .expect("ingest text");
 
-    let dataset =
-        ops::datasets::get_dataset_by_name(&database, "last_accessed_test", owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset should exist after ingest");
+    let dataset = ops::datasets::get_dataset_by_name_in_tenant(
+        &database,
+        "last_accessed_test",
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant")
+    .expect("dataset should exist after ingest");
     let data_items = ops::datasets::get_dataset_data(&database, dataset.id)
         .await
         .expect("get_dataset_data");

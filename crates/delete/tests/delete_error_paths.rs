@@ -48,6 +48,7 @@ async fn delete_nonexistent_data_returns_error() {
                 data_id,
                 dataset_name: None,
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -90,6 +91,7 @@ async fn delete_nonexistent_dataset_returns_error() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "no_such_ds".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -156,6 +158,7 @@ async fn delete_data_not_in_specified_dataset_returns_error() {
                 data_id,
                 dataset_name: Some("real_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -191,7 +194,10 @@ async fn delete_user_with_no_datasets_succeeds_with_zero_deletions() {
 
     let result = svc
         .execute(&DeleteRequest {
-            scope: DeleteScope::User { owner_id },
+            scope: DeleteScope::User {
+                owner_id,
+                tenant_id: None,
+            },
             mode: DeleteMode::Soft,
             memory_only: false,
         })

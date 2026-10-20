@@ -35,7 +35,8 @@ use cognee::{ComponentManager, PipelineContext};
 use crate::error::CliError;
 
 /// Parse an optional `--tenant-id` flag — the one parser every command
-/// (`add`, `remember`, `improve`, `forget`, `search`, `recall`) uses.
+/// (`add`, `remember`, `improve`, `forget`, `search`, `recall`, `cognify`,
+/// `memify`, `add-and-cognify`, `pipeline-unblock`, `delete`) uses.
 ///
 /// The tenant is applied by strict equality wherever a dataset is looked up
 /// (search/recall scoping, `forget --dataset-name`): data written with

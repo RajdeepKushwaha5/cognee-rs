@@ -13,7 +13,7 @@ Single-user, local command-line interface over the cognee pipeline (`add` → `c
 - `recall` — smart memory query with auto-routed search type.
 - `forget` — remove a data item, a dataset, or everything you own.
 - `improve` — enrich existing memory and bridge sessions into the permanent graph.
-- `delete` — lower-level deletion with soft/hard modes, dry-run, and ACL enforcement.
+- `delete` — lower-level deletion with soft/hard modes and dry-run, scoped to the acting user's datasets in `--tenant-id` (ACL enforcement is provided by the cloud CLI).
 - `config` — get / set / list / unset / reset persisted CLI configuration.
 - `run-sequence` — replay a JSON-described sequence of commands.
 - `visualize` — render a graph visualization to HTML (requires the `visualization` feature).

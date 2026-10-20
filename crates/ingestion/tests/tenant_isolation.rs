@@ -90,11 +90,11 @@ async fn impl_same_dataset_name_different_tenants(db_url: &str) {
         .await
         .expect("add for tenant 2");
 
-    let ds1 = ops::datasets::get_dataset_by_name(&database, "AI", owner, tenant1)
+    let ds1 = ops::datasets::get_dataset_by_name_in_tenant(&database, "AI", owner, tenant1)
         .await
         .expect("get ds tenant1")
         .expect("dataset for tenant1 should exist");
-    let ds2 = ops::datasets::get_dataset_by_name(&database, "AI", owner, tenant2)
+    let ds2 = ops::datasets::get_dataset_by_name_in_tenant(&database, "AI", owner, tenant2)
         .await
         .expect("get ds tenant2")
         .expect("dataset for tenant2 should exist");
@@ -153,7 +153,7 @@ async fn impl_tenant_id_flows_through_pipeline(db_url: &str) {
         "tenant_id must be set on the Data record"
     );
 
-    let ds = ops::datasets::get_dataset_by_name(&database, "scoped_ds", owner, tenant_id)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&database, "scoped_ds", owner, tenant_id)
         .await
         .expect("get dataset")
         .expect("dataset should exist");
@@ -238,4 +238,68 @@ async fn same_content_different_tenants_separate_data_pg() {
         return;
     };
     impl_same_content_different_tenants_separate_data(&url).await;
+}
+
+// ---------------------------------------------------------------------------
+// SDK-936 — a tenant-less add never attaches to a tenanted same-named
+// dataset. Python resolves the add's dataset with
+// `create_dataset.py:16-22@37f788bd2` (`Dataset.tenant_id == user.tenant_id`),
+// so a tenant-less caller gets its own tenant-less row.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tenantless_add_does_not_attach_to_a_tenanted_same_named_dataset() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = sqlite_db_url(&dir);
+    let (pipeline, database, _storage) = make_pipeline(&dir, &url).await;
+    let owner = Uuid::new_v4();
+    let t1 = Uuid::new_v4();
+
+    // The tenanted row is created first, so a tenant-loose lookup would find it.
+    let tenanted = ops::datasets::create_dataset(
+        &database,
+        cognee_models::Dataset::new(
+            "x".to_string(),
+            owner,
+            Some(t1),
+            cognee_ingestion::generate_dataset_id("x", owner, Some(t1)),
+        ),
+    )
+    .await
+    .expect("seed tenanted x");
+
+    pipeline
+        .add(
+            vec![DataInput::Text("tenant-less content".to_string())],
+            "x",
+            owner,
+            None,
+        )
+        .await
+        .expect("tenant-less add");
+
+    let tenantless = ops::datasets::get_dataset_by_name_in_tenant(&database, "x", owner, None)
+        .await
+        .expect("lookup")
+        .expect("a tenant-less x must have been created");
+    assert_ne!(tenantless.id, tenanted.id);
+    assert_eq!(tenantless.tenant_id, None);
+    assert_eq!(
+        tenantless.id,
+        cognee_ingestion::generate_dataset_id("x", owner, None)
+    );
+    assert_eq!(
+        ops::datasets::get_dataset_data(&database, tenantless.id)
+            .await
+            .expect("tenant-less data")
+            .len(),
+        1
+    );
+    assert!(
+        ops::datasets::get_dataset_data(&database, tenanted.id)
+            .await
+            .expect("tenanted data")
+            .is_empty(),
+        "the tenanted x must not receive the tenant-less add"
+    );
 }

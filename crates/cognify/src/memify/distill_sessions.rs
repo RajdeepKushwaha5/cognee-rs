@@ -624,7 +624,7 @@ async fn publish_distilled_lessons(
         ));
     }
 
-    let dataset_id = match cognee_database::IngestDb::get_dataset_by_name(
+    let dataset_id = match cognee_database::IngestDb::get_dataset_by_name_in_tenant(
         &*database,
         dataset_name,
         owner_id,

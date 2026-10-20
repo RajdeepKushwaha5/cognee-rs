@@ -18,6 +18,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **Delete parity: tenant-strict names, tenant-scoped delete-all, grant
+  reach by id only (SDK-936).** Every by-name dataset lookup is now
+  tenant-strict (there is no tenant-loose lookup left), the owner-scoped
+  delete scopes carry their tenant, and "delete everything" means the
+  caller's datasets in its tenant, deleted one by one by id and stopping at
+  the first failure — Python's `datasets.delete_all` (cognee 37f788bd2).
+
+  | Item | Before | After |
+  |---|---|---|
+  | `ops::datasets::get_dataset_by_name`, `IngestDb::get_dataset_by_name`, `DeleteDb::get_dataset_by_name` | `None` = any tenant | **removed**; use `get_dataset_by_name_in_tenant` (same signature, strict: `None` ⇔ tenant-less) |
+  | `DeleteScope::{Data, Dataset, User}` | no tenant | `+ tenant_id: Option<Uuid>` (`#[serde(default)]`), strict |
+  | `DeleteService` `User` | one batch over the owner's datasets in every tenant | the owner's datasets in `tenant_id`, per dataset by id, `DeleteError::Partial` on a later failure; **no longer deletes the owner's search history** (Python's `delete_all` never does, and the history table has no tenant) |
+  | `DeleteService::execute_datasets_by_id` | — | new |
+  | `AuthorizedDeleteService` | `Data{dataset_name: None}` checked the owner's linked datasets; `User` cover over every tenant | `Data{None}` → `Validation`; a scope tenant other than the caller's → `PermissionDenied`; `User` tenant-scoped, by id, no history; a by-name scope (`Dataset`, `Data{Some}`) whose `owner_id` is not the caller → `PermissionDenied` (names never reach grants; grant reach is by id only) |
+  | `DeleteScope::DataInDataset` / `Data{Some(name)}` with no `Data` row | flag ignored | `delete_dataset_if_empty` deletes the dataset when it is empty (Python) |
+  | `DeleteScope::Data{Some(name)}` with no `Data` row and a name that does not resolve | `Ok` (ghost cleanup) | `Validation("Dataset '…' was not found for owner …")`: the dataset is resolved first |
+  | `cognee::api::forget(ForgetTarget::All)` | owner-wide `User` batch | tenant-scoped, by id, `Partial` |
+  | `cognee::api::DatasetRef::to_name` | pub | **removed** (use `DatasetRef::resolve`) |
+  | `DatasetManager::{list_data, has_data}` without an ACL | no check | owner + tenant, else `DatasetError::NotFound`; bindings `hasData`/`listData` reject an unknown or foreign id |
+  | bindings `has` / `hasData` on a non-UUID id | `false` | validation error (like `listData`) |
+  | `cognee_cli::commands::delete::build_request_async` | `(args, owner_id, db)` | `(args, owner_id, tenant_id, db, RequestAuthorization)`; new `resolve_caller`, `RequestAuthorization::{Ownership, Grant}` |
+  | `cognee-cli delete` | `--all` = store-wide wipe; `--user-id` only as the User scope; `--data-id` + dataset rejected; no `--tenant-id` | `--all` = the caller's datasets in its tenant; `--user-id` = the acting user when a target is given; `--data-id` + dataset accepted; `--tenant-id` |
+  | `cognee-cli cognify / memify / add-and-cognify / pipeline-unblock` | names resolved in any tenant; no-name cognify/memify spanned tenants | `--tenant-id`; strict |
+  | `add` by name (`persist_data_with_acl_and_locks`) | a tenant-less add could attach to a tenanted same-named dataset | strict: creates/uses the tenant-less row |
+
+  **Migration.** Rename `get_dataset_by_name` calls to
+  `get_dataset_by_name_in_tenant` and pass the caller's tenant (a `None`
+  that relied on "any tenant" now finds only tenant-less rows). Add
+  `tenant_id` to `DeleteScope::{Data, Dataset, User}` literals (the caller's
+  authenticated tenant), or prefer the by-id scopes. Handle
+  `DeleteError::Partial` from `User`, `forget(All)` and
+  `execute_datasets_by_id`. Under an ACL, send item deletes with their
+  dataset. Scripts that used `cognee-cli delete --all` to wipe the store
+  must now wipe per tenant (or call the library's plain `DeleteScope::All`).
+  `forget(All)` no longer matches Python in one respect: it does not prune
+  the whole session cache (unsafe from a per-tenant call). Callers that
+  relied on `User` / `forget(All)` to clear a user's search history must
+  clear it themselves (`DeleteDb::delete_search_history_for_user`, across
+  all of the user's tenants). Under an ACL, delete another user's dataset by
+  id (`DatasetById` / `DataInDataset`), not by its name.
+
+  **Implementors of `IngestDb` / `DeleteDb`** (custom relational backends):
+  delete your `get_dataset_by_name` impl — it is no longer a trait method —
+  and override the provided `get_dataset_by_name_in_tenant` with a point
+  query (owner, name and `tenant_id` with `None` ⇔ NULL). Without the
+  override the default lists all of the owner's datasets and filters them,
+  which is correct but slower.
+
 - **Tenant-filtered per-dataset permission checks; strict tenant-less
   fallback (SDK-974, SDK-687, SDK-689).** Every per-id check now applies the
   caller's tenant like Python (`dataset.tenant_id == user.tenant_id`, strict:

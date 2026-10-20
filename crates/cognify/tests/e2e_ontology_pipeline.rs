@@ -184,11 +184,15 @@ async fn e2e_ontology_pipeline_add_cognify_search() {
         "Expected exactly one ingested data item"
     );
 
-    let dataset =
-        ops::datasets::get_dataset_by_name(&database, "ontology_e2e_dataset", owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset should exist after ingest");
+    let dataset = ops::datasets::get_dataset_by_name_in_tenant(
+        &database,
+        "ontology_e2e_dataset",
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant")
+    .expect("dataset should exist after ingest");
 
     let ontology_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ONTOLOGY_FIXTURE);
     let ontology_resolver = RdfLibOntologyResolver::new(OntologyFileInput::Path(ontology_path))
@@ -377,11 +381,15 @@ async fn e2e_ontology_pipeline_multi_ontology_add_cognify_search() {
         "Expected exactly one ingested data item"
     );
 
-    let dataset =
-        ops::datasets::get_dataset_by_name(&database, "ontology_multi_e2e_dataset", owner_id, None)
-            .await
-            .expect("get_dataset_by_name")
-            .expect("dataset should exist after ingest");
+    let dataset = ops::datasets::get_dataset_by_name_in_tenant(
+        &database,
+        "ontology_multi_e2e_dataset",
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant")
+    .expect("dataset should exist after ingest");
 
     let ontology_paths = vec![
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ONTOLOGY_TECH_ONLY_FIXTURE),

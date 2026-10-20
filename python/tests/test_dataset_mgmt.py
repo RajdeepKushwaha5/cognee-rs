@@ -95,17 +95,19 @@ async def test_list_datasets_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# has() — non-existent UUID returns False
+# has() — non-existent UUID is refused
 # ---------------------------------------------------------------------------
 
 @SKIP_IF_NO_ADD
 @pytest.mark.asyncio
-async def test_has_data_false_for_nonexistent(tmp_path):
-    """datasets.has() returns False for a random UUID that was never added."""
+async def test_has_data_rejects_nonexistent(tmp_path):
+    """datasets.has() raises for a random UUID that was never added: an unknown
+    id is not the caller's dataset (Python `datasets.has_data` raises
+    PermissionDeniedError there too)."""
     c = await _make_cognee(tmp_path)
     ds_id = str(uuid.uuid4())
-    result = await c.datasets.has(ds_id)
-    assert result is False
+    with pytest.raises(cp.CogneeError):
+        await c.datasets.has(ds_id)
 
 
 # ---------------------------------------------------------------------------

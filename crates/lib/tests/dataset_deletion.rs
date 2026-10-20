@@ -121,6 +121,7 @@ async fn dataset_deletion_removes_data_records() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "del_ds".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -165,6 +166,7 @@ async fn dataset_deletion_removes_storage_files() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "storage_ds".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -239,6 +241,7 @@ async fn shared_data_preserved_on_partial_delete() {
             scope: DeleteScope::Dataset {
                 owner_id,
                 dataset_name: "dataset_A".to_string(),
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -291,6 +294,7 @@ async fn delete_data_with_dataset_if_empty_false_preserves_dataset() {
                 data_id,
                 dataset_name: Some("keep_ds".to_string()),
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -310,7 +314,7 @@ async fn delete_data_with_dataset_if_empty_false_preserves_dataset() {
         result.deleted_datasets, 0,
         "dataset should NOT be deleted when delete_dataset_if_empty is false"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "keep_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "keep_ds", owner_id, None)
         .await
         .unwrap();
     assert!(
@@ -354,6 +358,7 @@ async fn delete_data_with_dataset_if_empty_true_removes_dataset() {
                 data_id,
                 dataset_name: Some("remove_ds".to_string()),
                 delete_dataset_if_empty: true,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -373,7 +378,7 @@ async fn delete_data_with_dataset_if_empty_true_removes_dataset() {
         result.deleted_datasets >= 1,
         "dataset should be deleted when delete_dataset_if_empty is true and dataset is empty"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "remove_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "remove_ds", owner_id, None)
         .await
         .unwrap();
     assert!(
@@ -440,6 +445,7 @@ async fn delete_data_with_dataset_if_empty_true_preserves_non_empty_dataset() {
                 data_id: data_id_1,
                 dataset_name: Some("two_item_ds".to_string()),
                 delete_dataset_if_empty: true,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,
@@ -457,7 +463,7 @@ async fn delete_data_with_dataset_if_empty_true_preserves_non_empty_dataset() {
         result.deleted_datasets, 0,
         "dataset should NOT be deleted because it still has data"
     );
-    let ds = ops::datasets::get_dataset_by_name(&db, "two_item_ds", owner_id, None)
+    let ds = ops::datasets::get_dataset_by_name_in_tenant(&db, "two_item_ds", owner_id, None)
         .await
         .unwrap();
     assert!(
@@ -569,7 +575,7 @@ async fn forget_by_dataset_uuid_missing_returns_err() {
 // ---------------------------------------------------------------------------
 // forget() resolves dataset references in the caller's tenant (strict,
 // `None` ⇔ tenant-less; Python `get_dataset_ids.py:30-34@37f788bd2`) and
-// deletes by id — S1 review loop 2.
+// deletes by id.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

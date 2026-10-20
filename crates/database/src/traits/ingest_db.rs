@@ -9,13 +9,6 @@ use crate::types::{DatabaseError, PipelineRunStatus};
 
 #[async_trait]
 pub trait IngestDb: Send + Sync {
-    async fn get_dataset_by_name(
-        &self,
-        name: &str,
-        owner_id: Uuid,
-        tenant_id: Option<Uuid>,
-    ) -> Result<Option<Dataset>, DatabaseError>;
-
     /// Look up a dataset by its UUID.
     async fn get_dataset(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError>;
 
@@ -28,8 +21,8 @@ pub trait IngestDb: Send + Sync {
     /// **strict** tenant equality (`None` matches only a tenant-less row) —
     /// Python's `get_dataset_ids` rule
     /// (`cognee/modules/data/methods/get_dataset_ids.py:30-34@37f788bd2`).
-    /// Every by-name path that must stay inside the caller's tenant uses this,
-    /// not [`Self::get_dataset_by_name`] (whose `None` means "no filter").
+    /// This is the only by-name dataset lookup: the tenant-loose variant was
+    /// removed (SDK-936), so a name never resolves across tenants.
     ///
     /// The default filters [`Self::list_datasets_by_owner`] and is correct for
     /// any implementation; override it with a point query.
@@ -101,15 +94,6 @@ pub trait IngestDb: Send + Sync {
 
 #[async_trait]
 impl IngestDb for DatabaseConnection {
-    async fn get_dataset_by_name(
-        &self,
-        name: &str,
-        owner_id: Uuid,
-        tenant_id: Option<Uuid>,
-    ) -> Result<Option<Dataset>, DatabaseError> {
-        datasets::get_dataset_by_name(self, name, owner_id, tenant_id).await
-    }
-
     async fn get_dataset(&self, id: Uuid) -> Result<Option<Dataset>, DatabaseError> {
         datasets::get_dataset(self, id).await
     }

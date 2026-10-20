@@ -405,7 +405,9 @@ class CogneeDatasets:
     async def has(self, dataset_id: str) -> bool:
         """Return ``True`` if *dataset_id* contains at least one data item.
 
-        Returns ``False`` for a non-existent dataset UUID.
+        Raises :exc:`CogneeRuntimeError` for a UUID that is not one of the
+        caller's datasets in its tenant (unknown, foreign or other-tenant),
+        like Python cognee's ``datasets.has_data``.
         Raises :exc:`CogneeValidationError` for an invalid UUID.
         """
         ...

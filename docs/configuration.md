@@ -1557,10 +1557,40 @@ count only grants on datasets in the caller's tenant (`delete_all` uses the
 
 Without an ACL, `DatasetManager::empty_dataset` / `delete_data` require the
 dataset to be the caller's and in its tenant, then delete by id; `list_data` /
-`has_data` perform no ownership or tenant check — the tenant they take is used
-only under an ACL. Every by-name dataset lookup on these paths (`update`,
-`AuthorizedDeleteService`, search names, `forget`) resolves among the owner's
-datasets in the caller's tenant, strictly, and the delete then runs by id.
+`has_data` require the same ownership and answer `NotFound` otherwise (unknown,
+foreign and other-tenant ids alike — Python always authorizes these reads,
+`datasets.py:155, 164`). Every by-name dataset lookup (`update`,
+`AuthorizedDeleteService`, the plain `DeleteService`, search names, `forget`,
+`add`, the CLI) resolves among the owner's datasets in the caller's tenant,
+strictly — there is no tenant-loose name lookup — and the delete then runs by
+id.
+
+Deletes in more detail (SDK-936, Python @37f788bd2):
+
+- The plain `DeleteService`'s owner-scoped scopes carry the tenant they
+  resolve in: `DeleteScope::Dataset { tenant_id }` and
+  `Data { dataset_name, tenant_id }` look the name up in that tenant only;
+  `Data { dataset_name: None }` detaches the item only from the owner's
+  datasets in that tenant; `User { owner_id, tenant_id }` covers the owner's
+  datasets in that tenant only (`get_dataset_ids.py:29-34`).
+- `DeleteScope::User` and `forget(ForgetTarget::All)` delete those datasets one
+  after another **by id** and stop at the first failure: the datasets before it
+  stay deleted and are reported in `DeleteError::Partial`. Like Python they do
+  not delete search history (`datasets.py:316-323`, `forget.py:191-221`); the
+  history table has no tenant, so a per-tenant delete could not scope it. Unlike Python, `forget(All)` does not prune the whole
+  session cache. `DeleteService::execute_datasets_by_id` is the shared
+  implementation.
+- Under an ACL (`AuthorizedDeleteService`), an owner-scoped scope whose
+  `tenant_id` is not the caller's tenant is denied, and a data item without its
+  dataset (`Data { dataset_name: None }`) is refused with a validation error —
+  Python has no dataset-less item delete (`datasets.py:218-224`,
+  `forget.py:161-162`). A grant reaches another user's dataset only by id: a
+  by-name scope whose owner is not the caller is denied before any lookup.
+- A data item with no `Data` row inside an empty dataset deletes that dataset
+  when `delete_dataset_if_empty` is set (`datasets.py:259-273`).
+- `cognee-cli delete --all` without an ACL deletes the caller's datasets in its
+  tenant (`--tenant-id`) — Python's `datasets.delete_all(user)` — not the whole
+  store. The library's plain `DeleteScope::All` is still the store-wide wipe.
 
 Without an `AclDb`, an unfiltered search stays unscoped and every type runs, as
 in Python's non-ACL mode. The ownership fallback that replaces the ACL — explicit

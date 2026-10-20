@@ -168,6 +168,7 @@ async fn deleting_the_first_file_leaves_the_shared_edge_for_the_second() {
                 data_id: first,
                 dataset_name: None,
                 delete_dataset_if_empty: false,
+                tenant_id: None,
             },
             mode: DeleteMode::Soft,
             memory_only: false,

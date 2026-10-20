@@ -18,11 +18,13 @@ use super::error::ApiError;
 /// `cognee.api.v1.forget.forget()`.
 #[derive(Debug, Clone)]
 pub enum DatasetRef {
-    /// Dataset identified by name (scoped to the `owner_id` passed to
-    /// [`forget`]).
+    /// Dataset identified by name — the `owner_id`'s dataset in the caller's
+    /// tenant (strict; see [`DatasetRef::resolve`]). Names never reach another
+    /// owner's or tenant's dataset.
     Name(String),
-    /// Dataset identified by UUID. Resolving a UUID back to a dataset name
-    /// requires an [`IngestDb`] connection.
+    /// Dataset identified by UUID. [`DatasetRef::resolve`] admits it only
+    /// when it is the owner's and in the caller's tenant; a by-id reach
+    /// through a grant is an `AuthorizedDeleteService` `DatasetById`.
     Id(Uuid),
 }
 
@@ -66,53 +68,12 @@ impl DatasetRef {
                         ApiError::InvalidArgument(format!("Dataset {id} lookup failed: {e}"))
                     })?
                     .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset {id} not found")))?;
-                if dataset.owner_id != owner_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not owned by the requesting user"
-                    )));
-                }
-                if dataset.tenant_id != tenant_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not found in the caller's tenant"
-                    )));
+                // One answer for unknown, foreign and other-tenant ids: no
+                // existence oracle on other users' datasets.
+                if dataset.owner_id != owner_id || dataset.tenant_id != tenant_id {
+                    return Err(ApiError::InvalidArgument(format!("Dataset {id} not found")));
                 }
                 Ok(dataset)
-            }
-        }
-    }
-
-    /// Resolve this reference to a dataset name, performing a reverse lookup
-    /// via [`IngestDb::get_dataset`] when the reference is a UUID.
-    ///
-    /// # Errors
-    /// * Returns [`ApiError::InvalidArgument`] if `self` is [`DatasetRef::Id`]
-    ///   and `db` is `None` (we cannot resolve a UUID without a DB connection).
-    /// * Returns [`ApiError::InvalidArgument`] if the dataset cannot be found
-    ///   in the database, or if the dataset is owned by a different user.
-    pub async fn to_name(
-        &self,
-        owner_id: Uuid,
-        db: Option<&dyn IngestDb>,
-    ) -> Result<String, ApiError> {
-        match self {
-            DatasetRef::Name(name) => Ok(name.clone()),
-            DatasetRef::Id(id) => {
-                let db = db.ok_or_else(|| {
-                    ApiError::InvalidArgument(
-                        "db connection required to resolve dataset UUID".to_string(),
-                    )
-                })?;
-                let dataset = db.get_dataset(*id).await.map_err(|e| {
-                    ApiError::InvalidArgument(format!("Dataset {id} lookup failed: {e}"))
-                })?;
-                let dataset = dataset
-                    .ok_or_else(|| ApiError::InvalidArgument(format!("Dataset {id} not found")))?;
-                if dataset.owner_id != owner_id {
-                    return Err(ApiError::InvalidArgument(format!(
-                        "Dataset {id} not owned by the requesting user"
-                    )));
-                }
-                Ok(dataset.name)
             }
         }
     }
@@ -125,7 +86,8 @@ pub enum ForgetTarget {
     Item { data_id: Uuid, dataset: DatasetRef },
     /// Delete an entire dataset (by name or UUID).
     Dataset { dataset: DatasetRef },
-    /// Delete all data for the given owner.
+    /// Delete the owner's datasets in the caller's tenant, one after another
+    /// by id, stopping at the first failure (Python `datasets.delete_all`).
     All,
     /// Wipe graph+vector for a dataset, keep files + Data/Dataset rows,
     /// reset cognify pipeline status only. Mirrors Python's
@@ -151,8 +113,15 @@ pub struct ForgetResult {
 ///   among the owner's datasets in this tenant (strict, `None` ⇔ tenant-less;
 ///   see [`DatasetRef::resolve`]) and are then deleted **by id**, so a
 ///   same-named dataset in another tenant is never touched.
-///   [`ForgetTarget::All`] is not tenant-scoped yet (owner-wide
-///   `DeleteScope::User`; S2).
+///   [`ForgetTarget::All`] is tenant-scoped too: it deletes the owner's
+///   datasets in this tenant (`DeleteScope::User { owner_id, tenant_id }`),
+///   one after another **by id**, and stops at the first failure with
+///   [`DeleteError::Partial`](cognee_delete::DeleteError::Partial) — Python's
+///   `_forget_everything` → `datasets.delete_all(user)`
+///   (`cognee/api/v1/forget/forget.py:191-205@37f788bd2`,
+///   `cognee/api/v1/datasets/datasets.py:316-323@37f788bd2`). Unlike Python
+///   it does not prune the whole session cache: a global prune from a
+///   per-tenant forget is unsafe in a multi-tenant deployment.
 /// * `delete_service` - Pre-configured [`DeleteService`] with all backends.
 /// * `db` - Database connection for dataset resolution. Required for every
 ///   target that references a dataset (by name or id); unused by
@@ -215,7 +184,10 @@ pub async fn forget(
             (scope, false, format!("dataset:{}", ds.name))
         }
         ForgetTarget::All => {
-            let scope = DeleteScope::User { owner_id };
+            let scope = DeleteScope::User {
+                owner_id,
+                tenant_id,
+            };
             (scope, false, "all".to_string())
         }
         ForgetTarget::DatasetMemoryOnly { dataset } => {
@@ -290,35 +262,6 @@ mod tests {
                 }
             }
             _ => panic!("expected Item variant"),
-        }
-    }
-
-    // ----- Unit tests for DatasetRef::to_name -----
-
-    #[tokio::test]
-    async fn dataset_ref_name_passthrough() {
-        // DatasetRef::Name with db=None should return the name without any DB
-        // lookup.
-        let owner_id = Uuid::new_v4();
-        let dref = DatasetRef::Name("my_ds".to_string());
-        let resolved = dref.to_name(owner_id, None).await.expect("passthrough ok");
-        assert_eq!(resolved, "my_ds");
-    }
-
-    #[tokio::test]
-    async fn dataset_ref_id_requires_db() {
-        // DatasetRef::Id with db=None must error with InvalidArgument.
-        let owner_id = Uuid::new_v4();
-        let dref = DatasetRef::Id(Uuid::new_v4());
-        let result = dref.to_name(owner_id, None).await;
-        match result {
-            Err(ApiError::InvalidArgument(msg)) => {
-                assert!(
-                    msg.contains("db connection required"),
-                    "unexpected msg: {msg}"
-                );
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 

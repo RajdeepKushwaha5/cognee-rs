@@ -57,17 +57,22 @@ pub fn run(args: PipelineUnblockArgs, cm: Arc<ComponentManager>) -> Result<(), C
         })?
     };
 
+    // The dataset the blocked run used: strict name + tenant lookup
+    // (`get_dataset_ids.py:34@37f788bd2`), so a same-named dataset of another
+    // tenant is never unblocked by mistake.
+    let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
+
     crate::teardown::run_command(Arc::clone(&cm), async move {
         let database = cm
             .database()
             .await
             .map_err(|e| CliError::Runtime(format!("{e}")))?;
 
-        let dataset = cognee::database::IngestDb::get_dataset_by_name(
+        let dataset = cognee::database::IngestDb::get_dataset_by_name_in_tenant(
             &*database,
             &args.dataset,
             owner_id,
-            None,
+            tenant_id,
         )
         .await
         .map_err(|error| {

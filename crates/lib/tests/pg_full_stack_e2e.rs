@@ -335,11 +335,15 @@ async fn run_full_stack(pg_url: String) {
         .expect("add() must succeed on Postgres stack");
 
     // ---- Step 2: Cognify. ---------------------------------------------------
-    let dataset =
-        cognee_database::IngestDb::get_dataset_by_name(&*db, &dataset_name, owner_id, None)
-            .await
-            .expect("get_dataset_by_name must succeed")
-            .unwrap_or_else(|| panic!("dataset '{dataset_name}' must exist after add()"));
+    let dataset = cognee_database::IngestDb::get_dataset_by_name_in_tenant(
+        &*db,
+        &dataset_name,
+        owner_id,
+        None,
+    )
+    .await
+    .expect("get_dataset_by_name_in_tenant must succeed")
+    .unwrap_or_else(|| panic!("dataset '{dataset_name}' must exist after add()"));
 
     let data_items = cognee_database::DeleteDb::get_dataset_data(&*db, dataset.id)
         .await
