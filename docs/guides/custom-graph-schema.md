@@ -111,9 +111,26 @@ comes from a hand-written or `BaseModel` schema. For useful output, a
 transparent root must have at least one reachable non-transparent descendant;
 otherwise the custom graph intentionally stores no nodes.
 
+The root model needs a `title` that is a valid class name: it starts with an
+uppercase letter and holds only letters and ASCII digits (`ResearchGraph`, not
+`research_graph`, `Research Graph` or `Graph²`), and it may not be `None`,
+`True`, `False` or `DataPoint`. Python looks the generated class up by that
+title, and its code generator rewrites the other spellings, so Python fails on
+them too. The Rust check is slightly stricter in one place: it rejects
+non-ASCII digits, which Python keeps. A root given as a `$ref` still needs that
+top-level `title`, and it must equal the `$defs` key the `$ref` points at
+(`{"title": "Company", "$ref": "#/$defs/Company", ...}`): Python reads only the
+top-level title, raising `KeyError` without one, and any other title makes its
+generator wrap the model in a `RootModel` it cannot store.
+
 Only the single-pass LLM extractor honours a custom schema: `validate()` rejects
 `graph_schema` together with a `graph_backend` or the `cascade` extraction
 strategy, as Python raises for a custom `graph_model` with a non-LLM extractor.
+`validate()` also rejects `graph_schema` together with `temporal_cognify`. This
+is a Rust decision: Python drops `temporal_cognify` and runs the custom model,
+whereas the Rust temporal pipeline would ignore the schema. Finally,
+`validate()` compiles the schema, so an invalid one fails before any document
+is classified or chunked, as Python builds the model class before running.
 
 ### Example (programmatic)
 
@@ -159,8 +176,9 @@ let config = CognifyConfig::default()
 By default each chunk links to the stored root, or to the children that replace
 a transparent root. Use `with_chunk_attachment(ChunkAttachment::All)` to link
 it to every persisted DataPoint reached by the transparent storage walk.
-Chunk attachment requires a custom graph schema and is rejected for temporal
-cognify, matching Python.
+Chunk attachment requires a custom graph schema. It is also rejected for
+temporal cognify, by the same Rust decision as `graph_schema` above: Python
+ignores `temporal_cognify` on this path rather than rejecting it.
 
 ## Pointers
 
