@@ -1835,3 +1835,204 @@ fn cognify_failure_summary_does_not_advise_a_pointless_re_run() {
         "the line must say why there is nothing to do: {summary}"
     );
 }
+
+/// `--graph-schema` / `--chunk-attachment` are parsed and validated before any
+/// component is built: each bad value fails with exit code 2 and says why,
+/// rather than being ignored.
+#[test]
+fn cognify_rejects_invalid_graph_schema_flags() {
+    let config_home = TempDir::new().expect("temp dir should be created");
+    let workdir = TempDir::new().expect("temp dir should be created");
+    let valid = workdir.path().join("graph.json");
+    std::fs::write(
+        &valid,
+        r#"{"title": "Graph", "type": "object", "properties": {"name": {"type": "string"}}}"#,
+    )
+    .expect("write schema");
+    let bad_title = workdir.path().join("bad_title.json");
+    std::fs::write(&bad_title, r#"{"title": "graph", "properties": {}}"#).expect("write schema");
+    let not_json = workdir.path().join("not_json.json");
+    std::fs::write(&not_json, "{ not json").expect("write schema");
+    let valid = valid.to_str().expect("utf-8 path");
+    let bad_title = bad_title.to_str().expect("utf-8 path");
+    let not_json = not_json.to_str().expect("utf-8 path");
+    let missing = workdir.path().join("missing.json");
+    let missing = missing.to_str().expect("utf-8 path");
+
+    for (command, args, expected) in [
+        (
+            "cognify",
+            vec!["--chunk-attachment", "all"],
+            "chunk_attachment requires graph_schema",
+        ),
+        (
+            "cognify",
+            vec!["--graph-schema", bad_title],
+            "Invalid graph schema",
+        ),
+        (
+            "cognify",
+            vec!["--graph-schema", not_json],
+            "not valid JSON",
+        ),
+        (
+            "cognify",
+            vec!["--graph-schema", missing],
+            "Cannot read --graph-schema",
+        ),
+        (
+            "cognify",
+            vec!["--graph-schema", valid, "--temporal-cognify"],
+            "not supported with temporal_cognify",
+        ),
+        (
+            "add-and-cognify",
+            vec!["some text", "--chunk-attachment", "direct"],
+            "chunk_attachment requires graph_schema",
+        ),
+    ] {
+        make_cmd_in(&config_home, workdir.path())
+            .arg(command)
+            .args(&args)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains(expected));
+    }
+
+    // Clap owns the value set: anything but `direct` / `all` is a usage error.
+    make_cmd_in(&config_home, workdir.path())
+        .args(["cognify", "--chunk-attachment", "everything"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid value 'everything'"));
+}
+
+/// A valid `--graph-schema` / `--chunk-attachment` reaches the run: the
+/// extraction request carries the custom schema (its unique title), not the
+/// default `KnowledgeGraph` shape. The local LLM endpoint refuses every
+/// request, so the command fails after the request — what matters is that the
+/// flag-validated config, not a fresh one from the settings, drove it.
+/// Gated like the search cases: the run builds the default graph backend
+/// before it extracts.
+#[cfg(feature = "ladybug")]
+#[test]
+fn a_valid_graph_schema_flag_reaches_the_extraction_request() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    // One schema title per command, so each command's request is seen.
+    let titles = ["CliProbeCognify", "CliProbeAddAndCognify"];
+    let (endpoint, server, probes) = rt.block_on(async {
+        let mut server = mockito::Server::new_async().await;
+        let mut probes = Vec::new();
+        for title in titles {
+            probes.push(
+                server
+                    .mock("POST", mockito::Matcher::Any)
+                    .match_body(mockito::Matcher::Regex(title.to_string()))
+                    .with_status(400)
+                    .with_body(r#"{"error": {"message": "refused by the test endpoint"}}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        (server.url(), server, probes)
+    });
+
+    let config_home = TempDir::new().expect("temp dir should be created");
+    let workdir = TempDir::new().expect("temp dir should be created");
+    let db_file_path = workdir.path().join("cognee.db");
+    std::fs::File::create(&db_file_path).expect("sqlite database file should be created");
+    for (key, value) in [
+        (
+            "default_user_id",
+            "\"00000000-0000-0000-0000-000000000000\"".to_string(),
+        ),
+        (
+            "data_root_directory",
+            format!("\"{}\"", workdir.path().join("cognee_data").display()),
+        ),
+        (
+            "relational_db_url",
+            format!("\"sqlite://{}\"", db_file_path.display()),
+        ),
+    ] {
+        config_set(&config_home, workdir.path(), key, &value);
+    }
+    let schemas: Vec<String> = titles
+        .iter()
+        .map(|title| {
+            let path = workdir.path().join(format!("{title}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"title": "{title}", "type": "object",
+                        "properties": {{"name": {{"type": "string"}}}}, "required": ["name"]}}"#
+                ),
+            )
+            .expect("write schema");
+            path.to_str().expect("utf-8 path").to_string()
+        })
+        .collect();
+    let llm_env = |cmd: &mut Command| {
+        cmd.env("MOCK_EMBEDDING", "true")
+            .env("LLM_PROVIDER", "openai")
+            .env("LLM_MODEL", "gpt-4o-mini")
+            .env("LLM_API_KEY", "sk-test")
+            .env("LLM_ENDPOINT", &endpoint)
+            .env("LLM_MAX_RETRIES", "1")
+            .env("LLM_NETWORK_RETRIES", "1")
+            .env("LLM_MIN_RETRY_SECONDS", "0");
+    };
+
+    make_cmd_in(&config_home, workdir.path())
+        .args(["add", "Alice works at Acme.", "--dataset-name", "schema_ds"])
+        .assert()
+        .success();
+    let mut cognify = make_cmd_in(&config_home, workdir.path());
+    llm_env(&mut cognify);
+    cognify
+        .args(["cognify", "--datasets", "schema_ds"])
+        .args(["--graph-schema", &schemas[0], "--chunk-attachment", "all"])
+        .assert()
+        .failure();
+
+    let mut add_and_cognify = make_cmd_in(&config_home, workdir.path());
+    llm_env(&mut add_and_cognify);
+    add_and_cognify
+        .args([
+            "add-and-cognify",
+            "Bob works at Initech.",
+            "--dataset-name",
+            "schema_ds2",
+        ])
+        .args([
+            "--graph-schema",
+            &schemas[1],
+            "--chunk-attachment",
+            "direct",
+        ])
+        .assert()
+        .failure();
+
+    // Each command sent its custom schema.
+    for probe in probes {
+        rt.block_on(probe.assert_async());
+    }
+    drop(server);
+}
+
+#[test]
+fn cognify_help_lists_graph_schema_flags() {
+    let config_home = TempDir::new().expect("temp dir should be created");
+    make_cmd(&config_home)
+        .args(["cognify", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--graph-schema <FILE>")
+                .and(predicate::str::contains("--chunk-attachment")),
+        );
+}

@@ -208,6 +208,143 @@ def _coerce_inputs(
 
 
 # ---------------------------------------------------------------------------
+# Custom graph models: ``graph_model`` → the ``graph_schema`` JSON Schema
+# ---------------------------------------------------------------------------
+
+
+def _is_default_graph_model(model: type) -> bool:
+    """Whether *model* is upstream's default ``KnowledgeGraph``.
+
+    Upstream ``cognify(graph_model=KnowledgeGraph)`` is the default pipeline,
+    not a custom model, so passing it explicitly must not turn into a runtime
+    schema.
+    """
+    return (
+        getattr(model, "__name__", None) == "KnowledgeGraph"
+        and getattr(model, "__module__", None) == "cognee.shared.data_models"
+    )
+
+
+def _basemodel_json_schema(model: type) -> dict:
+    """``model.model_json_schema()`` without the default per-field titles.
+
+    The same generator upstream's ``graph_model_to_graph_schema`` uses, for a
+    plain ``pydantic.BaseModel`` (which that function passes through
+    unchanged). Pydantic is the caller's dependency, not this package's, so it
+    is imported only here.
+    """
+    try:
+        from pydantic._internal._core_utils import is_core_schema
+        from pydantic.json_schema import GenerateJsonSchema
+    except ImportError:  # pragma: no cover - a pydantic without these helpers
+        return model.model_json_schema()
+
+    class _WithoutDefaultFieldTitles(GenerateJsonSchema):
+        def field_title_should_be_set(self, schema):  # type: ignore[override]
+            should_set = super().field_title_should_be_set(schema)
+            if should_set and is_core_schema(schema):
+                return False
+            return should_set
+
+    return model.model_json_schema(schema_generator=_WithoutDefaultFieldTitles)
+
+
+def _graph_model_to_schema(graph_model: Any) -> Any:
+    """Convert a ``graph_model`` argument into the native ``graph_schema``.
+
+    Accepts what upstream ``cognify(graph_model=...)`` takes — a Pydantic
+    model class — plus the JSON Schema itself, as a ``dict`` or a JSON
+    string (what upstream's HTTP route accepts). ``None`` and upstream's
+    ``KnowledgeGraph`` both mean the default pipeline.
+
+    A class is converted the way upstream's ``graph_model_to_graph_schema``
+    does it: through that very function when the upstream ``cognee`` package
+    is importable (so a ``DataPoint`` subclass drops the infrastructure fields
+    ``DataPoint`` declares), else with ``model_json_schema()`` minus the
+    default field titles. The schema is validated natively; an invalid one
+    raises :exc:`~cognee_py.CogneeValidationError`.
+    """
+    if graph_model is None or isinstance(graph_model, (dict, str)):
+        return graph_model
+    if isinstance(graph_model, type) and hasattr(graph_model, "model_json_schema"):
+        if _is_default_graph_model(graph_model):
+            return None
+        try:
+            from cognee.shared.graph_model_utils import graph_model_to_graph_schema
+        except ImportError:
+            # Upstream ``cognee`` is absent, or ``cognee`` is this repo's
+            # drop-in shim, which has no ``shared`` package.
+            return _basemodel_json_schema(graph_model)
+        return graph_model_to_graph_schema(graph_model)
+    raise CogneeValidationError(
+        "graph_model must be a Pydantic model class, a JSON Schema dict or a "
+        f"JSON string, got {type(graph_model).__name__}"
+    )
+
+
+def _upstream_datapoint() -> Optional[type]:
+    """Upstream ``cognee``'s ``DataPoint`` class, or ``None`` when absent.
+
+    ``None`` when upstream ``cognee`` is not importable, including when
+    ``cognee`` is this repo's drop-in shim, which defines no ``DataPoint``.
+    """
+    try:
+        from cognee.infrastructure.engine import DataPoint
+    except ImportError:
+        return None
+    return DataPoint
+
+
+def _check_chunk_attachment_model(graph_model: Any, chunk_attachment: Any) -> None:
+    """Raise as upstream ``cognify`` does for ``chunk_attachment`` with a
+    model class that is not a ``DataPoint`` subclass.
+
+    Upstream (``cognify.py``) requires ``issubclass(graph_model, DataPoint)``
+    whenever ``chunk_attachment`` is set. That check is only possible when
+    upstream's ``DataPoint`` is importable, so it applies then and only to a
+    class: a JSON Schema dict or string, like upstream's HTTP route, always
+    describes a ``DataPoint``-like model, and without upstream there is no
+    ``DataPoint`` to subclass, so a class is accepted as its schema. A missing
+    model (or the default ``KnowledgeGraph``) is rejected natively, because
+    ``chunk_attachment`` without a graph schema fails validation.
+    """
+    # Upstream rejects an unusable value before it looks at the model, so
+    # leave that error to the native validation.
+    if chunk_attachment not in ("direct", "all") or not isinstance(graph_model, type):
+        return
+    if _is_default_graph_model(graph_model):
+        return
+    data_point = _upstream_datapoint()
+    if data_point is not None and not issubclass(graph_model, data_point):
+        raise CogneeValidationError(
+            "chunk_attachment requires a custom DataPoint graph_model; "
+            f"{graph_model.__name__!r} is not a DataPoint subclass."
+        )
+
+
+def _cognify_opts(kwargs: dict) -> Optional[dict]:
+    """The native cognify ``opts`` for compat ``**kwargs``.
+
+    ``graph_model`` is converted by :func:`_graph_model_to_schema` and sent as
+    ``graph_schema``; ``chunk_attachment`` and every other keyword pass
+    through (snake_case keys are normalised natively); a ``chunk_attachment``
+    with a non-``DataPoint`` class raises as upstream does, when upstream's
+    ``DataPoint`` is importable (see :func:`_check_chunk_attachment_model`).
+    Unknown keywords are
+    logged as a warning natively — upstream forwards them into the LLM call
+    rather than raising — and wrongly-typed or invalid values raise.
+    """
+    opts = dict(kwargs)
+    if "graph_model" in opts:
+        if opts.get("graph_schema") is not None:
+            raise CogneeValidationError("pass either graph_model or graph_schema, not both")
+        graph_model = opts.pop("graph_model")
+        _check_chunk_attachment_model(graph_model, opts.get("chunk_attachment"))
+        opts["graph_schema"] = _graph_model_to_schema(graph_model)
+    return opts or None
+
+
+# ---------------------------------------------------------------------------
 # Module-level SDK functions
 # ---------------------------------------------------------------------------
 
@@ -263,10 +400,15 @@ async def cognify(
 
     Pass ``raw=True`` to receive the native camelCase dict
     (``alreadyCompleted``, ``priorPipelineRunId``).
+
+    ``graph_model`` takes a custom Pydantic graph model class (or its JSON
+    Schema as a dict or JSON string) and ``chunk_attachment`` takes
+    ``"direct"`` or ``"all"``, as upstream; see :func:`_graph_model_to_schema`.
+    An invalid value raises :exc:`~cognee_py.CogneeValidationError`.
     """
     dataset_name = datasets if isinstance(datasets, str) else _default_dataset_name()
-    opts = kwargs if kwargs else None
-    result = await _handle().cognify(dataset_name, opts or None)
+    opts = _cognify_opts(kwargs)
+    result = await _handle().cognify(dataset_name, opts)
     return result if raw else _rekey(result)
 
 
@@ -286,13 +428,16 @@ async def add_and_cognify(
     (snake_case sub-dict) and ``cognify`` (snake_case sub-dict).
 
     Pass ``raw=True`` to receive the native camelCase dict.
+
+    Accepts the same ``graph_model`` / ``chunk_attachment`` keywords as
+    :func:`cognify`.
     """
     descriptors = _coerce_inputs(data)
     inputs = descriptors if len(descriptors) != 1 else descriptors[0]
-    opts = kwargs if kwargs else None
+    opts = _cognify_opts(kwargs)
     if dataset_name is None:
         dataset_name = _default_dataset_name()
-    result = await _handle().add_and_cognify(inputs, dataset_name, opts or None)
+    result = await _handle().add_and_cognify(inputs, dataset_name, opts)
     if raw:
         return result
     # Re-key both the outer dict and the nested add/cognify sub-dicts.
