@@ -50,7 +50,7 @@ pub use config::{
 pub use dataset_resolver::{DatasetRef, DatasetResolver, cognify_dataset_refs, cognify_datasets};
 pub use dynamic_graph::{
     DynamicDataPoint, DynamicGraph, DynamicGraphError, DynamicGraphSchema, DynamicModelSchema,
-    DynamicRelationship, StoredDynamicGraph,
+    DynamicRelationship, FROM_IDENTITY_KEYWORD, StoredDynamicGraph,
 };
 pub use edge_reindex::{EdgeReindexOptions, EdgeReindexReport, reindex_edge_types};
 pub use error::CognifyError;

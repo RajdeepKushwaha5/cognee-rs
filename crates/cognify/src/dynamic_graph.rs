@@ -42,6 +42,18 @@ pub(crate) const DATA_POINT_FIELDS: &[&str] = &[
     "importance_weight",
 ];
 
+/// The field keyword that makes a reference field a FromIdentity reference:
+/// the LLM answers it with the target's identity string (a list of them for
+/// an array field) instead of a nested object, and the string is widened back
+/// into a reference to that node — the node with the same id, already in the
+/// graph or extracted alongside it.
+///
+/// This is Rust's spelling of Python's `Annotated[Target, FromIdentity()]`
+/// marker (`cognee/infrastructure/engine/models/FieldAnnotations.py`), which
+/// has no JSON Schema form: Python's schema-to-model converter ignores the
+/// keyword, so a schema that uses it extracts nested objects there.
+pub const FROM_IDENTITY_KEYWORD: &str = "x-cognee-from-identity";
+
 /// A compiled custom graph model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DynamicGraphSchema {
@@ -78,6 +90,8 @@ struct DynamicFieldSchema {
     default: Option<Value>,
     schema: Value,
     kind: DynamicFieldKind,
+    /// Whether the field carries [`FROM_IDENTITY_KEYWORD`].
+    from_identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +102,9 @@ enum DynamicFieldKind {
     Relationship {
         targets: Vec<String>,
         many: bool,
+        /// For a FromIdentity reference, the target's identity field: an
+        /// answered string `s` stands for the object `{identity_field: s}`.
+        identity_field: Option<String>,
     },
 }
 
@@ -500,6 +517,10 @@ pub enum DynamicGraphError {
          use a model, an optional model, a union of models, or a list of those"
     )]
     UnsupportedReferenceShape { model: String, field: String },
+    /// A FromIdentity reference Python would refuse to build
+    /// (`InvalidReferenceTypeError`), raised before any LLM call.
+    #[error("{0}")]
+    InvalidReferenceType(String),
     #[error("custom graph answer for `{model}` must be an object")]
     AnswerNotObject { model: String },
     #[error("custom graph answer for `{model}` is missing required field `{field}`")]
@@ -589,6 +610,15 @@ impl DynamicGraphSchema {
 
         let mut llm_schema = schema.clone();
         strip_metadata_properties(&mut llm_schema);
+        resolve_identity_references(
+            &mut models,
+            &root,
+            root_definition.is_none(),
+            &mut llm_schema,
+        )?;
+        // A `false` marker, or one the narrowing did not replace, must not
+        // reach a strict structured-output request either.
+        strip_from_identity_marker(&mut llm_schema);
 
         Ok(Self {
             root,
@@ -709,12 +739,14 @@ fn compile_model(
             None => DynamicFieldKind::Scalar,
         };
         let default = field_schema.get("default").cloned();
+        let from_identity = from_identity_marker(field_schema, name, field_name)?;
         fields.push(DynamicFieldSchema {
             name: field_name.clone(),
             required: required.contains(field_name.as_str()),
             default,
             schema: field_schema.clone(),
             kind,
+            from_identity,
         });
     }
 
@@ -776,6 +808,234 @@ fn compile_model(
     })
 }
 
+/// Whether a field schema carries [`FROM_IDENTITY_KEYWORD`] — anywhere in it,
+/// as Python finds a `FromIdentity()` marker at any depth of the annotation
+/// (`Annotated[Role, FromIdentity()] | None` puts it one level down). It takes
+/// `true` or `false`.
+fn from_identity_marker(
+    schema: &Value,
+    model: &str,
+    field: &str,
+) -> Result<bool, DynamicGraphError> {
+    fn find(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Object(map) => map
+                .get(FROM_IDENTITY_KEYWORD)
+                .or_else(|| map.values().find_map(find)),
+            Value::Array(values) => values.iter().find_map(find),
+            _ => None,
+        }
+    }
+    match find(schema) {
+        None => Ok(false),
+        Some(Value::Bool(marked)) => Ok(*marked),
+        Some(other) => Err(DynamicGraphError::InvalidReferenceType(format!(
+            "{field} on {model} sets `{FROM_IDENTITY_KEYWORD}` to {other}; it takes true or false"
+        ))),
+    }
+}
+
+/// How a FromIdentity field holds its target: Python's `_identity_reference`
+/// accepts `Target`, `Target | None`, `list[Target]` and `list[Target] | None`.
+struct IdentityReferenceShape<'s> {
+    reference: &'s str,
+    many: bool,
+    optional: bool,
+}
+
+fn identity_reference_shape(schema: &Value) -> Option<IdentityReferenceShape<'_>> {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return Some(IdentityReferenceShape {
+            reference,
+            many: false,
+            optional: false,
+        });
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("array") {
+        let reference = schema.get("items")?.get("$ref")?.as_str()?;
+        return Some(IdentityReferenceShape {
+            reference,
+            many: true,
+            optional: false,
+        });
+    }
+    let variants = schema.get("anyOf")?.as_array()?;
+    let non_null = non_null_variants(variants);
+    if variants.len() != 2 || non_null.len() != 1 {
+        return None;
+    }
+    let inner = identity_reference_shape(non_null[0])?;
+    (!inner.optional).then_some(IdentityReferenceShape {
+        optional: true,
+        ..inner
+    })
+}
+
+/// Check every FromIdentity field the way Python's `_llm_identity_field_for`
+/// does, record the target's identity field on it, and narrow it in the LLM
+/// schema to the identity string(s) the LLM should answer.
+///
+/// Models are checked root first, then by name, so the reported error does
+/// not depend on hash order.
+fn resolve_identity_references(
+    models: &mut HashMap<String, DynamicModelSchema>,
+    root: &str,
+    root_is_inline: bool,
+    llm_schema: &mut Value,
+) -> Result<(), DynamicGraphError> {
+    let mut names: Vec<String> = models.keys().cloned().collect();
+    names.sort_by_key(|name| (name != root, name.clone()));
+    let mut resolved = Vec::new();
+    for name in &names {
+        for (index, field) in models[name].fields.iter().enumerate() {
+            if !field.from_identity {
+                continue;
+            }
+            let target = identity_reference_shape(&field.schema).and_then(|shape| {
+                let target = shape.reference.strip_prefix("#/$defs/")?;
+                models.contains_key(target).then_some((target, shape))
+            });
+            let Some((target, shape)) = target else {
+                let mut shown = field.schema.clone();
+                strip_from_identity_marker(&mut shown);
+                return Err(DynamicGraphError::InvalidReferenceType(format!(
+                    "{} on {name} marks {shown} with {FROM_IDENTITY_KEYWORD}, but a FromIdentity \
+                     reference must name a model as a `$ref`, a `$ref` or null, or an array of \
+                     `$ref`. Any other shape would ask the LLM for a whole nested object and \
+                     mint a duplicate node instead of a reference.",
+                    field.name
+                )));
+            };
+            let target_model = &models[target];
+            let identity = &target_model.identity_fields;
+            if identity.len() != 1 {
+                // Python prints what `_get_identity_fields` read: the
+                // declared value, or `None` when there is none.
+                let got = target_model
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("identity_fields"))
+                    .map_or_else(
+                        || "None".to_string(),
+                        |declared| plain_python_value(declared).to_repr(),
+                    );
+                return Err(DynamicGraphError::InvalidReferenceType(format!(
+                    "{target} on {} needs exactly one identity_fields entry, got {got}",
+                    field.name
+                )));
+            }
+            let identity_field = identity[0].clone();
+            let offending: Vec<String> = target_model
+                .fields
+                .iter()
+                .filter(|candidate| {
+                    candidate.required
+                        && candidate.default.is_none()
+                        && candidate.name != identity_field
+                })
+                .map(|candidate| candidate.name.clone())
+                .collect();
+            if !offending.is_empty() {
+                return Err(DynamicGraphError::InvalidReferenceType(format!(
+                    "{target} on {} has required fields that cannot be filled from an identity \
+                     string: {}",
+                    field.name,
+                    PyValue::List(offending.into_iter().map(PyValue::Str).collect()).to_repr()
+                )));
+            }
+            let narrowed = narrowed_identity_field(
+                &field.schema,
+                &shape,
+                &format!("The {identity_field} of a {target} already in the graph"),
+            );
+            resolved.push((name.clone(), index, identity_field, narrowed));
+        }
+    }
+
+    for (name, index, identity_field, narrowed) in resolved {
+        let Some(field) = models
+            .get_mut(&name)
+            .and_then(|model| model.fields.get_mut(index))
+        else {
+            continue;
+        };
+        if let DynamicFieldKind::Relationship {
+            identity_field: slot,
+            ..
+        } = &mut field.kind
+        {
+            *slot = Some(identity_field);
+        }
+        // The root's fields sit at the top level unless the root is a `$ref`;
+        // a model in `$defs` is narrowed there (the spec compiler emits the
+        // root in both places).
+        let narrow = |properties: Option<&mut Value>| {
+            if let Some(slot) = properties.and_then(|properties| properties.get_mut(&field.name)) {
+                *slot = narrowed.clone();
+            }
+        };
+        if name == root && root_is_inline {
+            narrow(llm_schema.get_mut("properties"));
+        }
+        narrow(
+            llm_schema
+                .get_mut("$defs")
+                .and_then(|defs| defs.get_mut(&name))
+                .and_then(|model| model.get_mut("properties")),
+        );
+    }
+    Ok(())
+}
+
+/// The LLM-facing schema of a FromIdentity field: the identity string, a
+/// string or null, or a list of strings, with Python's description. The
+/// field's `default` and `title` are kept; the rest of the field schema, the
+/// marker included, is not sent.
+fn narrowed_identity_field(
+    schema: &Value,
+    shape: &IdentityReferenceShape<'_>,
+    description: &str,
+) -> Value {
+    let string = serde_json::json!({"type": "string"});
+    let value = if shape.many {
+        serde_json::json!({"type": "array", "items": string})
+    } else {
+        string
+    };
+    let mut narrowed = if shape.optional {
+        Map::from_iter([(
+            "anyOf".to_string(),
+            serde_json::json!([value, {"type": "null"}]),
+        )])
+    } else {
+        match value {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        }
+    };
+    for key in ["default", "title"] {
+        if let Some(kept) = schema.get(key) {
+            narrowed.insert(key.to_string(), kept.clone());
+        }
+    }
+    narrowed.insert(
+        "description".to_string(),
+        Value::String(description.to_string()),
+    );
+    Value::Object(narrowed)
+}
+
+fn strip_from_identity_marker(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove(FROM_IDENTITY_KEYWORD);
+            map.values_mut().for_each(strip_from_identity_marker);
+        }
+        Value::Array(values) => values.iter_mut().for_each(strip_from_identity_marker),
+        _ => {}
+    }
+}
+
 /// Classify a field as a relationship the way Python's storage walk would see
 /// it: any value that is a DataPoint becomes a node and an edge, whatever
 /// `Optional`/`Union`/`List` nesting the annotation used.
@@ -787,6 +1047,7 @@ fn relationship_kind(
         return Ok(Some(DynamicFieldKind::Relationship {
             targets,
             many: false,
+            identity_field: None,
         }));
     }
     if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
@@ -802,6 +1063,7 @@ fn relationship_kind(
         return Ok(Some(DynamicFieldKind::Relationship {
             targets,
             many: true,
+            identity_field: None,
         }));
     }
     Ok(None)
@@ -1075,8 +1337,18 @@ impl<'a> Materializer<'a> {
                     properties.insert(field.name.clone(), coerced.stored);
                     scalar_python_values.insert(field.name.as_str(), coerced.python);
                 }
-                DynamicFieldKind::Relationship { targets, many } => {
-                    relationship_values.push((field.name.clone(), targets, *many, value));
+                DynamicFieldKind::Relationship {
+                    targets,
+                    many,
+                    identity_field,
+                } => {
+                    relationship_values.push((
+                        field.name.clone(),
+                        targets,
+                        *many,
+                        identity_field.as_deref(),
+                        value,
+                    ));
                 }
             }
         }
@@ -1139,10 +1411,11 @@ impl<'a> Materializer<'a> {
             transparent: model.transparent,
         });
 
-        for (field_name, target_models, many, value) in relationship_values {
+        for (field_name, target_models, many, identity_field, value) in relationship_values {
             if value.is_null() {
                 continue;
             }
+            let widen = |child| widen_identity_reference(identity_field, child);
             if many {
                 let values =
                     value
@@ -1154,7 +1427,7 @@ impl<'a> Materializer<'a> {
                         })?;
                 // Python skips `None` list items: they are not DataPoints.
                 for child in values.iter().filter(|child| !child.is_null()) {
-                    let target = self.visit_any(target_models, child)?;
+                    let target = self.visit_any(target_models, &widen(child))?;
                     self.relationships.push(DynamicRelationship {
                         source: occurrence_id,
                         target,
@@ -1162,7 +1435,7 @@ impl<'a> Materializer<'a> {
                     });
                 }
             } else {
-                let target = self.visit_any(target_models, value)?;
+                let target = self.visit_any(target_models, &widen(value))?;
                 self.relationships.push(DynamicRelationship {
                     source: occurrence_id,
                     target,
@@ -1197,6 +1470,21 @@ impl<'a> Materializer<'a> {
                 model: models.join(" | "),
             }),
         )
+    }
+}
+
+/// Python's `_datapoint_reference_for`: for a FromIdentity field, an answered
+/// identity string becomes the object the target validates; anything else is
+/// left as answered.
+fn widen_identity_reference<'v>(
+    identity_field: Option<&str>,
+    child: &'v Value,
+) -> std::borrow::Cow<'v, Value> {
+    match (identity_field, child) {
+        (Some(field), Value::String(_)) => std::borrow::Cow::Owned(Value::Object(Map::from_iter(
+            [(field.to_string(), child.clone())],
+        ))),
+        _ => std::borrow::Cow::Borrowed(child),
     }
 }
 
@@ -4930,5 +5218,474 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// FromIdentity references (SDK-1055): the `x-cognee-from-identity` keyword,
+/// checked like Python's `_llm_identity_field_for`, narrowed in the LLM schema
+/// and widened back when the answer is materialized. Expected ids and messages
+/// were recorded from Python cognee @ 37f788bd2 with the equivalent Pydantic
+/// models (`Annotated[Role, FromIdentity()]` and friends).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code — panics are acceptable failures"
+)]
+mod from_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn metadata(identity: Value) -> Value {
+        json!({"type": "object", "default": {"index_fields": ["name"], "identity_fields": identity}})
+    }
+
+    fn role() -> Value {
+        json!({
+            "title": "Role",
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "level": {"type": "integer", "default": 0},
+                "metadata": metadata(json!(["name"]))
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn person(role_field: Value) -> Value {
+        json!({
+            "title": "Person",
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "role": role_field,
+                "backup": {
+                    "anyOf": [{"$ref": "#/$defs/Role"}, {"type": "null"}],
+                    "default": null,
+                    FROM_IDENTITY_KEYWORD: true
+                },
+                "past": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Role"},
+                    "default": [],
+                    FROM_IDENTITY_KEYWORD: true
+                },
+                "metadata": metadata(json!(["name"]))
+            },
+            "required": ["name", "role"]
+        })
+    }
+
+    /// Python's `Team` / `Person` / `Role` probe models.
+    fn team_schema_with(role_def: Value, role_field: Value) -> Value {
+        json!({
+            "title": "Team",
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "roles": {"type": "array", "items": {"$ref": "#/$defs/Role"}, "default": []},
+                "members": {"type": "array", "items": {"$ref": "#/$defs/Person"}, "default": []},
+                "metadata": metadata(json!(["name"]))
+            },
+            "required": ["name"],
+            "$defs": {"Role": role_def, "Person": person(role_field)}
+        })
+    }
+
+    fn team_schema() -> Value {
+        team_schema_with(
+            role(),
+            json!({"$ref": "#/$defs/Role", "description": "Their role.", FROM_IDENTITY_KEYWORD: true}),
+        )
+    }
+
+    fn reference_error(schema: Value) -> String {
+        match DynamicGraphSchema::compile(&schema) {
+            Err(DynamicGraphError::InvalidReferenceType(message)) => message,
+            other => panic!("expected InvalidReferenceType, got {other:?}"),
+        }
+    }
+
+    fn id(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
+    }
+
+    #[test]
+    fn identity_fields_are_narrowed_to_strings_in_the_llm_schema() {
+        let compiled = DynamicGraphSchema::compile(&team_schema()).unwrap();
+        let person = &compiled.llm_schema()["$defs"]["Person"]["properties"];
+        let description = "The name of a Role already in the graph";
+        // Python: `str`, `str | None = None`, `list[str] = []`, each with
+        // the generated description replacing the field's own.
+        assert_eq!(
+            person["role"],
+            json!({"type": "string", "description": description})
+        );
+        assert_eq!(
+            person["backup"],
+            json!({
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": null,
+                "description": description
+            })
+        );
+        assert_eq!(
+            person["past"],
+            json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": description
+            })
+        );
+        assert!(
+            !compiled
+                .llm_schema()
+                .to_string()
+                .contains(FROM_IDENTITY_KEYWORD)
+        );
+        // A plain reference to the same model is still a nested object.
+        assert_eq!(
+            compiled.llm_schema()["properties"]["roles"]["items"],
+            json!({"$ref": "#/$defs/Role"})
+        );
+    }
+
+    #[test]
+    fn identity_strings_become_references_to_the_nodes_python_builds() {
+        let compiled = DynamicGraphSchema::compile(&team_schema()).unwrap();
+        let answer = json!({
+            "name": "Core",
+            "roles": [{"name": "Lead Dev", "level": 3}],
+            "members": [{
+                "name": "Ada",
+                "role": "Lead Dev",
+                "backup": null,
+                "past": ["Intern", "Lead Dev"]
+            }]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let stored = store_dynamic_graph_batch([&graph], ChunkAttachment::Direct)
+            .pop()
+            .unwrap();
+
+        let team = id("5d3c1444-9bd5-5df9-859c-63e40fbdab96");
+        let ada = id("19602cf7-f83a-5764-884b-09504eb8f348");
+        let lead_dev = id("0d359583-1421-5b79-b911-f7d1095ee4c3");
+        let intern = id("c56632a1-d03b-5f53-bb6f-27dc64071ca6");
+        let mut edges: Vec<(Uuid, String, Uuid)> = stored
+            .relationships
+            .iter()
+            .map(|edge| (edge.source, edge.field_name.clone(), edge.target))
+            .collect();
+        edges.sort();
+        let mut expected = vec![
+            (team, "roles".to_string(), lead_dev),
+            (team, "members".to_string(), ada),
+            (ada, "role".to_string(), lead_dev),
+            (ada, "past".to_string(), intern),
+            (ada, "past".to_string(), lead_dev),
+        ];
+        expected.sort();
+        assert_eq!(edges, expected);
+
+        // The fully answered role is reached first and keeps its level, as in
+        // Python; the identity-only `Intern` holds the field defaults.
+        let level = |node_id: Uuid| {
+            stored
+                .nodes
+                .iter()
+                .find(|node| node.base.id == node_id)
+                .map(|node| node.properties["level"].clone())
+        };
+        assert_eq!(level(lead_dev), Some(json!(3)));
+        assert_eq!(level(intern), Some(json!(0)));
+        assert_eq!(
+            stored
+                .nodes
+                .iter()
+                .filter(|node| node.base.data_type == "Role")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_answered_object_is_still_accepted() {
+        // Python leaves a non-string answer as it is and validates it as the
+        // nested model.
+        let compiled = DynamicGraphSchema::compile(&team_schema()).unwrap();
+        let answer = json!({
+            "name": "Core",
+            "members": [{"name": "Ada", "role": {"name": "Lead Dev", "level": 2}}]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let role = graph
+            .nodes
+            .iter()
+            .find(|node| node.base.data_type == "Role")
+            .unwrap();
+        assert_eq!(role.base.id, id("0d359583-1421-5b79-b911-f7d1095ee4c3"));
+        assert_eq!(role.properties["level"], json!(2));
+    }
+
+    #[test]
+    fn a_required_reference_left_unanswered_is_rejected() {
+        let compiled = DynamicGraphSchema::compile(&team_schema()).unwrap();
+        let error = compiled
+            .materialize(
+                &json!({"name": "Core", "members": [{"name": "Ada"}]}),
+                Uuid::nil(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DynamicGraphError::MissingRequiredField { .. }
+        ));
+    }
+
+    #[test]
+    fn the_marker_may_sit_inside_the_field_schema() {
+        // Python's `Annotated[Role, FromIdentity()] | None` spelling.
+        let schema = team_schema_with(
+            role(),
+            json!({"anyOf": [{"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true}, {"type": "null"}]}),
+        );
+        let compiled = DynamicGraphSchema::compile(&schema).unwrap();
+        assert_eq!(
+            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"]["anyOf"],
+            json!([{"type": "string"}, {"type": "null"}])
+        );
+    }
+
+    #[test]
+    fn a_false_marker_is_a_plain_reference() {
+        let schema = team_schema_with(
+            role(),
+            json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: false}),
+        );
+        let compiled = DynamicGraphSchema::compile(&schema).unwrap();
+        assert_eq!(
+            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"],
+            json!({"$ref": "#/$defs/Role"}),
+            "the keyword never reaches the LLM, even when false"
+        );
+        assert!(
+            !compiled
+                .llm_schema()
+                .to_string()
+                .contains(FROM_IDENTITY_KEYWORD)
+        );
+    }
+
+    #[test]
+    fn a_reference_at_the_inline_root_is_narrowed_at_the_top_level() {
+        let schema = json!({
+            "title": "Person",
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "role": {"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true}
+            },
+            "required": ["name", "role"],
+            "$defs": {"Role": role()}
+        });
+        let compiled = DynamicGraphSchema::compile(&schema).unwrap();
+        assert_eq!(
+            compiled.llm_schema()["properties"]["role"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
+    fn unsupported_shapes_are_rejected_before_any_llm_call() {
+        let shape_error = "marks {} with x-cognee-from-identity, but a FromIdentity reference \
+                           must name a model";
+        let union = json!({
+            "anyOf": [{"$ref": "#/$defs/Role"}, {"$ref": "#/$defs/Person"}],
+            FROM_IDENTITY_KEYWORD: true
+        });
+        let scalar = json!({"type": "string", FROM_IDENTITY_KEYWORD: true});
+        let list_of_optional = json!({
+            "type": "array",
+            "items": {"anyOf": [{"$ref": "#/$defs/Role"}, {"type": "null"}]},
+            FROM_IDENTITY_KEYWORD: true
+        });
+        for field in [union, scalar, list_of_optional] {
+            let message = reference_error(team_schema_with(role(), field.clone()));
+            let mut shown = field.clone();
+            strip_from_identity_marker(&mut shown);
+            assert!(
+                message.starts_with(&format!(
+                    "role on Person {}",
+                    shape_error.replace("{}", &shown.to_string())
+                )),
+                "{field}: {message}"
+            );
+        }
+        // A reference to a non-model `$defs` entry is a value, not a node.
+        let mut schema = team_schema_with(
+            role(),
+            json!({"$ref": "#/$defs/Mood", FROM_IDENTITY_KEYWORD: true}),
+        );
+        schema["$defs"]["Mood"] = json!({"enum": ["happy", "grumpy"], "type": "string"});
+        assert!(reference_error(schema).starts_with("role on Person marks"));
+    }
+
+    #[test]
+    fn the_target_needs_exactly_one_identity_field() {
+        let mut two = role();
+        two["properties"]["metadata"] = metadata(json!(["name", "level"]));
+        assert_eq!(
+            reference_error(team_schema_with(
+                two,
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true})
+            )),
+            "Role on role needs exactly one identity_fields entry, got ['name', 'level']"
+        );
+        let mut none = role();
+        none["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
+        assert_eq!(
+            reference_error(team_schema_with(
+                none,
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true})
+            )),
+            "Role on role needs exactly one identity_fields entry, got None"
+        );
+        let mut null = role();
+        null["properties"]["metadata"] = metadata(Value::Null);
+        assert_eq!(
+            reference_error(team_schema_with(
+                null,
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true})
+            )),
+            "Role on role needs exactly one identity_fields entry, got None"
+        );
+    }
+
+    /// Within one answer the first occurrence of an id is stored (Python's
+    /// walk). A model that declares the referencing field before the full
+    /// list therefore stores the identity-only node: Python's `Directory`
+    /// probe with `people` before `companies` stores `Acme` with
+    /// `founded=0`.
+    #[test]
+    fn the_first_occurrence_wins_even_when_it_is_a_reference() {
+        let schema = json!({
+            "title": "Directory",
+            "type": "object",
+            "properties": {
+                "people": {"type": "array", "items": {"$ref": "#/$defs/Person"}, "default": []},
+                "companies": {"type": "array", "items": {"$ref": "#/$defs/Company"}, "default": []},
+                "metadata": {"type": "object", "default": {"index_fields": [], "transparent": true}}
+            },
+            "$defs": {
+                "Company": {
+                    "title": "Company",
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "founded": {"type": "integer", "default": 0},
+                        "metadata": metadata(json!(["name"]))
+                    },
+                    "required": ["name"]
+                },
+                "Person": {
+                    "title": "Person",
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "employer": {
+                            "anyOf": [{"$ref": "#/$defs/Company"}, {"type": "null"}],
+                            "default": null,
+                            FROM_IDENTITY_KEYWORD: true
+                        },
+                        "metadata": metadata(json!(["name"]))
+                    },
+                    "required": ["name"]
+                }
+            }
+        });
+        let compiled = DynamicGraphSchema::compile(&schema).unwrap();
+        // Answer order does not matter; declaration order does.
+        let answer = json!({
+            "companies": [{"name": "Acme", "founded": 1999}],
+            "people": [{"name": "Alice", "employer": "Acme"}]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let stored = store_dynamic_graph_batch([&graph], ChunkAttachment::Direct)
+            .pop()
+            .unwrap();
+        let companies: Vec<&DynamicDataPoint> = stored
+            .nodes
+            .iter()
+            .filter(|node| node.base.data_type == "Company")
+            .collect();
+        assert_eq!(companies.len(), 1);
+        assert_eq!(companies[0].properties["founded"], json!(0));
+    }
+
+    /// A target whose identity field it does not declare compiles (Python
+    /// does not check it, and the compile step warns that the identity has no
+    /// stable value), but each reference then becomes a node of its own, as
+    /// Python's random ids make it.
+    #[test]
+    fn an_undeclared_target_identity_field_mints_a_node_per_reference() {
+        // Python's probe: `name: str = ""`, `identity_fields = ["nickname"]`.
+        let mut nicknamed = role();
+        nicknamed["properties"]["name"]["default"] = json!("");
+        nicknamed["properties"]["metadata"] = metadata(json!(["nickname"]));
+        let compiled = DynamicGraphSchema::compile(&team_schema_with(
+            nicknamed,
+            json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true}),
+        ))
+        .unwrap();
+        assert_eq!(
+            compiled.llm_schema()["$defs"]["Person"]["properties"]["role"]["description"],
+            json!("The nickname of a Role already in the graph")
+        );
+        let answer = json!({
+            "name": "Core",
+            "members": [{"name": "Ada", "role": "x"}, {"name": "Bob", "role": "x"}]
+        });
+        let graph = compiled.materialize(&answer, Uuid::nil()).unwrap();
+        let roles: Vec<Uuid> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.base.data_type == "Role")
+            .map(|node| node.base.id)
+            .collect();
+        assert_eq!(roles.len(), 2);
+        assert_ne!(roles[0], roles[1]);
+        assert!(roles.iter().all(|id| id.get_version_num() == 4));
+    }
+
+    #[test]
+    fn the_target_must_be_constructible_from_its_identity() {
+        let mut strict = role();
+        strict["properties"]["must"] = json!({"type": "integer"});
+        strict["required"] = json!(["name", "must"]);
+        assert_eq!(
+            reference_error(team_schema_with(
+                strict,
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: true})
+            )),
+            "Role on role has required fields that cannot be filled from an identity string: \
+             ['must']"
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_marker_is_rejected() {
+        assert_eq!(
+            reference_error(team_schema_with(
+                role(),
+                json!({"$ref": "#/$defs/Role", FROM_IDENTITY_KEYWORD: "yes"})
+            )),
+            "role on Person sets `x-cognee-from-identity` to \"yes\"; it takes true or false"
+        );
     }
 }

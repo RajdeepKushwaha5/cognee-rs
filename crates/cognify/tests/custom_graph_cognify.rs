@@ -577,3 +577,151 @@ async fn a_spec_compiled_schema_cognifies_end_to_end() {
     // A `number` field is a Python float.
     assert_eq!(stored.nodes[ada].get("age"), Some(&json!(36.0)));
 }
+
+/// A `Person` with a FromIdentity `employer` (SDK-1055) next to a root that
+/// lists the companies in full.
+fn directory_schema(employer: Value) -> Value {
+    json!({
+        "$defs": {
+            "Company": {
+                "title": "Company",
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "founded": {"type": "integer", "default": 0},
+                    "metadata": {"type": "object", "default": {
+                        "index_fields": ["name"], "identity_fields": ["name"]
+                    }}
+                },
+                "required": ["name"]
+            },
+            "Person": {
+                "title": "Person",
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "employer": employer,
+                    "metadata": {"type": "object", "default": {
+                        "index_fields": ["name"], "identity_fields": ["name"]
+                    }}
+                },
+                "required": ["name"]
+            }
+        },
+        "title": "Directory",
+        "type": "object",
+        "properties": {
+            "companies": {"type": "array", "items": {"$ref": "#/$defs/Company"}},
+            "people": {"type": "array", "items": {"$ref": "#/$defs/Person"}},
+            "metadata": {"type": "object", "default": {"transparent": true}}
+        },
+        "required": ["companies", "people"]
+    })
+}
+
+/// The LLM answers a FromIdentity field with the company's name, and the
+/// stored edge points at the company node the same answer lists in full.
+#[tokio::test]
+async fn from_identity_answers_reference_existing_nodes() {
+    let schema = directory_schema(json!({
+        "anyOf": [{"$ref": "#/$defs/Company"}, {"type": "null"}],
+        "default": null,
+        "x-cognee-from-identity": true
+    }));
+    let answer = json!({
+        "companies": [{"name": "Acme", "founded": 1999}],
+        "people": [{"name": "Alice", "employer": "Acme"}, {"name": "Bob", "employer": null}]
+    });
+    let config = extraction_config().with_graph_schema(schema);
+    let (harness, _) = run(&config, PLAIN_TEXT, SchemaKeyedLlm::new(answer)).await;
+    let stored = Stored::of(&harness).await;
+
+    let acme = node_id("Company", "Acme").to_string();
+    assert_eq!(
+        stored.ids_of_type("Company"),
+        BTreeSet::from([acme.clone()])
+    );
+    assert_eq!(
+        stored.field_edges("employer"),
+        BTreeSet::from([(node_id("Person", "Alice").to_string(), acme.clone())])
+    );
+    assert_eq!(
+        stored.nodes[&acme].get("founded"),
+        Some(&json!(1999)),
+        "the full answer, reached first, keeps its properties"
+    );
+}
+
+/// A FromIdentity reference Python would refuse fails the run before any
+/// LLM call.
+#[tokio::test]
+async fn an_invalid_from_identity_reference_fails_before_any_llm_call() {
+    let schema = directory_schema(json!({
+        "type": "string",
+        "x-cognee-from-identity": true
+    }));
+    let llm = SchemaKeyedLlm::new(json!({}));
+    let mut harness = Harness::new().await;
+    let data_id = harness.add_file(PLAIN_TEXT).await;
+    let error = harness
+        .run_over(
+            &extraction_config().with_graph_schema(schema),
+            &[data_id],
+            llm.clone(),
+        )
+        .await
+        .expect_err("an invalid FromIdentity reference fails the run");
+    assert!(
+        error
+            .to_string()
+            .contains("FromIdentity reference must name a model"),
+        "{error}"
+    );
+    assert!(llm.system_prompts().is_empty(), "no LLM call was made");
+}
+
+/// A reference stored in a later run is written over the node an earlier run
+/// stored, with the target's defaults: Python's Ladybug adapter replaces the
+/// whole `properties` blob on `MERGE ... ON MATCH SET`
+/// (`ladybug/adapter.py` `add_nodes`), and so does Rust's. Pinned so a change
+/// to these semantics is a deliberate one.
+#[tokio::test]
+async fn a_later_reference_overwrites_the_stored_node_as_in_python() {
+    let schema = directory_schema(json!({
+        "anyOf": [{"$ref": "#/$defs/Company"}, {"type": "null"}],
+        "default": null,
+        "x-cognee-from-identity": true
+    }));
+    let config = extraction_config().with_graph_schema(schema);
+    let mut harness = Harness::new().await;
+    let first = harness.add_file(PLAIN_TEXT).await;
+    let second = harness.add_file(DATED_TEXT).await;
+    let acme = node_id("Company", "Acme").to_string();
+
+    let full = json!({"companies": [{"name": "Acme", "founded": 1999}], "people": []});
+    harness
+        .run_over(&config, &[first], SchemaKeyedLlm::new(full))
+        .await
+        .expect("first run");
+    assert_eq!(
+        Stored::of(&harness).await.nodes[&acme].get("founded"),
+        Some(&json!(1999))
+    );
+
+    let reference = json!({"companies": [], "people": [{"name": "Alice", "employer": "Acme"}]});
+    harness
+        .run_over(&config, &[second], SchemaKeyedLlm::new(reference))
+        .await
+        .expect("second run");
+    let stored = Stored::of(&harness).await;
+    assert_eq!(
+        stored.field_edges("employer"),
+        BTreeSet::from([(node_id("Person", "Alice").to_string(), acme.clone())]),
+        "the reference resolves to the stored node"
+    );
+    assert_eq!(
+        stored.nodes[&acme].get("founded"),
+        Some(&json!(0)),
+        "the reference's defaults replace the stored properties"
+    );
+}
