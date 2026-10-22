@@ -1,0 +1,1898 @@
+[
+  {
+    "name": "people",
+    "spec": {
+      "root": "Person",
+      "entities": [
+        {
+          "name": "Person",
+          "description": "A person.",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "primitive_type": "number"
+            },
+            {
+              "kind": "enum",
+              "name": "mood",
+              "enum_values": [
+                "happy",
+                "grumpy"
+              ]
+            },
+            {
+              "kind": "relation",
+              "name": "works_at",
+              "relation": {
+                "target_entity_name": "Organization",
+                "cardinality": "one"
+              }
+            },
+            {
+              "kind": "relation",
+              "name": "knows",
+              "relation": {
+                "target_entity_name": "Person",
+                "cardinality": "many"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Organization",
+          "identity_fields": [
+            "name"
+          ],
+          "fields": []
+        }
+      ]
+    },
+    "schema": {
+      "$defs": {
+        "PersonType": {
+          "properties": {
+            "name": {
+              "default": "Person",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "PersonType",
+          "type": "object"
+        },
+        "Person": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/PersonType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            },
+            "age": {
+              "type": "number"
+            },
+            "mood": {
+              "enum": [
+                "happy",
+                "grumpy"
+              ],
+              "type": "string"
+            },
+            "works_at": {
+              "$ref": "#/$defs/Organization"
+            },
+            "knows": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Person"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Person",
+          "type": "object",
+          "description": "A person."
+        },
+        "OrganizationType": {
+          "properties": {
+            "name": {
+              "default": "Organization",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "OrganizationType",
+          "type": "object"
+        },
+        "Organization": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/OrganizationType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Organization",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "is_type": {
+          "$ref": "#/$defs/PersonType"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {
+            "index_fields": [
+              "name"
+            ],
+            "identity_fields": [
+              "name"
+            ]
+          },
+          "type": "object"
+        },
+        "age": {
+          "type": "number"
+        },
+        "mood": {
+          "enum": [
+            "happy",
+            "grumpy"
+          ],
+          "type": "string"
+        },
+        "works_at": {
+          "$ref": "#/$defs/Organization"
+        },
+        "knows": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Person"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "is_type"
+      ],
+      "title": "Person",
+      "type": "object",
+      "description": "A person."
+    },
+    "buildable": true
+  },
+  {
+    "name": "everything",
+    "spec": {
+      "options": {
+        "autoTypeNodes": "no"
+      },
+      "root": "Project",
+      "entities": [
+        {
+          "name": "Team",
+          "description": "",
+          "primaryLabelField": "slug",
+          "indexFields": [],
+          "identityFields": [],
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "slug",
+              "required": "yes",
+              "description": ""
+            },
+            {
+              "kind": "relation",
+              "name": "members",
+              "required": true,
+              "relation": {
+                "targetEntityName": "Person",
+                "cardinality": "many",
+                "inverse": {
+                  "enabled": 0,
+                  "name": "member_of",
+                  "cardinality": "one"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "name",
+              "primitive_type": "string",
+              "required": 1
+            },
+            {
+              "kind": "primitive",
+              "name": "born",
+              "primitiveType": "date",
+              "required": true
+            },
+            {
+              "kind": "primitive",
+              "name": "active",
+              "primitive_type": "boolean"
+            },
+            {
+              "kind": "primitive",
+              "name": "height",
+              "primitive_type": "number"
+            },
+            {
+              "kind": "enum",
+              "name": "role",
+              "enumValues": [
+                "lead",
+                "dev"
+              ],
+              "required": "on",
+              "description": "Role in the team."
+            }
+          ],
+          "index_fields": [
+            "name",
+            "role"
+          ],
+          "identity_fields": [
+            "name",
+            "born"
+          ]
+        },
+        {
+          "name": "Project",
+          "description": "A project and its team.",
+          "fields": [
+            {
+              "kind": "relation",
+              "name": "team",
+              "description": "Who works on it.",
+              "relation": {
+                "target_entity_name": "Team"
+              }
+            },
+            {
+              "kind": "relation",
+              "name": "parent",
+              "relation": {
+                "target_entity_name": "Project",
+                "inverse": null
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "schema": {
+      "$defs": {
+        "TeamType": {
+          "properties": {
+            "name": {
+              "default": "Team",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "TeamType",
+          "type": "object"
+        },
+        "Team": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/TeamType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": []
+              },
+              "type": "object"
+            },
+            "slug": {
+              "type": "string"
+            },
+            "members": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Person"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "is_type",
+            "slug"
+          ],
+          "title": "Team",
+          "type": "object"
+        },
+        "PersonType": {
+          "properties": {
+            "name": {
+              "default": "Person",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name",
+                  "role"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "PersonType",
+          "type": "object"
+        },
+        "Person": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/PersonType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name",
+                  "role"
+                ],
+                "identity_fields": [
+                  "name",
+                  "born"
+                ]
+              },
+              "type": "object"
+            },
+            "born": {
+              "type": "string"
+            },
+            "active": {
+              "type": "boolean"
+            },
+            "height": {
+              "type": "number"
+            },
+            "role": {
+              "enum": [
+                "lead",
+                "dev"
+              ],
+              "type": "string",
+              "description": "Role in the team."
+            }
+          },
+          "required": [
+            "name",
+            "is_type",
+            "born",
+            "role"
+          ],
+          "title": "Person",
+          "type": "object"
+        },
+        "ProjectType": {
+          "properties": {
+            "name": {
+              "default": "Project",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "ProjectType",
+          "type": "object"
+        },
+        "Project": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/ProjectType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            },
+            "team": {
+              "$ref": "#/$defs/Team",
+              "description": "Who works on it."
+            },
+            "parent": {
+              "$ref": "#/$defs/Project"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Project",
+          "type": "object",
+          "description": "A project and its team."
+        }
+      },
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "is_type": {
+          "$ref": "#/$defs/ProjectType"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {
+            "index_fields": [
+              "name"
+            ],
+            "identity_fields": [
+              "name"
+            ]
+          },
+          "type": "object"
+        },
+        "team": {
+          "$ref": "#/$defs/Team",
+          "description": "Who works on it."
+        },
+        "parent": {
+          "$ref": "#/$defs/Project"
+        }
+      },
+      "required": [
+        "name",
+        "is_type"
+      ],
+      "title": "Project",
+      "type": "object",
+      "description": "A project and its team."
+    },
+    "buildable": true
+  },
+  {
+    "name": "single_entity_defaults",
+    "spec": {
+      "entities": [
+        {
+          "name": "Thing"
+        }
+      ]
+    },
+    "schema": {
+      "$defs": {
+        "ThingType": {
+          "properties": {
+            "name": {
+              "default": "Thing",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "ThingType",
+          "type": "object"
+        },
+        "Thing": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/ThingType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Thing",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "is_type": {
+          "$ref": "#/$defs/ThingType"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {
+            "index_fields": [
+              "name"
+            ],
+            "identity_fields": [
+              "name"
+            ]
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "is_type"
+      ],
+      "title": "Thing",
+      "type": "object"
+    },
+    "buildable": true
+  },
+  {
+    "name": "lowercase_root",
+    "spec": {
+      "entities": [
+        {
+          "name": "thing",
+          "fields": []
+        }
+      ]
+    },
+    "schema": {
+      "$defs": {
+        "thingType": {
+          "properties": {
+            "name": {
+              "default": "thing",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "thingType",
+          "type": "object"
+        },
+        "thing": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/thingType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "thing",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "is_type": {
+          "$ref": "#/$defs/thingType"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {
+            "index_fields": [
+              "name"
+            ],
+            "identity_fields": [
+              "name"
+            ]
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "is_type"
+      ],
+      "title": "thing",
+      "type": "object"
+    },
+    "buildable": false
+  },
+  {
+    "name": "underscored_names",
+    "spec": {
+      "entities": [
+        {
+          "name": "Org_unit",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "cost_center_2"
+            }
+          ]
+        },
+        {
+          "name": "Type"
+        }
+      ]
+    },
+    "schema": {
+      "$defs": {
+        "Org_unitType": {
+          "properties": {
+            "name": {
+              "default": "Org_unit",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "Org_unitType",
+          "type": "object"
+        },
+        "Org_unit": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/Org_unitType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            },
+            "cost_center_2": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Org_unit",
+          "type": "object"
+        },
+        "TypeType": {
+          "properties": {
+            "name": {
+              "default": "Type",
+              "type": "string"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "title": "TypeType",
+          "type": "object"
+        },
+        "Type": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "is_type": {
+              "$ref": "#/$defs/TypeType"
+            },
+            "metadata": {
+              "additionalProperties": true,
+              "default": {
+                "index_fields": [
+                  "name"
+                ],
+                "identity_fields": [
+                  "name"
+                ]
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "name",
+            "is_type"
+          ],
+          "title": "Type",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "is_type": {
+          "$ref": "#/$defs/Org_unitType"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {
+            "index_fields": [
+              "name"
+            ],
+            "identity_fields": [
+              "name"
+            ]
+          },
+          "type": "object"
+        },
+        "cost_center_2": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "is_type"
+      ],
+      "title": "Org_unit",
+      "type": "object"
+    },
+    "buildable": false
+  },
+  {
+    "name": "no_entities",
+    "spec": {
+      "entities": []
+    },
+    "error": "List should have at least 1 item after validation, not 0"
+  },
+  {
+    "name": "missing_entities",
+    "spec": {},
+    "error": "Field required"
+  },
+  {
+    "name": "too_many_entities",
+    "spec": {
+      "entities": [
+        {
+          "name": "E0"
+        },
+        {
+          "name": "E1"
+        },
+        {
+          "name": "E2"
+        },
+        {
+          "name": "E3"
+        },
+        {
+          "name": "E4"
+        },
+        {
+          "name": "E5"
+        },
+        {
+          "name": "E6"
+        },
+        {
+          "name": "E7"
+        },
+        {
+          "name": "E8"
+        },
+        {
+          "name": "E9"
+        },
+        {
+          "name": "E10"
+        },
+        {
+          "name": "E11"
+        },
+        {
+          "name": "E12"
+        },
+        {
+          "name": "E13"
+        },
+        {
+          "name": "E14"
+        },
+        {
+          "name": "E15"
+        },
+        {
+          "name": "E16"
+        },
+        {
+          "name": "E17"
+        },
+        {
+          "name": "E18"
+        },
+        {
+          "name": "E19"
+        },
+        {
+          "name": "E20"
+        },
+        {
+          "name": "E21"
+        },
+        {
+          "name": "E22"
+        },
+        {
+          "name": "E23"
+        },
+        {
+          "name": "E24"
+        },
+        {
+          "name": "E25"
+        },
+        {
+          "name": "E26"
+        },
+        {
+          "name": "E27"
+        },
+        {
+          "name": "E28"
+        },
+        {
+          "name": "E29"
+        },
+        {
+          "name": "E30"
+        },
+        {
+          "name": "E31"
+        },
+        {
+          "name": "E32"
+        },
+        {
+          "name": "E33"
+        },
+        {
+          "name": "E34"
+        },
+        {
+          "name": "E35"
+        },
+        {
+          "name": "E36"
+        },
+        {
+          "name": "E37"
+        },
+        {
+          "name": "E38"
+        },
+        {
+          "name": "E39"
+        },
+        {
+          "name": "E40"
+        },
+        {
+          "name": "E41"
+        },
+        {
+          "name": "E42"
+        },
+        {
+          "name": "E43"
+        },
+        {
+          "name": "E44"
+        },
+        {
+          "name": "E45"
+        },
+        {
+          "name": "E46"
+        },
+        {
+          "name": "E47"
+        },
+        {
+          "name": "E48"
+        },
+        {
+          "name": "E49"
+        },
+        {
+          "name": "E50"
+        }
+      ]
+    },
+    "error": "List should have at most 50 items after validation, not 51"
+  },
+  {
+    "name": "unknown_top_level_key",
+    "spec": {
+      "entities": [
+        {
+          "name": "P"
+        }
+      ],
+      "surprise": 1
+    },
+    "error": "Extra inputs are not permitted"
+  },
+  {
+    "name": "unknown_entity_key",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "surprise": true
+        }
+      ]
+    },
+    "error": "Extra inputs are not permitted"
+  },
+  {
+    "name": "unknown_field_key",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "surprise": true
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Extra inputs are not permitted"
+  },
+  {
+    "name": "relation_key_on_primitive",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "relation": {
+                "target_entity_name": "Person"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Extra inputs are not permitted"
+  },
+  {
+    "name": "missing_kind",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "name": "age"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Unable to extract tag using discriminator 'kind'"
+  },
+  {
+    "name": "unknown_kind",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "list",
+              "name": "age"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input tag 'list' found using 'kind' does not match any of the expected tags: 'primitive', 'enum', 'relation'"
+  },
+  {
+    "name": "unknown_primitive_type",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "primitive_type": "integer"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be 'string', 'number', 'boolean' or 'date'"
+  },
+  {
+    "name": "null_primitive_type",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "primitive_type": null
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be 'string', 'number', 'boolean' or 'date'"
+  },
+  {
+    "name": "null_required",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "required": null
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be a valid boolean"
+  },
+  {
+    "name": "non_bool_required",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "required": "maybe"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be a valid boolean, unable to interpret input"
+  },
+  {
+    "name": "two_required",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age",
+              "required": 2
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be a valid boolean, unable to interpret input"
+  },
+  {
+    "name": "null_fields",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": null
+        }
+      ]
+    },
+    "error": "Input should be a valid list"
+  },
+  {
+    "name": "null_options",
+    "spec": {
+      "options": null,
+      "entities": [
+        {
+          "name": "P"
+        }
+      ]
+    },
+    "error": "Input should be a valid dictionary or instance of GraphSchemaOptions"
+  },
+  {
+    "name": "empty_enum",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "enum",
+              "name": "e",
+              "enum_values": []
+            }
+          ]
+        }
+      ]
+    },
+    "error": "List should have at least 1 item after validation, not 0"
+  },
+  {
+    "name": "non_string_enum_value",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "enum",
+              "name": "e",
+              "enum_values": [
+                1
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be a valid string"
+  },
+  {
+    "name": "unknown_cardinality",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "relation",
+              "name": "r",
+              "relation": {
+                "target_entity_name": "Person",
+                "cardinality": "few"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Input should be 'one' or 'many'"
+  },
+  {
+    "name": "snake_and_camel_alias",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "index_fields": [
+            "name"
+          ],
+          "indexFields": [
+            "name"
+          ]
+        }
+      ]
+    },
+    "error": "Extra inputs are not permitted"
+  },
+  {
+    "name": "duplicate_entity",
+    "spec": {
+      "entities": [
+        {
+          "name": "P"
+        },
+        {
+          "name": "P"
+        }
+      ]
+    },
+    "error": "Value error, Entity names must be unique."
+  },
+  {
+    "name": "entity_name_injection",
+    "spec": {
+      "entities": [
+        {
+          "name": "\"; import os"
+        }
+      ]
+    },
+    "error": "Value error, Entity name '\"; import os' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_dunder",
+    "spec": {
+      "entities": [
+        {
+          "name": "__class__"
+        }
+      ]
+    },
+    "error": "Value error, Entity name '__class__' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_digit",
+    "spec": {
+      "entities": [
+        {
+          "name": "1st"
+        }
+      ]
+    },
+    "error": "Value error, Entity name '1st' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_space",
+    "spec": {
+      "entities": [
+        {
+          "name": "has space"
+        }
+      ]
+    },
+    "error": "Value error, Entity name 'has space' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_dash",
+    "spec": {
+      "entities": [
+        {
+          "name": "has-dash"
+        }
+      ]
+    },
+    "error": "Value error, Entity name 'has-dash' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_empty",
+    "spec": {
+      "entities": [
+        {
+          "name": ""
+        }
+      ]
+    },
+    "error": "Value error, Entity name '' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "entity_name_unicode",
+    "spec": {
+      "entities": [
+        {
+          "name": "Café"
+        }
+      ]
+    },
+    "error": "Value error, Entity name 'Café' must be a plain identifier (letters, digits, underscores; starting with a letter)."
+  },
+  {
+    "name": "type_marker_collision",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person"
+        },
+        {
+          "name": "PersonType"
+        }
+      ]
+    },
+    "error": "Value error, Entity name 'PersonType' collides with the generated type marker of entity 'Person'."
+  },
+  {
+    "name": "unknown_root",
+    "spec": {
+      "root": "Ghost",
+      "entities": [
+        {
+          "name": "P"
+        }
+      ]
+    },
+    "error": "Value error, Root entity 'Ghost' is not declared."
+  },
+  {
+    "name": "too_many_fields",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "f0"
+            },
+            {
+              "kind": "primitive",
+              "name": "f1"
+            },
+            {
+              "kind": "primitive",
+              "name": "f2"
+            },
+            {
+              "kind": "primitive",
+              "name": "f3"
+            },
+            {
+              "kind": "primitive",
+              "name": "f4"
+            },
+            {
+              "kind": "primitive",
+              "name": "f5"
+            },
+            {
+              "kind": "primitive",
+              "name": "f6"
+            },
+            {
+              "kind": "primitive",
+              "name": "f7"
+            },
+            {
+              "kind": "primitive",
+              "name": "f8"
+            },
+            {
+              "kind": "primitive",
+              "name": "f9"
+            },
+            {
+              "kind": "primitive",
+              "name": "f10"
+            },
+            {
+              "kind": "primitive",
+              "name": "f11"
+            },
+            {
+              "kind": "primitive",
+              "name": "f12"
+            },
+            {
+              "kind": "primitive",
+              "name": "f13"
+            },
+            {
+              "kind": "primitive",
+              "name": "f14"
+            },
+            {
+              "kind": "primitive",
+              "name": "f15"
+            },
+            {
+              "kind": "primitive",
+              "name": "f16"
+            },
+            {
+              "kind": "primitive",
+              "name": "f17"
+            },
+            {
+              "kind": "primitive",
+              "name": "f18"
+            },
+            {
+              "kind": "primitive",
+              "name": "f19"
+            },
+            {
+              "kind": "primitive",
+              "name": "f20"
+            },
+            {
+              "kind": "primitive",
+              "name": "f21"
+            },
+            {
+              "kind": "primitive",
+              "name": "f22"
+            },
+            {
+              "kind": "primitive",
+              "name": "f23"
+            },
+            {
+              "kind": "primitive",
+              "name": "f24"
+            },
+            {
+              "kind": "primitive",
+              "name": "f25"
+            },
+            {
+              "kind": "primitive",
+              "name": "f26"
+            },
+            {
+              "kind": "primitive",
+              "name": "f27"
+            },
+            {
+              "kind": "primitive",
+              "name": "f28"
+            },
+            {
+              "kind": "primitive",
+              "name": "f29"
+            },
+            {
+              "kind": "primitive",
+              "name": "f30"
+            },
+            {
+              "kind": "primitive",
+              "name": "f31"
+            },
+            {
+              "kind": "primitive",
+              "name": "f32"
+            },
+            {
+              "kind": "primitive",
+              "name": "f33"
+            },
+            {
+              "kind": "primitive",
+              "name": "f34"
+            },
+            {
+              "kind": "primitive",
+              "name": "f35"
+            },
+            {
+              "kind": "primitive",
+              "name": "f36"
+            },
+            {
+              "kind": "primitive",
+              "name": "f37"
+            },
+            {
+              "kind": "primitive",
+              "name": "f38"
+            },
+            {
+              "kind": "primitive",
+              "name": "f39"
+            },
+            {
+              "kind": "primitive",
+              "name": "f40"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Entity 'Person' declares 41 fields; the maximum is 40."
+  },
+  {
+    "name": "duplicate_field",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "age"
+            },
+            {
+              "kind": "primitive",
+              "name": "age"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Entity 'Person' has duplicate field names."
+  },
+  {
+    "name": "field_name_injection",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "\"; import os"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'\"; import os' must be a plain identifier."
+  },
+  {
+    "name": "field_name_space",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "a b"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'a b' must be a plain identifier."
+  },
+  {
+    "name": "reserved_id",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "id"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'id' collides with a DataPoint infrastructure field."
+  },
+  {
+    "name": "reserved_metadata",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "metadata"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'metadata' collides with a DataPoint infrastructure field."
+  },
+  {
+    "name": "reserved_is_type",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "is_type"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'is_type' collides with a DataPoint infrastructure field."
+  },
+  {
+    "name": "reserved_source_pipeline",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "source_pipeline"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'source_pipeline' collides with a DataPoint infrastructure field."
+  },
+  {
+    "name": "reserved_ontology_uri",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "ontology_uri"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.'ontology_uri' collides with a DataPoint infrastructure field."
+  },
+  {
+    "name": "name_as_number",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "primitive",
+              "name": "name",
+              "primitive_type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.name must be a string primitive (it is the node's primary identifier)."
+  },
+  {
+    "name": "name_as_enum",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "enum",
+              "name": "name",
+              "enum_values": [
+                "a"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Field Person.name must be a string primitive (it is the node's primary identifier)."
+  },
+  {
+    "name": "unknown_relation_target",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "fields": [
+            {
+              "kind": "relation",
+              "name": "r",
+              "relation": {
+                "target_entity_name": "Nowhere"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, Relation Person.r targets undeclared entity 'Nowhere'."
+  },
+  {
+    "name": "index_field_is_relation",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "index_fields": [
+            "r"
+          ],
+          "fields": [
+            {
+              "kind": "relation",
+              "name": "r",
+              "relation": {
+                "target_entity_name": "Person"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "error": "Value error, index_fields entry 'r' on entity 'Person' must reference 'name' or a declared primitive/enum field."
+  },
+  {
+    "name": "identity_field_undeclared",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "identity_fields": [
+            "nickname"
+          ]
+        }
+      ]
+    },
+    "error": "Value error, identity_fields entry 'nickname' on entity 'Person' must reference 'name' or a declared primitive/enum field."
+  },
+  {
+    "name": "label_field_undeclared",
+    "spec": {
+      "entities": [
+        {
+          "name": "Person",
+          "primary_label_field": "nickname"
+        }
+      ]
+    },
+    "error": "Value error, primary_label_field 'nickname' on entity 'Person' must reference 'name' or a declared primitive/enum field."
+  }
+]

@@ -80,6 +80,8 @@ pub fn opts_tenant(opts: &serde_json::Value) -> Result<Option<Uuid>, SdkError> {
 /// Every key the `cognify` / `add_and_cognify` opts are read for.
 ///
 /// `graphModel` is an alias of `graphSchema` under Python's argument name.
+/// `graphSpec` is the same custom graph model written in the spec DSL
+/// (Python `cognee.low_level.GraphSchemaSpec`), compiled into a `graphSchema`.
 pub const COGNIFY_OPT_KEYS: &[&str] = &[
     "tenant",
     "chunkSize",
@@ -90,6 +92,7 @@ pub const COGNIFY_OPT_KEYS: &[&str] = &[
     "graphBackend",
     "graphSchema",
     "graphModel",
+    "graphSpec",
     "chunkAttachment",
 ];
 
@@ -157,13 +160,15 @@ fn opt_bool(opts: &serde_json::Value, key: &str) -> Result<Option<bool>, SdkErro
 /// so the second application in [`cognify_config_with_opts`] does not repeat
 /// it. `graphSchema` (alias
 /// `graphModel`) takes a JSON Schema object or a string holding one;
-/// `chunkAttachment` takes `"direct"` or `"all"`. The combination is checked
+/// `graphSpec` takes a spec-DSL object or a string holding one, compiled by
+/// [`cognee::cognify::graph_schema_from_spec_value`]; `chunkAttachment` takes `"direct"` or `"all"`. The combination is checked
 /// by [`cognee::cognify::CognifyConfig::validate`], which the callers run.
 ///
 /// # Errors
-/// [`SdkError::Validation`] for non-object opts, a wrongly-typed value, both
-/// `graphSchema` and `graphModel`, a graph schema that is not an object, or a
-/// `chunkAttachment` outside `"direct"` / `"all"`.
+/// [`SdkError::Validation`] for non-object opts, a wrongly-typed value, more
+/// than one of `graphSchema` / `graphModel` / `graphSpec`, a graph schema that
+/// is not an object, an invalid spec, or a `chunkAttachment` outside
+/// `"direct"` / `"all"`.
 pub fn apply_cognify_opts(
     mut cfg: cognee::cognify::CognifyConfig,
     opts: &serde_json::Value,
@@ -200,10 +205,21 @@ pub fn apply_cognify_opts(
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     };
+    let spec = opt_value(opts, "graphSpec");
+    if spec.is_some() && schema.is_some() {
+        return Err(SdkError::Validation(
+            "pass either `graphSpec` or `graphSchema` (alias `graphModel`), not both".to_string(),
+        ));
+    }
     if let Some(value) = schema {
         let parsed = cognee::cognify::parse_graph_schema(value)
             .map_err(|e| SdkError::Validation(e.to_string()))?;
         cfg.graph_schema = parsed;
+    }
+    if let Some(value) = spec {
+        let compiled = cognee::cognify::graph_schema_from_spec_value(value)
+            .map_err(|e| SdkError::Validation(format!("invalid `graphSpec`: {e}")))?;
+        cfg.graph_schema = Some(compiled);
     }
     if let Some(value) = opt_value(opts, "chunkAttachment") {
         let text = value.as_str().ok_or_else(|| {
@@ -216,6 +232,17 @@ pub fn apply_cognify_opts(
         cfg = cfg.with_chunk_attachment(attachment);
     }
     Ok(cfg)
+}
+
+/// Compile a spec-DSL graph model (an object, or a string holding one) into
+/// the JSON Schema `graphSchema` takes — the binding form of Python's
+/// `cognee.low_level.graph_spec_to_json_schema`.
+///
+/// # Errors
+/// [`SdkError::Validation`] for a value that is not a valid spec.
+pub fn graph_spec_to_json_schema(spec: &serde_json::Value) -> Result<serde_json::Value, SdkError> {
+    cognee::cognify::graph_schema_from_spec_value(spec)
+        .map_err(|e| SdkError::Validation(format!("invalid graph spec: {e}")))
 }
 
 /// Log the [`unknown_cognify_opts`] of `opts` as one warning naming every

@@ -136,7 +136,9 @@ impl PyCognee {
     /// ``tenant``, ``chunkSize``, ``chunkOverlap``, ``summarization``,
     /// ``temporalCognify``, ``triplet``, ``graphSchema`` (a custom graph
     /// model's JSON Schema, as a dict or a JSON string; alias
-    /// ``graphModel``) and ``chunkAttachment`` (``"direct"`` or ``"all"``) —
+    /// ``graphModel``), ``graphSpec`` (the same model in the spec DSL, as a
+    /// dict or a JSON string) and ``chunkAttachment`` (``"direct"`` or
+    /// ``"all"``) —
     /// ``snake_case`` spellings (``chunk_size``, …) are accepted too and
     /// normalised automatically. A wrongly-typed or invalid value raises
     /// ``CogneeValidationError``; an unknown key is logged as a warning.

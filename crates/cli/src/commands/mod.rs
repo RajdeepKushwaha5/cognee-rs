@@ -49,12 +49,14 @@ pub fn parse_tenant_id(raw: Option<&str>) -> Result<Option<uuid::Uuid>, CliError
         .map_err(|error| CliError::Validation(format!("Invalid --tenant-id: {error}")))
 }
 
-/// Apply `--graph-schema` / `--chunk-attachment` to `cfg` and validate the
-/// result — the step `cognify` and `add-and-cognify` run before building any
-/// component, so a bad flag fails fast with exit code 2.
+/// Apply `--graph-schema` / `--graph-spec` / `--chunk-attachment` to `cfg`
+/// and validate the result — the step `cognify` and `add-and-cognify` run
+/// before building any component, so a bad flag fails fast with exit code 2.
 ///
 /// The schema file is parsed by [`cognee::cognify::parse_graph_schema`] (`{}`
-/// is the default model) and compiled by `CognifyConfig::validate`, which also
+/// is the default model); a spec file is compiled into a schema by
+/// [`cognee::cognify::graph_schema_from_spec_value`] (clap rejects both flags
+/// together). The schema is compiled by `CognifyConfig::validate`, which also
 /// rejects `--chunk-attachment` without `--graph-schema` and either with
 /// `--temporal-cognify`.
 pub(crate) fn apply_graph_schema_args(
@@ -75,6 +77,23 @@ pub(crate) fn apply_graph_schema_args(
                     path.display()
                 ))
             })?;
+    }
+    if let Some(path) = &args.graph_spec {
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            CliError::Validation(format!(
+                "Cannot read --graph-spec {}: {error}",
+                path.display()
+            ))
+        })?;
+        let schema =
+            cognee::cognify::graph_schema_from_spec_value(&serde_json::Value::String(text))
+                .map_err(|error| {
+                    CliError::Validation(format!(
+                        "Invalid --graph-spec {}: {error}",
+                        path.display()
+                    ))
+                })?;
+        cfg.graph_schema = Some(schema);
     }
     if let Some(attachment) = args.chunk_attachment {
         cfg = cfg.with_chunk_attachment(attachment.into());

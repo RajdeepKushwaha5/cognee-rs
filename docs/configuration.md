@@ -1517,9 +1517,9 @@ Pass the schema per call instead, as below.
 
 | Entry point | Graph schema | Chunk attachment |
 |---|---|---|
-| Rust (`cognee` / `cognee-cognify`) | `CognifyConfig::with_graph_schema(value)` (`parse_graph_schema` reads an object or a JSON string) | `with_chunk_attachment(ChunkAttachment::…)` (`ChunkAttachment::parse`) |
-| CLI `cognify`, `add-and-cognify` | `--graph-schema <FILE>` | `--chunk-attachment direct\|all` |
-| Bindings (Python handle, TS, C, Java) | `graphSchema` opt (alias `graphModel`): an object or a JSON string | `chunkAttachment` opt: `"direct"` or `"all"` |
+| Rust (`cognee` / `cognee-cognify`) | `CognifyConfig::with_graph_schema(value)` (`parse_graph_schema` reads an object or a JSON string; `graph_spec_to_json_schema` compiles a spec) | `with_chunk_attachment(ChunkAttachment::…)` (`ChunkAttachment::parse`) |
+| CLI `cognify`, `add-and-cognify` | `--graph-schema <FILE>` or `--graph-spec <FILE>` | `--chunk-attachment direct\|all` |
+| Bindings (Python handle, TS, C, Java) | `graphSchema` opt (alias `graphModel`), or `graphSpec`: an object or a JSON string | `chunkAttachment` opt: `"direct"` or `"all"` |
 | Python compat `cognify()` / `add_and_cognify()` | `graph_model=`: a Pydantic model class, a dict or a JSON string | `chunk_attachment=` |
 
 `null` and `{}` mean the default `KnowledgeGraph`, as Python's HTTP route

@@ -17,7 +17,13 @@ use uuid::Uuid;
 
 use crate::config::ChunkAttachment;
 
-const DATA_POINT_FIELDS: &[&str] = &[
+/// The keys a stored node's [`DataPoint`] base serializes. A custom property
+/// of the same name would overwrite the base value in the stored node, so a
+/// model may not declare one. This is stricter than Python, whose generated
+/// subclass may redeclare any `DataPoint` field; the two `DataPoint` fields
+/// the Rust base does not carry (`ontology_uri`, and `valid_to`, which Python
+/// dropped in SDK-880) are ordinary custom fields here, as in Python.
+pub(crate) const DATA_POINT_FIELDS: &[&str] = &[
     "id",
     "created_at",
     "updated_at",
@@ -34,7 +40,6 @@ const DATA_POINT_FIELDS: &[&str] = &[
     "source_content_hash",
     "feedback_weight",
     "importance_weight",
-    "valid_to",
 ];
 
 /// A compiled custom graph model.
@@ -1256,8 +1261,9 @@ enum BaseIdentity {
 /// What a fresh Python instance holds for an inherited DataPoint field when
 /// `_generate_identity_id` reads it from `self.__dict__`: `type` is already
 /// the class name, `metadata` the declared default, and every other field
-/// its `DataPoint` default (cognee @ f154b32). `None` for a name that is not
-/// a base field, which makes Python fall back to uuid4.
+/// its `DataPoint` default (cognee @ 37f788bd2). `None` for a name that is not
+/// a base field, which makes Python fall back to uuid4 — `valid_to` among
+/// them since Python dropped it from `DataPoint` (SDK-880).
 fn base_identity_text(
     field: &str,
     model_name: &str,
@@ -1272,7 +1278,6 @@ fn base_identity_text(
         "topological_rank" => "0".to_string(),
         "feedback_weight" | "importance_weight" => "0.5".to_string(),
         "ontology_uri"
-        | "valid_to"
         | "belongs_to_set"
         | "source_pipeline"
         | "source_task"
@@ -2717,6 +2722,40 @@ mod tests {
         );
     }
 
+    /// The reserved names are exactly the keys a stored node's base
+    /// serializes, every optional one set.
+    #[test]
+    fn reserved_fields_are_the_serialized_base_keys() {
+        let mut base = DataPoint::new("X", None);
+        base.source_pipeline = Some(String::new());
+        base.source_task = Some(String::new());
+        base.source_node_set = Some(String::new());
+        base.source_user = Some(String::new());
+        base.source_content_hash = Some(String::new());
+        let mut serialized: Vec<String> = base.to_dict().keys().cloned().collect();
+        serialized.sort();
+        let mut reserved: Vec<String> = DATA_POINT_FIELDS.iter().map(|f| f.to_string()).collect();
+        reserved.sort();
+        assert_eq!(reserved, serialized);
+    }
+
+    /// Python lets a generated model declare any `DataPoint` field; the ones
+    /// the Rust base does not carry stay ordinary custom fields.
+    #[test]
+    fn fields_the_base_does_not_carry_are_custom_fields() {
+        for field in ["ontology_uri", "valid_to"] {
+            let compiled = DynamicGraphSchema::compile(&json!({
+                "title": "Company",
+                "properties": {"name": {"type": "string"}, field: {"type": "string"}}
+            }))
+            .unwrap_or_else(|e| panic!("{field}: {e}"));
+            let graph = compiled
+                .materialize(&json!({"name": "Acme", field: "x"}), Uuid::nil())
+                .unwrap();
+            assert_eq!(graph.nodes[0].properties[field], json!("x"));
+        }
+    }
+
     #[test]
     fn requires_a_root_title() {
         for schema in [
@@ -3429,7 +3468,6 @@ mod tests {
             ("ontology_valid", "7fc850e7-22f5-5ebf-844a-bc12fe93947a"),
             ("ontology_uri", "5fb02635-8639-5e8e-87d2-b46ec6a9ca34"),
             ("topological_rank", "43f7bb39-9346-5e61-a86b-f156700c5392"),
-            ("valid_to", "5fb02635-8639-5e8e-87d2-b46ec6a9ca34"),
             ("belongs_to_set", "5fb02635-8639-5e8e-87d2-b46ec6a9ca34"),
             ("source_pipeline", "5fb02635-8639-5e8e-87d2-b46ec6a9ca34"),
             ("feedback_weight", "91bb3be1-a505-5353-b6a3-42410898bacd"),
@@ -3446,8 +3484,9 @@ mod tests {
             Uuid::parse_str("d35de72e-eaca-5e4b-ae3d-4c1d5bbd5711").unwrap()
         );
         assert_eq!(first, second);
-        // Per-instance base fields stay random.
-        for identity in ["id", "created_at", "updated_at"] {
+        // Per-instance base fields stay random, and so does `valid_to`,
+        // no longer a `DataPoint` field in Python (SDK-880).
+        for identity in ["id", "created_at", "updated_at", "valid_to"] {
             let (first, second) = tag(identity, json!({}));
             assert_ne!(first, second, "{identity}");
             assert_eq!(first.get_version_num(), 4, "{identity}");

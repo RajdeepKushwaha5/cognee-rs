@@ -165,6 +165,21 @@ await c.cognify("my-dataset", {
   graphSchema: mySchema,
   chunkAttachment: "all", // "direct" (default) or "all"
 });
+
+// Or the same model written in the spec DSL (typed as `GraphSchemaSpec`)
+await c.cognify("my-dataset", {
+  graphSpec: {
+    entities: [
+      {
+        name: "Person",
+        fields: [
+          { kind: "relation", name: "worksAt", relation: { targetEntityName: "Company" } },
+        ],
+      },
+      { name: "Company" },
+    ],
+  },
+});
 ```
 
 An invalid option value is rejected with a `VALIDATION_ERROR`; see

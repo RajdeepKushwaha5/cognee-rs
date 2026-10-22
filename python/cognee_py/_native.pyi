@@ -121,6 +121,18 @@ def cancellation_pair() -> tuple[CancellationHandle, CancellationToken]:
     """
     ...
 
+def graph_spec_to_json_schema(spec: Union[dict[str, Any], str]) -> dict[str, Any]:
+    """Compile a custom graph model written in the spec DSL into its JSON Schema.
+
+    *spec* is a ``GraphSchemaSpec`` document (entities with ``primitive``,
+    ``enum`` and ``relation`` fields), as a dict or a JSON string. The result
+    is what the ``graphSchema`` cognify option takes. Mirrors upstream
+    ``cognee.low_level.graph_spec_to_json_schema``, key for key.
+
+    Raises ``CogneeValidationError`` for an invalid spec.
+    """
+    ...
+
 # ---------------------------------------------------------------------------
 # ProgressToken
 # ---------------------------------------------------------------------------
@@ -687,8 +699,10 @@ class Cognee:
         Accepted *opts* keys (``snake_case`` and ``camelCase`` both accepted):
         ``tenant``, ``chunkSize``, ``chunkOverlap``, ``summarization``,
         ``temporalCognify``, ``triplet``, ``graphSchema`` (a custom graph
-        model's JSON Schema, as a dict or a JSON string; alias ``graphModel``)
-        and ``chunkAttachment`` (``"direct"`` or ``"all"``). A wrongly-typed or
+        model's JSON Schema, as a dict or a JSON string; alias ``graphModel``),
+        ``graphSpec`` (the same model in the spec DSL, as a dict or a JSON
+        string; see :func:`graph_spec_to_json_schema`) and
+        ``chunkAttachment`` (``"direct"`` or ``"all"``). A wrongly-typed or
         invalid value raises ``CogneeValidationError``; an unknown key is
         logged as a warning.
         """

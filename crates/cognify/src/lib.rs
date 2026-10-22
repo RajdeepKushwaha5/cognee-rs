@@ -20,6 +20,8 @@ pub mod graph_backend;
 pub mod graph_extraction;
 /// Graph integration module.
 pub mod graph_integration;
+/// The JSON graph-model spec DSL, compiled into a graph schema.
+pub mod graph_spec;
 /// Memify pipeline module.
 pub mod memify;
 /// Pipeline orchestration module.
@@ -65,6 +67,12 @@ pub use graph_integration::{
     DeduplicationResult, EdgeResolutionStats, Expansion, GraphEdgePair, GraphNodePair,
     TimestampNode, deduplicate_nodes_and_edges, expand_extracted_graphs,
     expand_with_nodes_and_edges, expand_with_nodes_and_edges_with_stats,
+};
+pub use graph_spec::{
+    Cardinality, EntitySpec, EnumFieldSpec, FieldSpec, GraphSchemaOptions, GraphSchemaSpec,
+    GraphSpecError, InverseSpec, MAX_ENTITIES, MAX_FIELDS_PER_ENTITY, PrimitiveFieldSpec,
+    PrimitiveType, RelationFieldSpec, RelationSpec, graph_model_from_spec,
+    graph_schema_from_spec_value, graph_spec_to_json_schema,
 };
 pub use memify::{
     CuratorBatchOutput, DistillError, DistillSessionsResult, DistillationResult,

@@ -22,10 +22,13 @@ binding's README and its generated docs.
 `cognee_bindings_common::ops::pipeline::apply_cognify_opts`, for every binding:
 `tenant`, `chunkSize`, `chunkOverlap`, `summarization`, `temporalCognify`,
 `triplet`, `graphBackend`, `graphSchema` (a custom graph model's JSON Schema, as
-an object or a JSON string; alias `graphModel`) and `chunkAttachment`
-(`"direct"` or `"all"`). Python accepts the snake_case spellings too, and its
-compat `cognify(graph_model=…)` converts a Pydantic model class to its JSON
-Schema. A wrongly-typed or invalid value, or a combination `CognifyConfig`
+an object or a JSON string; alias `graphModel`), `graphSpec` (the same model in
+the spec DSL, compiled into a `graphSchema`; not together with it) and
+`chunkAttachment` (`"direct"` or `"all"`). Python accepts the snake_case
+spellings too, and its compat `cognify(graph_model=…)` converts a Pydantic model
+class to its JSON Schema. Python also exposes the spec compiler on its own as
+`cognee_py.graph_spec_to_json_schema` (re-exported by `cognee_py.compat`, as
+upstream's `cognee.low_level` does). A wrongly-typed or invalid value, or a combination `CognifyConfig`
 rejects, fails with the `VALIDATION_ERROR` code before the dataset is looked up
 (and, for `addAndCognify`, before anything is added); an unknown key is logged
 as a warning. See [the custom graph schema guide](../guides/custom-graph-schema.md).
@@ -33,6 +36,7 @@ as a warning. See [the custom graph schema guide](../guides/custom-graph-schema.
 | | Python | TypeScript | Java | C |
 |---|---|---|---|---|
 | Graph schema | `opts={"graph_schema": …}`; compat `graph_model=` | `{ graphSchema }` | `CognifyOptions.graphSchema(json \| map)` | `"graphSchema"` in `opts_json` |
+| Graph spec | `opts={"graph_spec": …}`; `graph_spec_to_json_schema(spec)` | `{ graphSpec }` (typed `GraphSchemaSpec`) | `CognifyOptions.graphSpec(json \| map)` | `"graphSpec"` in `opts_json` |
 | Chunk attachment | `opts={"chunk_attachment": "all"}` | `{ chunkAttachment: "all" }` | `CognifyOptions.chunkAttachment("all")` | `"chunkAttachment"` in `opts_json` |
 
 ## Process-wide configuration (logging, OTLP, analytics)

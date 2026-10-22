@@ -1858,6 +1858,23 @@ fn cognify_rejects_invalid_graph_schema_flags() {
     let not_json = not_json.to_str().expect("utf-8 path");
     let missing = workdir.path().join("missing.json");
     let missing = missing.to_str().expect("utf-8 path");
+    let spec_with_unknown_target = workdir.path().join("bad_spec.json");
+    std::fs::write(
+        &spec_with_unknown_target,
+        r#"{"entities": [{"name": "Person", "fields": [
+            {"kind": "relation", "name": "r", "relation": {"target_entity_name": "Nowhere"}}
+        ]}]}"#,
+    )
+    .expect("write spec");
+    let spec_with_unknown_target = spec_with_unknown_target.to_str().expect("utf-8 path");
+    // Compiles, but a lowercase root is not a class name Python can build.
+    let lowercase_root_spec = workdir.path().join("lowercase_root.json");
+    std::fs::write(
+        &lowercase_root_spec,
+        r#"{"entities": [{"name": "person"}]}"#,
+    )
+    .expect("write spec");
+    let lowercase_root_spec = lowercase_root_spec.to_str().expect("utf-8 path");
 
     for (command, args, expected) in [
         (
@@ -1890,6 +1907,26 @@ fn cognify_rejects_invalid_graph_schema_flags() {
             vec!["some text", "--chunk-attachment", "direct"],
             "chunk_attachment requires graph_schema",
         ),
+        (
+            "cognify",
+            vec!["--graph-spec", spec_with_unknown_target],
+            "targets undeclared entity 'Nowhere'",
+        ),
+        (
+            "cognify",
+            vec!["--graph-spec", not_json],
+            "Invalid --graph-spec",
+        ),
+        (
+            "cognify",
+            vec!["--graph-spec", missing],
+            "Cannot read --graph-spec",
+        ),
+        (
+            "add-and-cognify",
+            vec!["some text", "--graph-spec", lowercase_root_spec],
+            "Invalid graph schema",
+        ),
     ] {
         make_cmd_in(&config_home, workdir.path())
             .arg(command)
@@ -1898,6 +1935,13 @@ fn cognify_rejects_invalid_graph_schema_flags() {
             .code(2)
             .stdout(predicate::str::contains(expected));
     }
+
+    // A schema and a spec are two spellings of one model: clap refuses both.
+    make_cmd_in(&config_home, workdir.path())
+        .args(["cognify", "--graph-schema", valid, "--graph-spec", valid])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
 
     // Clap owns the value set: anything but `direct` / `all` is a usage error.
     make_cmd_in(&config_home, workdir.path())
@@ -1921,8 +1965,9 @@ fn a_valid_graph_schema_flag_reaches_the_extraction_request() {
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    // One schema title per command, so each command's request is seen.
-    let titles = ["CliProbeCognify", "CliProbeAddAndCognify"];
+    // One schema title per command, so each command's request is seen. The
+    // last is a `--graph-spec` whose root entity compiles to that title.
+    let titles = ["CliProbeCognify", "CliProbeAddAndCognify", "CliProbeSpec"];
     let (endpoint, server, probes) = rt.block_on(async {
         let mut server = mockito::Server::new_async().await;
         let mut probes = Vec::new();
@@ -2017,6 +2062,20 @@ fn a_valid_graph_schema_flag_reaches_the_extraction_request() {
         .assert()
         .failure();
 
+    let spec = workdir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        format!(r#"{{"entities": [{{"name": "{}"}}]}}"#, titles[2]),
+    )
+    .expect("write spec");
+    let mut spec_cognify = make_cmd_in(&config_home, workdir.path());
+    llm_env(&mut spec_cognify);
+    spec_cognify
+        .args(["cognify", "--datasets", "schema_ds"])
+        .args(["--graph-spec", spec.to_str().expect("utf-8 path")])
+        .assert()
+        .failure();
+
     // Each command sent its custom schema.
     for probe in probes {
         rt.block_on(probe.assert_async());
@@ -2033,6 +2092,7 @@ fn cognify_help_lists_graph_schema_flags() {
         .success()
         .stdout(
             predicate::str::contains("--graph-schema <FILE>")
+                .and(predicate::str::contains("--graph-spec <FILE>"))
                 .and(predicate::str::contains("--chunk-attachment")),
         );
 }

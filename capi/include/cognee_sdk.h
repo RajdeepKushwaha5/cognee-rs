@@ -417,7 +417,11 @@ void cg_sdk_add(const CgSdk*        sdk,
  *   "graphSchema"    — a custom graph model's JSON Schema, as an object or a
  *                      JSON string (alias "graphModel"); {} means the
  *                      default KnowledgeGraph. Not with temporalCognify.
- *   "chunkAttachment"— "direct" (default) or "all"; requires graphSchema.
+ *   "graphSpec"      — the same model in the spec DSL (Python's
+ *                      GraphSchemaSpec), as an object or a JSON string,
+ *                      compiled into a graphSchema. Not with graphSchema.
+ *   "chunkAttachment"— "direct" (default) or "all"; requires graphSchema
+ *                      or graphSpec.
  *
  * A wrongly-typed or invalid value, or an invalid combination, fails with
  * CG_ERR_SDK_VALIDATION before the dataset is looked up; an unknown key is

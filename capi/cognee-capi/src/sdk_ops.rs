@@ -167,7 +167,8 @@ pub unsafe extern "C" fn cg_sdk_add(
 /// optional keys: `tenant` (UUID string), `chunkSize` (integer), `chunkOverlap`
 /// (integer), `summarization` (boolean), `temporalCognify` (boolean),
 /// `triplet` (boolean), `graphSchema` (a custom graph model's JSON Schema, as
-/// an object or a JSON string; alias `graphModel`) and `chunkAttachment`
+/// an object or a JSON string; alias `graphModel`), `graphSpec` (the same
+/// model in the spec DSL, as an object or a JSON string) and `chunkAttachment`
 /// (`"direct"` or `"all"`). A wrongly-typed or invalid value fails with
 /// `CG_ERR_SDK_VALIDATION`; an unknown key is logged as a warning.
 ///

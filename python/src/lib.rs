@@ -4,6 +4,7 @@ mod cancellation;
 mod config;
 mod default_subscriber;
 mod error;
+mod graph_spec;
 mod json;
 mod logging;
 mod pipeline;
@@ -48,6 +49,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cancellation::PyCancellationHandle>()?;
     m.add_class::<cancellation::PyCancellationToken>()?;
     m.add_function(wrap_pyfunction!(cancellation::cancellation_pair, m)?)?;
+    m.add_function(wrap_pyfunction!(graph_spec::graph_spec_to_json_schema, m)?)?;
     m.add_class::<progress::PyProgressToken>()?;
 
     // Logging entrypoint (gap-06): optional options dict, idempotent.

@@ -533,3 +533,73 @@ async def test_compat_cognify_rejects_an_invalid_chunk_attachment(tmp_path):
         await cognee.cognify("ds", chunk_attachment="direct")
     with pytest.raises(cp.CogneeValidationError, match="Invalid graph schema"):
         await cognee.cognify("ds", graph_model={"title": "lower", "properties": {}})
+
+
+# ---------------------------------------------------------------------------
+# Spec DSL: graph_spec_to_json_schema / graph_spec (no network I/O needed)
+# ---------------------------------------------------------------------------
+
+_PEOPLE_SPEC = {
+    "entities": [
+        {
+            "name": "Person",
+            "fields": [
+                {"kind": "primitive", "name": "age", "primitive_type": "number"},
+                {
+                    "kind": "relation",
+                    "name": "works_at",
+                    "relation": {"targetEntityName": "Organization"},
+                },
+            ],
+        },
+        {"name": "Organization"},
+    ]
+}
+
+
+def test_graph_spec_to_json_schema_compiles_like_upstream():
+    import json
+
+    schema = cp.graph_spec_to_json_schema(_PEOPLE_SPEC)
+    # Root entity spread at the top level, every entity and marker in $defs.
+    assert schema["title"] == "Person"
+    assert schema["required"] == ["name", "is_type"]
+    assert list(schema["$defs"]) == [
+        "PersonType",
+        "Person",
+        "OrganizationType",
+        "Organization",
+    ]
+    assert schema["properties"]["works_at"] == {"$ref": "#/$defs/Organization"}
+    assert schema["properties"]["metadata"]["default"] == {
+        "index_fields": ["name"],
+        "identity_fields": ["name"],
+    }
+    # A JSON string is the same spec; compat re-exports the same function.
+    assert cp.graph_spec_to_json_schema(json.dumps(_PEOPLE_SPEC)) == schema
+    assert cognee.graph_spec_to_json_schema is cp.graph_spec_to_json_schema
+
+
+def test_graph_spec_to_json_schema_raises_upstreams_message():
+    with pytest.raises(cp.CogneeValidationError, match="Entity names must be unique."):
+        cp.graph_spec_to_json_schema({"entities": [{"name": "P"}, {"name": "P"}]})
+    with pytest.raises(cp.CogneeValidationError, match="unknown field"):
+        cp.graph_spec_to_json_schema({"entities": [{"name": "P", "surprise": 1}]})
+    with pytest.raises(cp.CogneeValidationError):
+        cp.graph_spec_to_json_schema("{not json")
+
+
+@pytest.mark.asyncio
+async def test_compat_cognify_passes_a_graph_spec_through():
+    import cognee_py.compat as _compat
+    recorder = _RecordingHandle()
+    _compat._default_handle = recorder
+    try:
+        await cognee.cognify("ds", graph_spec=_PEOPLE_SPEC, chunk_attachment="all")
+        await cognee.cognify(
+            "ds", graph_model=cognee.graph_spec_to_json_schema(_PEOPLE_SPEC)
+        )
+    finally:
+        _compat.reset_default_handle()
+    assert recorder.calls[0][2] == {"graph_spec": _PEOPLE_SPEC, "chunk_attachment": "all"}
+    assert recorder.calls[1][2] == {"graph_schema": cp.graph_spec_to_json_schema(_PEOPLE_SPEC)}

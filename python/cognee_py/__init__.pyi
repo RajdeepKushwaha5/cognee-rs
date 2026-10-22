@@ -43,6 +43,7 @@ from cognee_py._native import (
     CancellationHandle as CancellationHandle,
     CancellationToken as CancellationToken,
     cancellation_pair as cancellation_pair,
+    graph_spec_to_json_schema as graph_spec_to_json_schema,
     ProgressToken as ProgressToken,
     # Pipeline exceptions
     PipelineError as PipelineError,

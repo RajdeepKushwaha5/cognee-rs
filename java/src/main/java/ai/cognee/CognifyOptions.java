@@ -25,9 +25,21 @@ public final class CognifyOptions extends Options {
     public CognifyOptions graphSchema(Map<String, ?> schema) { put("graphSchema", schema); return this; }
 
     /**
+     * The same custom graph model written in the spec DSL (Python's {@code GraphSchemaSpec}:
+     * entities with primitive, enum and relation fields), given as JSON text and compiled natively
+     * into a graph schema. An invalid spec, or one passed together with {@link #graphSchema(String)},
+     * fails the call with a validation error.
+     * See docs/guides/custom-graph-schema.md for the spec format.
+     */
+    public CognifyOptions graphSpec(String specJson) { put("graphSpec", specJson); return this; }
+
+    /** {@link #graphSpec(String)} for a spec already held as a JSON-shaped map. */
+    public CognifyOptions graphSpec(Map<String, ?> spec) { put("graphSpec", spec); return this; }
+
+    /**
      * How each chunk links to the custom graph extracted from it: {@code "direct"} (the root, the
-     * default) or {@code "all"} (every stored node). Requires {@link #graphSchema(String)}; any
-     * other value fails the call with a validation error.
+     * default) or {@code "all"} (every stored node). Requires {@link #graphSchema(String)} or
+     * {@link #graphSpec(String)}; any other value fails the call with a validation error.
      */
     public CognifyOptions chunkAttachment(String attachment) {
         put("chunkAttachment", attachment);

@@ -153,6 +153,63 @@ fn invalid_values_are_validation_errors() {
     }
 }
 
+fn spec() -> Value {
+    json!({
+        "entities": [{
+            "name": "Person",
+            "fields": [{
+                "kind": "relation", "name": "knows",
+                "relation": {"targetEntityName": "Person", "cardinality": "many"}
+            }]
+        }]
+    })
+}
+
+#[test]
+fn graph_spec_is_compiled_into_the_graph_schema() {
+    let expected = cognee::cognify::graph_schema_from_spec_value(&spec()).expect("spec compiles");
+    assert_eq!(expected["title"], json!("Person"));
+
+    let cfg = apply(json!({ "graphSpec": spec(), "chunkAttachment": "all" })).expect("config");
+    assert_eq!(cfg.graph_schema, Some(expected.clone()));
+    cfg.validate().expect("a compiled spec validates");
+
+    // A JSON string carries the same spec (C strings, CLI files).
+    let cfg = apply(json!({ "graphSpec": spec().to_string() })).expect("config");
+    assert_eq!(cfg.graph_schema, Some(expected));
+
+    let cfg = apply(json!({ "graphSpec": null })).expect("null is unset");
+    assert_eq!(cfg.graph_schema, None);
+}
+
+#[test]
+fn invalid_graph_specs_are_validation_errors() {
+    let cases = [
+        (json!({ "graphSpec": {} }), "invalid `graphSpec`"),
+        (json!({ "graphSpec": "{not json" }), "invalid `graphSpec`"),
+        (
+            json!({ "graphSpec": { "entities": [{ "name": "Person", "surprise": 1 }] } }),
+            "unknown field",
+        ),
+        (
+            json!({ "graphSpec": { "entities": [{ "name": "Person" }, { "name": "Person" }] } }),
+            "Entity names must be unique.",
+        ),
+        (
+            json!({ "graphSpec": spec(), "graphSchema": schema() }),
+            "not both",
+        ),
+        (
+            json!({ "graphSpec": spec(), "graphModel": schema() }),
+            "not both",
+        ),
+    ];
+    for (opts, expected) in cases {
+        let message = validation_message(apply(opts.clone()));
+        assert!(message.contains(expected), "{opts}: {message}");
+    }
+}
+
 #[test]
 fn unknown_keys_are_reported_and_known_ones_are_not() {
     let opts = json!({
@@ -165,6 +222,7 @@ fn unknown_keys_are_reported_and_known_ones_are_not() {
         "graphBackend": null,
         "graphSchema": null,
         "graphModel": null,
+        "graphSpec": null,
         "chunkAttachment": null,
         "chunkAtachment": "all",
         "runInBackground": true,

@@ -81,7 +81,12 @@ policy: every node gets a random id, nothing is vector-indexed and nothing is
 transparent. Python's own round trip produces the same result, so Rust compiles
 it the same way rather than rejecting it. An unprocessed
 `DataPoint.model_json_schema()` is rejected, because it declares the reserved
-DataPoint infrastructure fields.
+DataPoint infrastructure fields: the keys a stored node's base carries (`id`,
+`type`, `version`, `metadata`, the timestamps, the `source_*` provenance
+fields, ...), which a custom property would overwrite. Python is laxer here:
+its generated subclass may redeclare any `DataPoint` field. The two Python
+`DataPoint` fields the Rust base does not carry, `ontology_uri` and the
+removed `valid_to`, are ordinary custom fields, as in Python.
 
 Local `$defs` and `#/$defs/...` references are supported, whether a field holds
 one model, an optional model, a union of models, or a list of any of these;
@@ -293,6 +298,74 @@ Chunk attachment requires a custom graph schema. It is also rejected for
 temporal cognify, by the same Rust decision as `graph_schema` above: Python
 ignores `temporal_cognify` on this path rather than rejecting it.
 
+### Spec DSL
+
+A custom graph model can also be written in the hand-writable spec DSL that
+Python's `cognee.modules.graph_models` defines (and the cognee frontend's
+graph-model editor produces): entities with `primitive`, `enum` and
+`relation` fields. Rust's port,
+[`crates/cognify/src/graph_spec.rs`](../../crates/cognify/src/graph_spec.rs),
+compiles a spec into the JSON Schema above, key for key what Python's
+`graph_spec_to_json_schema` emits, so a spec runs through the same
+`graph_schema` path:
+
+```rust
+use cognee_cognify::{CognifyConfig, GraphSchemaSpec, graph_spec_to_json_schema};
+use serde_json::json;
+
+let spec = GraphSchemaSpec::from_value(&json!({
+    "entities": [
+        {
+            "name": "Person",
+            "fields": [
+                {"kind": "primitive", "name": "age", "primitive_type": "number"},
+                {"kind": "enum", "name": "mood", "enum_values": ["happy", "grumpy"]},
+                {"kind": "relation", "name": "works_at",
+                 "relation": {"target_entity_name": "Organization"}},
+                {"kind": "relation", "name": "knows",
+                 "relation": {"target_entity_name": "Person", "cardinality": "many"}}
+            ]
+        },
+        {"name": "Organization"}
+    ]
+}))?;
+let config = CognifyConfig::default().with_graph_schema(graph_spec_to_json_schema(&spec)?);
+```
+
+The compiled schema puts every entity and a `{Name}Type` marker in `$defs` and
+spreads the root entity (`root`, else the first) at the top level. Each entity
+gets a required string `name` and an `is_type` marker: every instance of one
+entity type points at a single `{Name}Type` node. `metadata` defaults to
+`index_fields: ["name"]` (also when given as `[]`) and `identity_fields:
+["name"]` (`[]` opts out of merging). `date` fields are ISO date strings, and a
+relation field is never required. `inverse` and `options.auto_type_nodes` are
+accepted and, as in Python, not compiled.
+
+Validation follows Python's `GraphSchemaSpec`, in the same order, and a rule
+violation carries Python's message verbatim:
+
+- **Limits and names:** 1–50 entities and at most 40 fields per entity. Entity
+  and field names are ASCII identifiers (`^[A-Za-z][A-Za-z0-9_]*$`). Rust also
+  rejects a trailing newline, which Python's `$` lets through.
+- **Uniqueness:** entity names are unique, and field names are unique within
+  an entity.
+- **Reserved names:** an entity may not be named `{Other}Type` for another
+  entity `Other`. Fields may not reuse a `DataPoint` field name or `is_type`.
+- **`name` and relations:** an explicit `name` field must be a string
+  primitive. A relation must target a declared entity.
+- **References:** `index_fields`, `identity_fields` and `primary_label_field`
+  name `name` or a declared primitive or enum field.
+
+Keys are snake_case with camelCase aliases (`target_entity_name` or
+`targetEntityName`). An unknown key is rejected, and so is a field without its
+`kind`. Boolean flags accept Pydantic's lax spellings (`"yes"`, `1`, `"off"`).
+
+As in Python, a spec can compile but still not build: the root entity's name
+must be a class name (see above), so `person` or `Org_unit` as a root fails when
+the schema is compiled. `graph_model_from_spec` runs both steps.
+`crates/cognify/tests/fixtures/graph_spec/` holds the generator and the table,
+recorded from Python, that the unit tests replay.
+
 ### Entry points
 
 `graph_schema` and `chunk_attachment` are per-call options, like Python's
@@ -303,13 +376,19 @@ or environment variable for either.
   the example above. `cognee_cognify::parse_graph_schema` reads a schema given
   as an object or a JSON string, and `ChunkAttachment::parse` (or `FromStr`)
   reads `"direct"` / `"all"`.
-- **CLI**: `cognee-cli cognify --graph-schema schema.json --chunk-attachment all`;
-  `add-and-cognify` takes the same two flags.
+  A spec goes through `graph_spec_to_json_schema` (or
+  `graph_schema_from_spec_value` for an object or a JSON string), as above.
+- **CLI**: `cognee-cli cognify --graph-schema schema.json --chunk-attachment all`,
+  or `--graph-spec spec.json` for a spec (not both); `add-and-cognify` takes
+  the same flags.
 - **Bindings** (Python handle, TypeScript, Java, C): the cognify and
   add-and-cognify options `graphSchema` (an object or a JSON string; alias
-  `graphModel`) and `chunkAttachment`. Python also accepts `graph_schema` /
-  `chunk_attachment`; Java has `CognifyOptions.graphSchema(...)` and
-  `.chunkAttachment(...)`.
+  `graphModel`), `graphSpec` (a spec, compiled natively; not with
+  `graphSchema`) and `chunkAttachment`. Python also accepts `graph_schema` /
+  `graph_spec` / `chunk_attachment` and has
+  `cognee_py.graph_spec_to_json_schema`; TypeScript types the spec as
+  `GraphSchemaSpec`; Java has `CognifyOptions.graphSchema(...)`,
+  `.graphSpec(...)` and `.chunkAttachment(...)`.
 - **Python compat** (`cognee_py.compat`): `cognify(graph_model=..., chunk_attachment=...)`
   and `add_and_cognify(...)`, as upstream. `graph_model` takes a Pydantic model
   class, converted as upstream's `graph_model_to_graph_schema` does (through
@@ -321,6 +400,9 @@ or environment variable for either.
   upstream's `DataPoint` is importable. Without upstream `cognee` there is no
   `DataPoint` to subclass, so a class is accepted as its schema; a schema
   dict or string is always accepted, as upstream's HTTP route takes it.
+  `graph_spec_to_json_schema` is re-exported, as upstream's `cognee.low_level`
+  does, so `graph_model=graph_spec_to_json_schema(spec)` works; `graph_spec=`
+  passes a spec straight through.
 
 `null` and `{}` mean the default `KnowledgeGraph`, as Python's HTTP route reads
 an omitted or empty `graph_model`. Every entry point validates before any side
@@ -348,4 +430,5 @@ a vector backend that cannot list its collections.
 
 - [`CognifyConfig`](../../crates/cognify/src/config.rs) — schema and chunk-attachment configuration.
 - [`crates/cognify/src/dynamic_graph.rs`](../../crates/cognify/src/dynamic_graph.rs) — runtime schema compiler, validation, identity, and storage walk.
+- [`crates/cognify/src/graph_spec.rs`](../../crates/cognify/src/graph_spec.rs) — the spec DSL and its compiler.
 - [`crates/cognify/src/summarization/extractor.rs`](../../crates/cognify/src/summarization/extractor.rs) — summary schema consumption.

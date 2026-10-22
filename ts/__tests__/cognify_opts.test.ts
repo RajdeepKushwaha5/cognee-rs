@@ -11,6 +11,7 @@ import * as os from "os";
 import * as path from "path";
 
 import { native, NativeBox } from "../src/native";
+import type { GraphSchemaSpec } from "../src/types";
 
 const GRAPH_SCHEMA = {
   title: "Graph",
@@ -76,6 +77,73 @@ describe("cognify options (Tier-A, no LLM)", () => {
     await expect(
       native.cogneeCognify(handle, "missing", { graphSchema: JSON.stringify(bad) })
     ).rejects.toThrow(/Invalid graph schema/);
+  });
+
+  it("compiles a graphSpec and rejects an invalid one before the dataset lookup", async () => {
+    const spec: GraphSchemaSpec = {
+      entities: [
+        {
+          name: "Person",
+          fields: [
+            {
+              kind: "relation",
+              name: "knows",
+              relation: { targetEntityName: "Person", cardinality: "many" },
+            },
+          ],
+        },
+      ],
+    };
+    await expect(
+      native.cogneeCognify(handle, "missing", { graphSpec: spec, chunkAttachment: "all" })
+    ).rejects.toThrow(/was not found/);
+    await expect(
+      native.cogneeCognify(handle, "missing", { graphSpec: JSON.stringify(spec) })
+    ).rejects.toThrow(/was not found/);
+    await expect(
+      native.cogneeCognify(handle, "missing", {
+        graphSpec: { entities: [{ name: "P" }, { name: "P" }] },
+      })
+    ).rejects.toThrow(/Entity names must be unique\./);
+    await expect(
+      native.cogneeCognify(handle, "missing", {
+        graphSpec: spec,
+        graphSchema: GRAPH_SCHEMA,
+      })
+    ).rejects.toThrow(/not both/);
+  });
+
+  it("types and accepts a snake_case spec, as the docs write it", async () => {
+    // The guide's spec, verbatim: snake_case keys type-check too.
+    const spec: GraphSchemaSpec = {
+      entities: [
+        {
+          name: "Person",
+          index_fields: ["name"],
+          fields: [
+            { kind: "primitive", name: "age", primitive_type: "number" },
+            { kind: "enum", name: "mood", enum_values: ["happy", "grumpy"] },
+            {
+              kind: "relation",
+              name: "works_at",
+              relation: { target_entity_name: "Organization" },
+            },
+          ],
+        },
+        { name: "Organization" },
+      ],
+    };
+    await expect(
+      native.cogneeCognify(handle, "missing", { graphSpec: spec })
+    ).rejects.toThrow(/was not found/);
+
+    const bothSpellings: GraphSchemaSpec = {
+      // @ts-expect-error -- one spelling per key, as the native parser requires
+      entities: [{ name: "P", indexFields: ["name"], index_fields: ["name"] }],
+    };
+    await expect(
+      native.cogneeCognify(handle, "missing", { graphSpec: bothSpellings })
+    ).rejects.toThrow(/invalid `graphSpec`/);
   });
 
   it("rejects graphSchema with temporalCognify", async () => {

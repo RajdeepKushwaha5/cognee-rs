@@ -497,12 +497,22 @@ pub struct GraphSchemaArgs {
     /// of the default KnowledgeGraph (Python's `graph_model`). `{}` means the
     /// default model. Not supported with `--temporal-cognify`. See
     /// docs/guides/custom-graph-schema.md for the schema contract.
-    #[arg(long = "graph-schema", value_name = "FILE")]
+    #[arg(
+        long = "graph-schema",
+        value_name = "FILE",
+        conflicts_with = "graph_spec"
+    )]
     pub graph_schema: Option<std::path::PathBuf>,
+
+    /// JSON file holding a custom graph model in the spec DSL (entities,
+    /// typed fields and relations; Python's `GraphSchemaSpec`), compiled into
+    /// a `--graph-schema`. See docs/guides/custom-graph-schema.md.
+    #[arg(long = "graph-spec", value_name = "FILE")]
+    pub graph_spec: Option<std::path::PathBuf>,
 
     /// How each chunk links to the custom graph extracted from it: `direct`
     /// (the root, the default) or `all` (every stored node). Requires
-    /// `--graph-schema`.
+    /// `--graph-schema` or `--graph-spec`.
     #[arg(long = "chunk-attachment", value_enum)]
     pub chunk_attachment: Option<ChunkAttachmentArg>,
 }

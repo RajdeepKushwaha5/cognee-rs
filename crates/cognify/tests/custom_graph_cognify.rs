@@ -498,3 +498,82 @@ async fn default_cognify_without_a_schema_is_unchanged() {
         );
     }
 }
+
+/// A graph model written in the spec DSL (SDK-1055) runs end to end: the
+/// compiled schema is what the LLM is asked for, and the answer is stored as
+/// Python's generated model would store it — one node per entity, one field
+/// edge per relation, and every instance's `is_type` marker merged into one
+/// `{Name}Type` node per entity.
+#[tokio::test]
+async fn a_spec_compiled_schema_cognifies_end_to_end() {
+    let spec = cognee_cognify::GraphSchemaSpec::from_value(&json!({
+        "entities": [
+            {
+                "name": "Person",
+                "fields": [
+                    {"kind": "primitive", "name": "age", "primitive_type": "number"},
+                    {
+                        "kind": "relation", "name": "works_at",
+                        "relation": {"target_entity_name": "Organization"}
+                    },
+                    {
+                        "kind": "relation", "name": "knows",
+                        "relation": {"target_entity_name": "Person", "cardinality": "many"}
+                    }
+                ]
+            },
+            {"name": "Organization"}
+        ]
+    }))
+    .expect("valid spec");
+    let schema = cognee_cognify::graph_spec_to_json_schema(&spec).expect("spec compiles");
+    let answer = json!({
+        "name": "Ada",
+        "is_type": {},
+        "age": 36,
+        "works_at": {"name": "Analytical Engines", "is_type": {}},
+        "knows": [{"name": "Charles", "is_type": {"name": "Person"}}]
+    });
+    let config = extraction_config().with_graph_schema(schema);
+    let (harness, _) = run(&config, PLAIN_TEXT, SchemaKeyedLlm::new(answer)).await;
+    let stored = Stored::of(&harness).await;
+
+    // The ids Python's `graph_model_from_spec` model assigns to this answer.
+    let ada = "19602cf7-f83a-5764-884b-09504eb8f348";
+    let charles = "e69f3bc4-5260-54cc-9692-8194cedd27a7";
+    let engines = "2f9555c5-730a-5e47-b896-0e54caf69083";
+    let person_type = "b4404d21-cd36-5bc7-9b83-8e08176c280a";
+    let organization_type = "b4323b15-10bc-5a05-b72c-b4dcaa343dd9";
+    let set = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<BTreeSet<_>>();
+    let edge = |source: &str, target: &str| (source.to_string(), target.to_string());
+
+    assert_eq!(stored.ids_of_type("Person"), set(&[ada, charles]));
+    assert_eq!(stored.ids_of_type("Organization"), set(&[engines]));
+    assert_eq!(
+        stored.ids_of_type("PersonType"),
+        set(&[person_type]),
+        "both people's markers merge into one PersonType node"
+    );
+    assert_eq!(
+        stored.ids_of_type("OrganizationType"),
+        set(&[organization_type])
+    );
+    assert_eq!(
+        stored.field_edges("works_at"),
+        BTreeSet::from([edge(ada, engines)])
+    );
+    assert_eq!(
+        stored.field_edges("knows"),
+        BTreeSet::from([edge(ada, charles)])
+    );
+    assert_eq!(
+        stored.field_edges("is_type"),
+        BTreeSet::from([
+            edge(ada, person_type),
+            edge(charles, person_type),
+            edge(engines, organization_type),
+        ])
+    );
+    // A `number` field is a Python float.
+    assert_eq!(stored.nodes[ada].get("age"), Some(&json!(36.0)));
+}

@@ -210,11 +210,18 @@ await cognee.cognify("my-dataset")
 
 # With a custom graph model: its JSON Schema (a dict or a JSON string)
 await cognee.cognify("my-dataset", {"graph_schema": schema, "chunk_attachment": "all"})
+
+# Or the same model in the spec DSL, compiled natively
+spec = {"entities": [{"name": "Person"}, {"name": "Company"}]}
+await cognee.cognify("my-dataset", {"graph_spec": spec})
+schema = graph_spec_to_json_schema(spec)  # from cognee_py; upstream's low_level function
 ```
 
 The compat API takes upstream's arguments instead:
 `compat.cognify(graph_model=MyModel, chunk_attachment="all")`, where `MyModel`
-is a Pydantic model class (or its schema as a dict). An invalid option value
+is a Pydantic model class (or its schema as a dict), and
+`compat.graph_spec_to_json_schema(spec)` compiles a spec as upstream's
+`cognee.low_level` function does. An invalid option value
 raises `CogneeValidationError`; see
 [the custom graph schema guide](../docs/guides/custom-graph-schema.md).
 

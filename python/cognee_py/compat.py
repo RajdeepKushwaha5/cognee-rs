@@ -69,7 +69,7 @@ import pathlib
 import re
 from typing import Any, Optional, Union
 
-from . import Cognee, CogneeValidationError, SearchType
+from . import Cognee, CogneeValidationError, SearchType, graph_spec_to_json_schema
 
 __all__ = [
     "add",
@@ -78,6 +78,7 @@ __all__ = [
     "search",
     "prune",
     "SearchType",
+    "graph_spec_to_json_schema",
 ]
 
 # ---------------------------------------------------------------------------
@@ -404,7 +405,11 @@ async def cognify(
     ``graph_model`` takes a custom Pydantic graph model class (or its JSON
     Schema as a dict or JSON string) and ``chunk_attachment`` takes
     ``"direct"`` or ``"all"``, as upstream; see :func:`_graph_model_to_schema`.
-    An invalid value raises :exc:`~cognee_py.CogneeValidationError`.
+    A model written in the spec DSL can be passed as
+    ``graph_model=graph_spec_to_json_schema(spec)`` — the upstream spelling,
+    with ``cognee.low_level.graph_spec_to_json_schema`` — or directly as
+    ``graph_spec=spec``. An invalid value raises
+    :exc:`~cognee_py.CogneeValidationError`.
     """
     dataset_name = datasets if isinstance(datasets, str) else _default_dataset_name()
     opts = _cognify_opts(kwargs)
