@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   http-parity:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     # HAS_OPENAI_KEY must be set at job level so step-level `if:` expressions
     # can read it via `env.HAS_OPENAI_KEY`.  A step's own `env:` block is only
@@ -108,7 +108,7 @@ jobs:
           fi
           echo "ok: $d/Dockerfile.dockerignore present, no inert .dockerignore beside it"
 
-      # ubuntu-latest ships with ~14 GB free; the release build plus the cargo
+      # The ubuntu-24.04 runner ships with ~14 GB free; the release build plus the cargo
       # registry and target cache needs more headroom. Mirror ci.yml.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -164,7 +164,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cognee-rust -> target
-          shared-key: http-parity-release-v2
+          shared-key: http-parity-release-v3
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache ORT binary

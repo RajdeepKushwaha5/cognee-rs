@@ -80,12 +80,27 @@ env:
   # updates touch /usr/bin/cc+gcc mtimes and would silently invalidate the
   # whole cache. Hash the compiler content instead.
   CCACHE_COMPILERCHECK: content
+  # Pin the interpreter pyo3-build-config resolves. Without this it probes
+  # whatever `python3` the image ships (3.14 on ubuntu-26.04, newer than PyO3
+  # 0.23 supports), and it caches that result in OUT_DIR, re-resolving only
+  # when a PYO3_* variable changes, so a rust-cache saved on one image can
+  # carry a stale interpreter into another. python3.12 is noble's system
+  # Python. maturin-driven jobs set their own PYO3_PYTHON and are unaffected.
+  PYO3_PYTHON: python3.12
 
 jobs:
+  # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
+  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
+  # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
+  # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
+  # changes every `runs-on:` / matrix runner under .github/workflows/ at once,
+  # updates PYO3_PYTHON above (python3.12 does not exist on 26.04), and bumps
+  # every rust-cache shared-key (the key does not include the image, so a
+  # target dir built on the old image would otherwise be restored on the new).
   # ── Stage 1: Quick lints (fast fail) ──────────────────────────────────
   lint:
     name: Lint (fmt + check + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only: fork PRs get no secrets and are covered by the
     # `Community Checks (No Secrets)` workflow. `test`, the Postgres lanes and
     # the binding-check jobs cascade off this gate via `needs`.
@@ -140,8 +155,8 @@ jobs:
           key: lbug-cxx
           max-size: 1G
 
-      # Lint has its own Swatinem key (workspace-lint-v6) separate from the
-      # test job (workspace-test-v6). The lint job runs only `cargo check` /
+      # Lint has its own Swatinem key (workspace-lint-v7) separate from the
+      # test job (workspace-test-v7). The lint job runs only `cargo check` /
       # `cargo clippy`, which produce .rmeta but NOT .rlib files. Sharing a
       # key with the test job would cause the test job to inherit a cache full
       # of .rmeta stubs and have to rebuild everything from scratch on every
@@ -150,7 +165,7 @@ jobs:
       - name: Cache cargo/target (lint)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-lint-v6
+          shared-key: workspace-lint-v7
           # Save only on main. Branch-scoped copies are what pushed the repo
           # over GitHub's 10 GB cache quota and kept the LRU rotating (see the
           # capi-check note below). Branches still *restore* main's caches;
@@ -371,7 +386,7 @@ jobs:
   # path, so this only manifests on x86_64.
   msrv:
     name: MSRV (1.91.1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only (no `needs`, so it carries its own gate). See `lint`.
     if: >-
       github.event_name != 'pull_request' ||
@@ -412,7 +427,7 @@ jobs:
       - name: Cache cargo/target (msrv)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-msrv-v1
+          shared-key: workspace-msrv-v2
           cache-on-failure: true
           # main-only save — see the note in the lint job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -445,7 +460,7 @@ jobs:
   # No protoc/cmake/lbug here: the three logic crates pull none of them.
   wasm:
     name: wasm32 (Config-1 logic crates)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # In-repo only (no `needs`, so it carries its own gate). See `lint`. Needs no
     # secrets itself, but it belongs to the keyed workflow that fork PRs skip
     # wholesale — the fork-safe `Community Checks` workflow covers forks instead.
@@ -477,7 +492,7 @@ jobs:
       - name: Cache cargo/target (wasm)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: wasm-v1
+          shared-key: wasm-v2
           # main-only save — see the note in the lint job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -527,7 +542,7 @@ jobs:
   test:
     name: Test (stable)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     env:
       OPENAI_URL: https://api.openai.com/v1
@@ -583,16 +598,16 @@ jobs:
           max-size: 1G
           save: false
 
-      # The test job has its own Swatinem key (workspace-test-v6) separate from
-      # lint (workspace-lint-v6). The test job runs `cargo nextest` which
+      # The test job has its own Swatinem key (workspace-test-v7) separate from
+      # lint (workspace-lint-v7). The test job runs `cargo nextest` which
       # compiles everything to .rlib for linking. On the first run this is a
-      # cold build (~15 min), but workspace-test-v6 is then populated with
+      # cold build (~15 min), but workspace-test-v7 is then populated with
       # .rlib files and subsequent runs are fast. cache-on-failure=true ensures
       # even a first-run compile failure seeds the cache so the rerun is warm.
       - name: Cache cargo/target (test)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           cache-on-failure: true
           # main-only save — see the note in the lint job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -679,7 +694,7 @@ jobs:
   docs-and-extras:
     name: Docs + feature lanes
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -724,7 +739,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       - name: Cache ORT binary
@@ -834,7 +849,7 @@ jobs:
   pgvector-postgres:
     name: Test (Postgres pgvector lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -889,12 +904,12 @@ jobs:
 
       # Restore-only: this lane runs one small `cargo test -p cognee-vector`,
       # fully covered by the `test` job's debug build of the same key. Saving
-      # here only added a divergent version of workspace-test-v6 (cache churn),
+      # here only added a divergent version of workspace-test-v7 (cache churn),
       # so it restores but does not save.
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       - name: Cache ORT binary
@@ -1016,7 +1031,7 @@ jobs:
   pg-single-db-postgres:
     name: Test (Postgres single-database lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -1066,7 +1081,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # Unlike the pggraph lane, this one DOES need the ORT cache: `cognee`'s
@@ -1189,7 +1204,7 @@ jobs:
   pggraph-postgres:
     name: Test (Postgres graph lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       postgres:
@@ -1243,11 +1258,11 @@ jobs:
 
       # Restore-only for the same reason as `pgvector-postgres`: this lane builds
       # one crate with a non-default feature set, so saving under the shared key
-      # would only fork a divergent copy of workspace-test-v6.
+      # would only fork a divergent copy of workspace-test-v7.
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # No ORT cache step here on purpose. `cognee-graph` pulls in no `ort-sys`
@@ -1331,7 +1346,7 @@ jobs:
   redis-session:
     name: Test (Redis session lane)
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     services:
       redis:
@@ -1367,7 +1382,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # `session.ttl_seconds` on Redis: the store arms an expiry on every key
@@ -1407,7 +1422,7 @@ jobs:
   capi-check:
     name: C API Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     env:
       OPENAI_URL: https://api.openai.com/v1
@@ -1463,7 +1478,7 @@ jobs:
       # cargo test artifacts instead.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: capi-check-v2
+          shared-key: capi-check-v3
           workspaces: |
             . -> target
             capi -> target
@@ -1499,7 +1514,12 @@ jobs:
   python-check:
     name: Python Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # Build against the venv's interpreter (setup-python 3.11 below), not the
+    # workflow-wide python3.12. maturin overrides PYO3_PYTHON anyway; this makes
+    # any direct cargo call in check.sh agree with the interpreter pytest uses.
+    env:
+      PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
 
     steps:
       - uses: actions/checkout@v4
@@ -1529,7 +1549,7 @@ jobs:
           key: lbug-cxx
           max-size: 1G
           save: false
-      # Restore-only share of workspace-test-v6: `maturin develop` (python/scripts/
+      # Restore-only share of workspace-test-v7: `maturin develop` (python/scripts/
       # check.sh) builds in DEBUG, so it reuses the test job's debug dep rlibs —
       # maturin then only compiles the PyO3 extension + workspace crates. A
       # dedicated key was tried (assuming a release build) but it just added a
@@ -1538,7 +1558,7 @@ jobs:
       # divergent copy (the `test` job is the sole writer).
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
       - uses: actions/cache@v4
         with:
@@ -1579,7 +1599,7 @@ jobs:
   ts-check:
     name: JS/TS Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -1600,12 +1620,12 @@ jobs:
           key: lbug-cxx
           max-size: 1G
           save: false
-      # Dedicated key, NOT shared workspace-test-v6: the Neon module build
+      # Dedicated key, NOT shared workspace-test-v7: the Neon module build
       # differs from the debug test cache, so sharing churned/polluted it. Its
       # own key caches the binding build across runs.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-ts-v1
+          shared-key: workspace-ts-v2
           workspaces: |
             . -> target
             bindings -> target
@@ -1636,7 +1656,7 @@ jobs:
   java-check:
     name: Java Bindings Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -1663,7 +1683,7 @@ jobs:
       # and java-check builds it dev, so the two caches hold disjoint trees.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-java-v1
+          shared-key: workspace-java-v2
           workspaces: |
             . -> target
             bindings -> target
@@ -1695,7 +1715,7 @@ jobs:
   notify:
     name: Test Suite Status
     needs: [ lint, msrv, wasm, test, docs-and-extras, pgvector-postgres, pg-single-db-postgres, pggraph-postgres, redis-session, capi-check, python-check, ts-check, java-check ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: >-
       !cancelled() &&
       (github.event_name != 'pull_request' ||

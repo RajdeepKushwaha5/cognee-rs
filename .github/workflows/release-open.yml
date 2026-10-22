@@ -35,7 +35,7 @@ jobs:
   open-release-pr:
     name: Open release PR
     if: startsWith(github.event.label.name, 'release:')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Parse & validate version from label

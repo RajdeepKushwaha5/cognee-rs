@@ -51,13 +51,13 @@ jobs:
         include:
           # Linux x64 glibc — native runner
           - platform: linux-x64-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             rust-target: x86_64-unknown-linux-gnu
             cross: false
 
           # Linux arm64 glibc — cross via `cross`
           - platform: linux-arm64-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             rust-target: aarch64-unknown-linux-gnu
             cross: true
 
@@ -169,7 +169,7 @@ jobs:
       - name: Cache cargo (bindings workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ts-neon-${{ matrix.platform }}-v1
+          shared-key: ts-neon-${{ matrix.platform }}-v2
           workspaces: bindings -> target
           cache-on-failure: true
 
@@ -288,7 +288,7 @@ jobs:
   # surface a boolean output the publish job can gate on.
   check-token:
     name: Check npm token
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       has_token: ${{ steps.check.outputs.has_token }}
     steps:
@@ -306,7 +306,7 @@ jobs:
   publish:
     name: Publish npm packages
     needs: [build-platform, check-token]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Env-guarded per the token-gate pattern. NPM_TOKEN is T17 scope
     # (registry publish — irreversible, gated on F8 + explicit human "go").
     # Pre-T17 the secret is intentionally absent on cognee-rs so this job

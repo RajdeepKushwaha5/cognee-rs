@@ -55,7 +55,7 @@ jobs:
       github.event.pull_request.base.ref == 'main' &&
       startsWith(github.event.pull_request.head.ref, 'release/') &&
       contains(github.event.pull_request.labels.*.name, 'autorelease:pending'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Required-reviewer gate: CARGO_REGISTRY_TOKEN lives as an environment secret
     # and is not decrypted onto the runner until a reviewer approves this job.
@@ -120,7 +120,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-publish-v1
+          shared-key: release-publish-v2
           cache-on-failure: true
 
       # ── 0. Credential preflight — fail before ANY irreversible action ──────

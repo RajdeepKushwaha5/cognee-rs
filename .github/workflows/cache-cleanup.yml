@@ -31,8 +31,8 @@ on:
   # pull_request_target, NOT pull_request. A `pull_request` run for a PR from a
   # fork gets a read-only GITHUB_TOKEN no matter what the permissions block
   # says, so the delete below would silently fail for exactly the PRs that most
-  # need it — community.yml (the fork lane) saves workspace-lint-v6 and
-  # workspace-test-v6 unrestricted, so a fork PR writes ~2 GB of its own.
+  # need it — community.yml (the fork lane) saves workspace-lint-v7 and
+  # workspace-test-v7 unrestricted, so a fork PR writes ~2 GB of its own.
   #
   # The usual pull_request_target hazard is running untrusted head code with a
   # writable token. That does not apply here: this workflow has no checkout and
@@ -88,7 +88,7 @@ concurrency:
 jobs:
   cleanup:
     name: Reclaim caches for a closed PR, deleted branch or tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Delete caches scoped to the ref
         env:

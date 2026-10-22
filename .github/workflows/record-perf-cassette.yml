@@ -12,7 +12,7 @@ name: Record perf cassette
 #     hash is NOT identical across OS/arch, so a cassette recorded on a dev's
 #     macOS box only partially replays on the Linux CI runner (empty-graph
 #     fallbacks → unrepresentative timings). Recording it HERE, on the same
-#     ubuntu-latest image the perf job replays on, keeps record and replay on
+#     ubuntu-24.04 image the perf job replays on, keeps record and replay on
 #     the same platform.
 #
 # Run this whenever the corpus, cognify prompts/schemas, chunking, or the model
@@ -47,7 +47,7 @@ env:
 jobs:
   record:
     name: Record perf cassette
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     # contents:write lets the default GITHUB_TOKEN commit the refreshed cassette.
     permissions:
@@ -84,7 +84,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: perf-record
+          shared-key: perf-record-v1
 
       - name: Cache ORT binary
         uses: actions/cache@v4

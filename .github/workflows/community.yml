@@ -32,12 +32,27 @@ env:
   CARGO_INCREMENTAL: "0"
   ORT_CACHE_DIR: ${{ github.workspace }}/target/ort-cache
   CCACHE_COMPILERCHECK: content
+  # Pin the interpreter pyo3-build-config resolves. Without this it probes
+  # whatever `python3` the image ships (3.14 on ubuntu-26.04, newer than PyO3
+  # 0.23 supports), and it caches that result in OUT_DIR, re-resolving only
+  # when a PYO3_* variable changes, so a rust-cache saved on one image can
+  # carry a stale interpreter into another. python3.12 is noble's system
+  # Python. maturin-driven jobs set their own PYO3_PYTHON and are unaffected.
+  PYO3_PYTHON: python3.12
 
 jobs:
+  # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
+  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
+  # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
+  # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
+  # changes every `runs-on:` / matrix runner under .github/workflows/ at once,
+  # updates PYO3_PYTHON above (python3.12 does not exist on 26.04), and bumps
+  # every rust-cache shared-key (the key does not include the image, so a
+  # target dir built on the old image would otherwise be restored on the new).
   # ── Lint: fmt + check + clippy (no secrets) ───────────────────────────
   lint:
     name: Lint (fmt + check + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,7 +92,7 @@ jobs:
       - name: Cache cargo/target (lint)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-lint-v6
+          shared-key: workspace-lint-v7
 
       - name: Cache ORT binary
         uses: actions/cache@v4
@@ -123,7 +138,7 @@ jobs:
   # ── Secret-free workspace tests ───────────────────────────────────────
   test-no-secrets:
     name: Test (no secrets)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Select the tuned nextest CI profile (.config/nextest.toml): parallel
       # execution, fail-fast off, and one retry for transient flakiness. The
@@ -177,7 +192,7 @@ jobs:
       - name: Cache cargo/target (test)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           cache-on-failure: true
 
       - name: Cache ORT binary
@@ -228,7 +243,7 @@ jobs:
   # cannot drift between the two copies.
   pggraph-postgres:
     name: Test (Postgres graph lane)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event.pull_request.head.repo.full_name != github.repository
 
     services:
@@ -277,7 +292,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # No ORT cache step — see the ci.yml twin: `cognee-graph` pulls in no
@@ -344,7 +359,7 @@ jobs:
   # per-test processes defeat), and why the image must be pgvector/pgvector.
   pgvector-postgres:
     name: Test (Postgres pgvector lane)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event.pull_request.head.repo.full_name != github.repository
 
     services:
@@ -396,7 +411,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       - name: Cache ORT binary
@@ -475,7 +490,7 @@ jobs:
   # closes. Fork PRs only; `notify` accepts `skipped`.
   pg-single-db-postgres:
     name: Test (Postgres single-database lane)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event.pull_request.head.repo.full_name != github.repository
 
     services:
@@ -521,7 +536,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # Needed here (unlike the graph lane): `cognee`'s default features include
@@ -600,7 +615,7 @@ jobs:
   # lanes; the `notify` aggregator below therefore accepts `skipped`.
   redis-session:
     name: Test (Redis session lane)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event.pull_request.head.repo.full_name != github.repository
 
     services:
@@ -637,7 +652,7 @@ jobs:
       - name: Cache cargo/target (test, restore-only)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: workspace-test-v6
+          shared-key: workspace-test-v7
           save-if: "false"
 
       # `session.ttl_seconds` on Redis: the store arms an expiry on every key
@@ -670,7 +685,7 @@ jobs:
   notify:
     name: Community Checks Status
     needs: [ lint, test-no-secrets, pggraph-postgres, pgvector-postgres, pg-single-db-postgres, redis-session ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ !cancelled() }}
     steps:
       - name: Check status

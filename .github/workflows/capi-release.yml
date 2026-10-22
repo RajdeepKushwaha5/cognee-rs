@@ -40,13 +40,13 @@ jobs:
       matrix:
         include:
           # Linux x86_64 — native runner
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             cross: false
             archive_suffix: linux-x86_64
 
           # Linux aarch64 — cross via `cross`
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             cross: true
             archive_suffix: linux-aarch64
@@ -136,7 +136,7 @@ jobs:
       - name: Cache cargo (capi workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: capi-release-${{ matrix.archive_suffix }}-v1
+          shared-key: capi-release-${{ matrix.archive_suffix }}-v2
           workspaces: capi -> target
           cache-on-failure: true
 
@@ -240,7 +240,7 @@ jobs:
   release:
     name: Attach to GitHub Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Attach on a real tag push, or on a manual workflow_dispatch (so a failed
     # release can be re-cut without force-moving the tag — the dispatch input
     # supplies the tag to attach to).
