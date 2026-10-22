@@ -35,6 +35,9 @@ provenance fields (`source_pipeline`, `source_task`, `source_node_set`,
 `HasDataPoint` trait so provenance stamping can walk any node uniformly. When a
 DataPoint is indexed, its serialized form becomes the vector-store payload
 (`vector_metadata()`), keeping the on-disk shape comparable to Python's.
+Python's serialization and versioning helpers are mirrored as `to_json_string()`
+/ `from_json()`, `to_dict()` / `from_dict()` and `update_version()` (bumps
+`version` and refreshes `updated_at`).
 
 Rust: `DataPoint` / `HasDataPoint` in [`cognee-models`](../crates/models/).
 

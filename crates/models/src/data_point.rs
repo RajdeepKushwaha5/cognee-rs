@@ -196,6 +196,48 @@ impl DataPoint {
         serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 
+    /// Serialize to a JSON string.
+    ///
+    /// Mirrors Python's `DataPoint.to_json() -> str` (`model_dump_json()`);
+    /// [`DataPoint::to_json`] returns the same document as a `Value`.
+    pub fn to_json_string(&self) -> String {
+        self.to_json().to_string()
+    }
+
+    /// Deserialize from a JSON string, applying the serde defaults of
+    /// fields the document omits.
+    ///
+    /// Mirrors Python's `DataPoint.from_json` (`model_validate_json`).
+    pub fn from_json(json: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(json)
+    }
+
+    /// Convert to a field-name-keyed map (`data_type` under the key `"type"`).
+    ///
+    /// Mirrors Python's `DataPoint.to_dict()` (`model_dump()`).
+    pub fn to_dict(&self) -> serde_json::Map<String, serde_json::Value> {
+        match self.to_json() {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        }
+    }
+
+    /// Build a DataPoint from a field-name-keyed map, as produced by
+    /// [`DataPoint::to_dict`].
+    ///
+    /// Mirrors Python's `DataPoint.from_dict` (`model_validate`).
+    pub fn from_dict(data: serde_json::Map<String, serde_json::Value>) -> serde_json::Result<Self> {
+        serde_json::from_value(serde_json::Value::Object(data))
+    }
+
+    /// Increment `version` and refresh `updated_at` to now.
+    ///
+    /// Mirrors Python's `DataPoint.update_version`.
+    pub fn update_version(&mut self) {
+        self.version += 1;
+        self.touch();
+    }
+
     /// Canonical vector-store payload keys for this DataPoint.
     ///
     /// Mirrors Python's `DataPoint.model_dump()` payload shape: every
@@ -447,5 +489,83 @@ mod tests {
         dp.touch();
 
         assert!(dp.updated_at > original_time);
+    }
+
+    fn populated_data_point() -> DataPoint {
+        let mut dp = DataPoint::new("Entity", Some(Uuid::new_v4()));
+        dp.set_metadata("index_fields", json!(["name"]));
+        dp.source_pipeline = Some("cognify_pipeline".into());
+        dp.source_content_hash = Some("md5:abcdef".into());
+        dp.topological_rank = Some(2);
+        dp.importance_weight = None;
+        dp
+    }
+
+    #[test]
+    fn update_version_bumps_version_and_refreshes_updated_at() {
+        let mut dp = DataPoint::new("Entity", None);
+        let original_time = dp.updated_at;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        dp.update_version();
+        assert_eq!(dp.version, 2);
+        assert!(dp.updated_at > original_time);
+
+        dp.update_version();
+        assert_eq!(dp.version, 3);
+    }
+
+    #[test]
+    fn json_string_round_trips() {
+        let dp = populated_data_point();
+        let text = dp.to_json_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            dp.to_json()
+        );
+        assert_eq!(DataPoint::from_json(&text).unwrap(), dp);
+    }
+
+    #[test]
+    fn dict_round_trips_with_python_field_names() {
+        let dp = populated_data_point();
+        let dict = dp.to_dict();
+        assert_eq!(dict.get("type"), Some(&json!("Entity")));
+        assert!(!dict.contains_key("data_type"));
+        assert_eq!(dict.get("importance_weight"), Some(&json!(null)));
+        assert!(
+            !dict.contains_key("source_task"),
+            "None source fields are skipped"
+        );
+        assert_eq!(DataPoint::from_dict(dict).unwrap(), dp);
+    }
+
+    #[test]
+    fn from_dict_applies_defaults_for_omitted_fields() {
+        let dict = json!({
+            "id": Uuid::new_v4().to_string(),
+            "created_at": 1_i64,
+            "updated_at": 1_i64,
+            "ontology_valid": false,
+            "metadata": {},
+            "type": "Entity",
+            "belongs_to_set": null,
+        });
+        let serde_json::Value::Object(dict) = dict else {
+            unreachable!("literal is an object")
+        };
+        let dp = DataPoint::from_dict(dict).unwrap();
+        assert_eq!(dp.version, 1);
+        assert_eq!(dp.topological_rank, Some(0));
+        assert_eq!(dp.importance_weight, Some(0.5));
+    }
+
+    #[test]
+    fn from_json_and_from_dict_reject_invalid_input() {
+        assert!(DataPoint::from_json("not json").is_err());
+        assert!(DataPoint::from_json(r#"{"type": "Entity"}"#).is_err());
+        let mut dict = DataPoint::new("Entity", None).to_dict();
+        dict.insert("version".into(), json!("one"));
+        assert!(DataPoint::from_dict(dict).is_err());
     }
 }
