@@ -209,16 +209,13 @@ Stale agent worktrees each hold a 13–18 GB target dir; remove with
   `CCACHE_COMPILERCHECK=content` is set workflow-wide because runner-image
   updates touch `/usr/bin/cc` mtimes, which would invalidate the default
   mtime-based compiler check.
-- e2e Docker harness (`e2e-cross-sdk/Dockerfile` + `http-parity.yml`): the
-  rust-builder stage installs ccache and sets the CMake launcher env directly
-  (the repo's `.cargo/config.toml` and launcher script are not copied into
-  the image), compiling into a `--mount=type=cache,target=/ccache` BuildKit
-  mount. Locally that mount persists in the builder's state across
-  `docker compose build` runs with no further setup. In CI, BuildKit cache
-  mounts are not part of exported layer caches and start empty on fresh
-  runners, so `http-parity.yml` persists the mount with
-  `reproducible-containers/buildkit-cache-dance` + `actions/cache`
-  (inject before build, extract after).
+- e2e Docker harness (`e2e-cross-sdk/Dockerfile` + `http-parity.yml`): no
+  ccache. The image no longer compiles Rust (#133); the binaries are built by
+  `e2e-cross-sdk/build-rust-binaries.sh` in the Dockerfile's `rust-build-env`
+  stage with the checkout bind-mounted, so lbug's C++ objects live in the
+  host target dir, which `http-parity.yml` persists with rust-cache. (The
+  earlier rust-builder stage with a ccache BuildKit mount and
+  buildkit-cache-dance is gone.)
 - Rust-side equivalent: `sccache` as `RUSTC_WRAPPER` also caches the ~700
   dependency crates across fresh worktree target dirs. Now wired — see
   "sccache for the Rust half" below for how it stays safe on machines that do

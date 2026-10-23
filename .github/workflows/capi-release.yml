@@ -19,9 +19,24 @@ on:
         description: "Manual tag (e.g. v0.1.0) for dry-run / re-upload."
         required: true
         type: string
+  # Also on PRs that change the Linux build environment or the glibc floor,
+  # so a change to either is proven on the real release legs before merge
+  # instead of on the next tag (Linux legs only — see the `plan` job).
+  # Everything that publishes is skipped on
+  # pull_request (see the publish/release job conditions).
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/capi-release.yml"
+      - "capi/Cross.toml"
+      - "ci/cross/**"
+      - "ci/assert-glibc-floor.sh"
+      - "ci/linux-glibc-floor.txt"
 
+# Read-only by default; only the `release` job, which never runs on
+# pull_request, gets write access.
 permissions:
-  contents: write   # required by softprops/action-gh-release
+  contents: read
 
 concurrency:
   group: capi-release-${{ github.ref }}
@@ -32,47 +47,69 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
+  # ── Plan: which legs to build ────────────────────────────────────────
+  # The matrix lives here, not inline in `build-platform`, so it can depend on
+  # the event: tag pushes and dispatches build every leg; pull_request (which
+  # only fires for changes to the Linux build environment, see `on:`) builds
+  # just the Linux legs, since nothing those paths control can affect the
+  # macOS / Windows legs and those are the slowest, coldest builds. A job-level
+  # `if:` cannot see `matrix`, and `exclude` cannot remove `include`-only
+  # entries, hence a job output. Each leg is one JSON object below; the
+  # comments are the reasons each leg looks the way it does.
+  plan:
+    name: Plan build legs
+    runs-on: ubuntu-24.04
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: legs
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # linux-x86_64:
+          #   Linux x64 glibc — also via `cross`, in the pinned ubuntu:24.04 image
+          #   (ci/cross/x86_64-gnu.Dockerfile), NOT natively on the runner: a
+          #   native build takes its glibc floor from the runner image, which
+          #   moved to glibc 2.43 when ubuntu-latest became 26.04. The floor is
+          #   recorded in ci/linux-glibc-floor.txt and asserted after the build.
+          # linux-aarch64:
+          #   Linux aarch64 — cross via `cross`
+          # macos-aarch64:
+          #   NOTE: no macos-x86_64 (x86_64-apple-darwin). ort 2.0.0-rc.12 ships no
+          #   prebuilt ONNX Runtime for that target (its dist manifest bundles ORT
+          #   1.24.2, which Microsoft no longer builds for x86_64 macOS as of ORT
+          #   1.24.1), so ort-sys errors "does not provide prebuilt binaries for the
+          #   target x86_64-apple-darwin". Intel macOS is also EOL and GitHub is
+          #   retiring its x86_64 runners. Dropped rather than carry a red leg —
+          #   matches ts-prebuild.yml, which dropped darwin-x64 for the same reason.
+          #   macOS aarch64 (Apple Silicon). macos-15 (Xcode 16.4): the older
+          #   macos-14 default (Xcode 15.4) ships a libc++ whose std::construct_at
+          #   trips a C++20 aggregate-init bug compiling lbug's bundled C++.
+          # windows-x86_64:
+          #   Windows x86_64
+          legs=$(jq -c -s . <<'EOF'
+          {"os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "cross": true, "archive_suffix": "linux-x86_64"}
+          {"os": "ubuntu-24.04", "target": "aarch64-unknown-linux-gnu", "cross": true, "archive_suffix": "linux-aarch64"}
+          {"os": "macos-15", "target": "aarch64-apple-darwin", "cross": false, "archive_suffix": "macos-aarch64"}
+          {"os": "windows-latest", "target": "x86_64-pc-windows-msvc", "cross": false, "archive_suffix": "windows-x86_64"}
+          EOF
+          )
+          if [ "$EVENT" = pull_request ]; then
+            legs=$(jq -c '[.[] | select(.target | test("linux"))]' <<<"$legs")
+          fi
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+          jq . <<<"$legs"
+
   # ── Build per-platform release tarballs ──────────────────────────────
   build:
     name: Build ${{ matrix.archive_suffix }}
+    needs: plan
     strategy:
       fail-fast: false
+      # Legs and their rationale: the `plan` job above.
       matrix:
-        include:
-          # Linux x86_64 — native runner
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            cross: false
-            archive_suffix: linux-x86_64
-
-          # Linux aarch64 — cross via `cross`
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            archive_suffix: linux-aarch64
-
-          # NOTE: no macos-x86_64 (x86_64-apple-darwin). ort 2.0.0-rc.12 ships no
-          # prebuilt ONNX Runtime for that target (its dist manifest bundles ORT
-          # 1.24.2, which Microsoft no longer builds for x86_64 macOS as of ORT
-          # 1.24.1), so ort-sys errors "does not provide prebuilt binaries for the
-          # target x86_64-apple-darwin". Intel macOS is also EOL and GitHub is
-          # retiring its x86_64 runners. Dropped rather than carry a red leg —
-          # matches ts-prebuild.yml, which dropped darwin-x64 for the same reason.
-
-          # macOS aarch64 (Apple Silicon). macos-15 (Xcode 16.4): the older
-          # macos-14 default (Xcode 15.4) ships a libc++ whose std::construct_at
-          # trips a C++20 aggregate-init bug compiling lbug's bundled C++.
-          - os: macos-15
-            target: aarch64-apple-darwin
-            cross: false
-            archive_suffix: macos-aarch64
-
-          # Windows x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            archive_suffix: windows-x86_64
-
+        include: ${{ fromJSON(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.os }}
     # 150, not 45. The windows-x86_64 leg never reached a real compile before —
     # the wrong-linker bug (see the native build step) killed it ~4 minutes in, so
@@ -91,16 +128,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Install cross for cross-compilation jobs (Linux aarch64).
+      # Install cross for cross-compilation jobs (both Linux legs).
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # Native build deps — mirror ts-prebuild.yml.
-      - name: Install native build deps (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
-
+      # Native build deps — mirror ts-prebuild.yml. None on Linux: both Linux
+      # legs build inside the cross images (ci/cross/*.Dockerfile).
       - name: Install native build deps (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake protobuf
@@ -136,7 +170,8 @@ jobs:
       - name: Cache cargo (capi workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: capi-release-${{ matrix.archive_suffix }}-v2
+          # v3: linux-x86_64 moved from a native runner build to cross.
+          shared-key: capi-release-${{ matrix.archive_suffix }}-v3
           workspaces: capi -> target
           cache-on-failure: true
 
@@ -167,6 +202,9 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF_NAME}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Only names the tarball; the release job never runs on PRs.
+            TAG="pr-${{ github.event.pull_request.number }}"
           else
             TAG="${{ inputs.tag }}"
           fi
@@ -212,17 +250,27 @@ jobs:
         working-directory: capi
         shell: bash
         # Run from capi/ so cross picks up capi/Cross.toml (repo mount via
-        # COGNEE_REPO_ROOT so ../crates path-deps resolve; gcc-11 + libssl image).
-        # cross mounts capi/target at /target. Disable simsimd's advanced ARM SIMD
-        # kernels the cross toolchain can't assemble (basic NEON + serial remain).
+        # COGNEE_REPO_ROOT so ../crates path-deps resolve; the pinned build image
+        # per target, ci/cross/*.Dockerfile). cross mounts capi/target at
+        # /target. On arm64, disable simsimd's advanced ARM SIMD kernels the
+        # cross toolchain can't assemble (basic NEON + serial remain).
         env:
           ORT_CACHE_DIR: /target/ort-cache
           COGNEE_REPO_ROOT: ${{ github.workspace }}
         run: |
-          SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
-          TGT_US=$(echo "${{ matrix.target }}" | tr '-' '_')
-          export CFLAGS_${TGT_US}="$SVE" CXXFLAGS_${TGT_US}="$SVE"
+          if [ "${{ matrix.target }}" = aarch64-unknown-linux-gnu ]; then
+            SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
+            export CFLAGS_aarch64_unknown_linux_gnu="$SVE" CXXFLAGS_aarch64_unknown_linux_gnu="$SVE"
+          fi
           cross build --release --target ${{ matrix.target }}
+
+      # The promised glibc / libstdc++ floor for this target
+      # (ci/linux-glibc-floor.txt), checked on the artifact itself, so a build
+      # image or dependency change that raises it fails here instead of
+      # shipping a library that will not load on older distros.
+      - name: Assert the glibc floor (Linux)
+        if: runner.os == 'Linux'
+        run: bash ci/assert-glibc-floor.sh --target ${{ matrix.target }} capi/target/${{ matrix.target }}/release/libcognee_capi.so
 
       - name: Assemble release tarball
         shell: bash
@@ -243,8 +291,10 @@ jobs:
     runs-on: ubuntu-24.04
     # Attach on a real tag push, or on a manual workflow_dispatch (so a failed
     # release can be re-cut without force-moving the tag — the dispatch input
-    # supplies the tag to attach to).
+    # supplies the tag to attach to). Never on pull_request.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write   # required by softprops/action-gh-release
     steps:
       - name: Checkout
         uses: actions/checkout@v4

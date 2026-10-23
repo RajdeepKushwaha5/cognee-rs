@@ -232,6 +232,7 @@ When you change core crate behavior, check whether the bindings expose it and up
 Parity with Python cognee is verified by the `e2e-cross-sdk/` Docker harness:
 
 ```bash
+bash e2e-cross-sdk/build-rust-binaries.sh   # Rust CLIs, built in the harness base image
 cd e2e-cross-sdk && docker compose up --build
 ```
 

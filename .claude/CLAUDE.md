@@ -130,11 +130,12 @@ The script sources `scripts/lib/common.sh` and runs the workspace tests via `car
 Located in `e2e-cross-sdk/`. Docker-based harness that verifies parity between Python and Rust CLIs.
 
 ```bash
+bash e2e-cross-sdk/build-rust-binaries.sh   # Rust CLIs into dist/, built in the harness base image
 cd e2e-cross-sdk
 docker compose up --build
 ```
 
-**Architecture:** multi-stage Dockerfile packaging a Python cognee venv and the pytest harness. The Rust `cognee-cli` / `cognee-telemetry-emit` release binaries are **not** built in the image — since PR #133 (`4db8bbf3`) they are built on the runner (or by hand locally) and copied in from `cognee-rust/dist/`, so the Dockerfile has no Rust stage and never invokes `cargo`. Tests run in pytest on a tmpfs workspace.
+**Architecture:** multi-stage Dockerfile packaging a Python cognee venv and the pytest harness. The Rust `cognee-cli` / `cognee-telemetry-emit` release binaries are **not** compiled by `docker build` — since PR #133 (`4db8bbf3`) they are built on the runner, for rust-cache, and copied in from `cognee-rust/dist/`. They are, however, compiled *inside* the Dockerfile's `rust-build-env` stage (the harness base image `ARG HARNESS_BASE` plus C/C++ build deps, no sources) with the checkout and toolchain bind-mounted, so they link against the harness's own glibc/libstdc++. Build them with `bash e2e-cross-sdk/build-rust-binaries.sh` — locally too; a plain host `cargo build --release` on a host newer than Debian Trixie produces binaries that fail in the image with `GLIBC_2.xx not found`. Tests run in pytest on a tmpfs workspace.
 
 **Test suites:**
 - `test_add_parity.py` — deterministic checks (no LLM needed): content hash, data/dataset IDs, file content, deduplication, metadata match between SDKs

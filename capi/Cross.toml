@@ -23,3 +23,10 @@ passthrough = [
 
 [target.aarch64-unknown-linux-gnu]
 dockerfile = "../ci/cross/aarch64-gnu.Dockerfile"
+
+# x86_64 builds through cross too, in a pinned ubuntu:24.04 image, so the
+# glibc/libstdc++ floor of the shipped .so comes from that image rather than
+# from whatever the GitHub runner happens to be. See
+# ci/cross/x86_64-gnu.Dockerfile and ci/linux-glibc-floor.txt.
+[target.x86_64-unknown-linux-gnu]
+dockerfile = "../ci/cross/x86_64-gnu.Dockerfile"

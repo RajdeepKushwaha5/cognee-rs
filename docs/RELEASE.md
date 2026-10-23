@@ -86,6 +86,17 @@ Runs behind the **`release` environment** (required reviewers). Order:
      review and release it**, so Maven Central is the one target that is not
      fully automatic. Its version comes solely from `java/pom.xml`, and Central
      releases are immutable: re-deploying an existing version fails.
+
+   All three build both Linux legs through `cross`, in pinned images
+   (`ci/cross/*.Dockerfile`), so the oldest glibc / libstdc++ / libgcc_s the
+   Linux artifacts load on is fixed by those images rather than by the GitHub
+   runner: glibc 2.39 on x86_64 (Ubuntu 24.04; ort's prebuilt ONNX Runtime
+   rules out anything below 2.38) and 2.35 on aarch64 (Ubuntu 22.04).
+   [`ci/linux-glibc-floor.txt`](../ci/linux-glibc-floor.txt) records the
+   promise; every Linux leg asserts it on the artifact before upload, and
+   ci.yml's `capi-check` asserts the x86_64 floor on every PR. Changes to the
+   build environment also run the three workflows on the PR (Linux legs only;
+   nothing publishes from a PR).
 3. **GitHub Release** — created/updated with the changelog section.
 
 `ios.yml` is **not** part of the release. It is a `main`/PR check only — it

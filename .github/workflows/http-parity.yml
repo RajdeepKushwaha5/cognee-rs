@@ -121,7 +121,7 @@ jobs:
           swap-storage: true
           docker-images: true
 
-      # ── Build the Rust binaries HERE, not inside the image ────────────────
+      # ── Build the Rust binaries on the runner, in the harness's base ──────
       # The Dockerfile used to carry a builder stage that recompiled ~741
       # crates on every run — ~34 min of a ~39 min job — because its cargo
       # target dir lived in a `--mount=type=cache` that never survives a fresh
@@ -130,29 +130,31 @@ jobs:
       # Swatinem/rust-cache persist the target dir instead, which is the one
       # caching mechanism this repo has proven works.
       #
+      # But a plain runner build links against the RUNNER's glibc, and the
+      # binaries then run in the harness image: when ubuntu-latest became 26.04
+      # (glibc 2.43) they failed there with `GLIBC_2.43 not found`. So the
+      # compile runs in the Dockerfile's `rust-build-env` stage — the harness
+      # base image plus C/C++ build deps — via
+      # e2e-cross-sdk/build-rust-binaries.sh, the same script developers run
+      # locally. It bind-mounts the checkout, rustup toolchain and cargo home at
+      # their host paths, so the target dir stays on the runner for rust-cache
+      # while glibc and libstdc++ are the harness's own, by construction; then
+      # it checks both binaries load in the bare harness base.
+      #
       # Cold runs (first main run after a toolchain bump) cost about what the
       # in-image build did; warm runs skip nearly all of it.
+      #
+      # The rustup toolchain is installed on the runner and only mounted into
+      # the container. The official Rust toolchain binaries target glibc 2.17,
+      # so they run in any recent Debian.
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install mold linker
-        uses: rui314/setup-mold@v1
-        with:
-          make-default: true
-
-      # cmake + protoc: lbug's bundled Ladybug C++ tree and the prost build.
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
-
-      # Restore-only, shared with ci.yml's lint job (the sole writer). ccache
-      # keys on compiler+flags+source content, so this workspace's resolution
-      # hits the same entries.
-      - name: ccache (lbug bundled C++, restore-only)
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: lbug-cxx
-          max-size: 1G
-          save: false
+      # No ccache step: the C/C++ compile happens in the container, where the
+      # runner's ccache is not installed (scripts/ccache-launcher.sh then
+      # passes straight through) and whose gcc would miss the host-gcc entries
+      # ci.yml writes anyway. The lbug objects are still cached — as part of
+      # the cargo target dir that rust-cache persists.
 
       # Its own key: this is a --release tree, disjoint from the debug caches
       # ci.yml keeps. Main-only save, matching the policy in ci.yml — branches
@@ -161,10 +163,13 @@ jobs:
       # v2 = the tree is now built with CARGO_PROFILE_RELEASE_DEBUG=0 (see the
       # build step). Bumped rather than reused so a debug=0 build can never
       # restore the older line-tables-only tree and thrash against it.
+      # v4 = built inside rust-build-env (the harness's Debian, its gcc and
+      # glibc) instead of on the ubuntu runner; a host-built tree's C/C++
+      # objects must not be restored into it.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cognee-rust -> target
-          shared-key: http-parity-release-v3
+          shared-key: http-parity-release-v4
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache ORT binary
@@ -182,13 +187,13 @@ jobs:
         shell: bash
         run: bash cognee-rust/ci/ort/ensure-cache-usable.sh cognee-rust/target/ort-cache
 
-      - name: Build release binaries
-        working-directory: cognee-rust
+      - name: Build release binaries (in the harness base) and check they load there
         env:
           # ort-sys downloads the ONNX Runtime static library here; keeping it
           # under target/ is what lets the cache above pick it up.
           ORT_CACHE_DIR: ${{ github.workspace }}/cognee-rust/target/ort-cache
           CARGO_INCREMENTAL: "0"
+          CARGO_TERM_COLOR: always
           # Strip debug info for these binaries only. The workspace
           # release profile is `debug = "line-tables-only"`, which is right for
           # shipped artifacts but is a large share of the target dir — and this
@@ -204,31 +209,7 @@ jobs:
           # a harness failure is reproduced by re-running the phase rather than
           # read off a stack trace.
           CARGO_PROFILE_RELEASE_DEBUG: "0"
-        run: |
-          # One invocation for both: separate `cargo build -p X` calls resolve
-          # features per-subgraph and build duplicate variants of shared deps
-          # (that cost 44 min before it was fixed). No `--features` here — the
-          # `bin` and `dev-mock` flags this line used to carry belonged to
-          # cognee-http-server, which has moved out of this repository.
-          cargo build --release \
-            -p cognee-cli \
-            -p cognee-telemetry-emit
-          mkdir -p dist
-          cp target/release/cognee-cli \
-             target/release/cognee-telemetry-emit \
-             dist/
-          ls -la dist/
-          # A real gate: catch a copy that silently did not happen here,
-          # rather than at container start.
-          for b in cognee-cli cognee-telemetry-emit; do
-            test -x "dist/$b" || { echo "error: dist/$b missing or not executable" >&2; exit 1; }
-          done
-          # Informational only. This runs on the runner, so it cannot prove the
-          # harness image provides these libraries — the parity phases below are
-          # what verify that. It is here so a newly-introduced dynamic
-          # dependency is visible in the log instead of surfacing as an opaque
-          # container start failure.
-          ldd dist/cognee-cli
+        run: bash cognee-rust/e2e-cross-sdk/build-rust-binaries.sh
 
       # NOTE on layer caching — measured and rejected, do not re-add blindly.
       #

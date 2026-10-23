@@ -32,6 +32,24 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
+  # Also on PRs that change the Linux build environment or the glibc floor,
+  # so a change to either is proven on the real release legs before merge
+  # instead of on the next tag (Linux legs only — see the `plan` job).
+  # Everything that publishes is skipped on
+  # pull_request (see the publish/release job conditions).
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/java-prebuild.yml"
+      - "bindings/Cross.toml"
+      - "ci/cross/**"
+      - "ci/assert-glibc-floor.sh"
+      - "ci/linux-glibc-floor.txt"
+
+# Least privilege: nothing here writes to the repository. Publishing
+# authenticates to npm / Maven Central with its own secrets, not GITHUB_TOKEN.
+permissions:
+  contents: read
 
 concurrency:
   group: java-prebuild-${{ github.ref }}
@@ -43,6 +61,54 @@ env:
   CCACHE_COMPILERCHECK: content
 
 jobs:
+  # ── Plan: which legs to build ────────────────────────────────────────
+  # The matrix lives here, not inline in `build-platform`, so it can depend on
+  # the event: tag pushes and dispatches build every leg; pull_request (which
+  # only fires for changes to the Linux build environment, see `on:`) builds
+  # just the Linux legs, since nothing those paths control can affect the
+  # macOS / Windows legs and those are the slowest, coldest builds. A job-level
+  # `if:` cannot see `matrix`, and `exclude` cannot remove `include`-only
+  # entries, hence a job output. Each leg is one JSON object below; the
+  # comments are the reasons each leg looks the way it does.
+  plan:
+    name: Plan build legs
+    runs-on: ubuntu-24.04
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: legs
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # linux-x64-gnu:
+          #   Linux x64 glibc — also via `cross`, in the pinned ubuntu:24.04 image
+          #   (ci/cross/x86_64-gnu.Dockerfile), NOT natively on the runner: a
+          #   native build takes its glibc floor from the runner image, which
+          #   moved to glibc 2.43 when ubuntu-latest became 26.04. The floor is
+          #   recorded in ci/linux-glibc-floor.txt and asserted after the build.
+          # linux-arm64-gnu:
+          #   Linux arm64 glibc — cross via `cross`
+          # darwin-arm64:
+          #   macOS arm64 (Apple Silicon). Use macos-15 (default Xcode 16.4):
+          #   the older macos-14 default (Xcode 15.4) ships a libc++ whose
+          #   std::construct_at trips a C++20 aggregate-init bug while compiling
+          #   lbug's bundled C++ (needs Clang 16+ / P0960 support).
+          # win32-x64-msvc:
+          #   Windows x64
+          legs=$(jq -c -s . <<'EOF'
+          {"platform": "linux-x64-gnu", "runner": "ubuntu-24.04", "rust-target": "x86_64-unknown-linux-gnu", "cross": true, "classifier": "linux-x86_64", "libfile": "libcognee_java.so"}
+          {"platform": "linux-arm64-gnu", "runner": "ubuntu-24.04", "rust-target": "aarch64-unknown-linux-gnu", "cross": true, "classifier": "linux-aarch_64", "libfile": "libcognee_java.so"}
+          {"platform": "darwin-arm64", "runner": "macos-15", "rust-target": "aarch64-apple-darwin", "cross": false, "classifier": "osx-aarch_64", "libfile": "libcognee_java.dylib"}
+          {"platform": "win32-x64-msvc", "runner": "windows-latest", "rust-target": "x86_64-pc-windows-msvc", "cross": false, "classifier": "windows-x86_64", "libfile": "cognee_java.dll"}
+          EOF
+          )
+          if [ "$EVENT" = pull_request ]; then
+            legs=$(jq -c '[.[] | select(.["rust-target"] | test("linux"))]' <<<"$legs")
+          fi
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+          jq . <<<"$legs"
+
   build-platform:
     name: Build ${{ matrix.platform }}
     # Cap each leg so a stuck build (e.g. a hung native compile) fails fast
@@ -52,45 +118,12 @@ jobs:
     # cancelled at ~91m while still legitimately compiling, so the four-jar gate
     # correctly withheld the Maven Central bundle. See ts-prebuild.yml for detail.
     timeout-minutes: 150
+    needs: plan
     strategy:
       fail-fast: false
+      # Legs and their rationale: the `plan` job above.
       matrix:
-        include:
-          # Linux x64 glibc — native runner
-          - platform: linux-x64-gnu
-            runner: ubuntu-24.04
-            rust-target: x86_64-unknown-linux-gnu
-            cross: false
-            classifier: linux-x86_64
-            libfile: libcognee_java.so
-
-          # Linux arm64 glibc — cross via `cross`
-          - platform: linux-arm64-gnu
-            runner: ubuntu-24.04
-            rust-target: aarch64-unknown-linux-gnu
-            cross: true
-            classifier: linux-aarch_64
-            libfile: libcognee_java.so
-
-          # macOS arm64 (Apple Silicon). Use macos-15 (default Xcode 16.4):
-          # the older macos-14 default (Xcode 15.4) ships a libc++ whose
-          # std::construct_at trips a C++20 aggregate-init bug while compiling
-          # lbug's bundled C++ (needs Clang 16+ / P0960 support).
-          - platform: darwin-arm64
-            runner: macos-15
-            rust-target: aarch64-apple-darwin
-            cross: false
-            classifier: osx-aarch_64
-            libfile: libcognee_java.dylib
-
-          # Windows x64
-          - platform: win32-x64-msvc
-            runner: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            cross: false
-            classifier: windows-x86_64
-            libfile: cognee_java.dll
-
+        include: ${{ fromJSON(needs.plan.outputs.legs) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -107,17 +140,9 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # mold linker (Linux only, native builds only).
-      - name: Install mold linker
-        if: runner.os == 'Linux' && !matrix.cross
-        uses: rui314/setup-mold@v1
-        with:
-          make-default: true
-
-      # cmake + protoc needed by lbug and qdrant on Linux.
-      - name: Install native build deps (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake protobuf-compiler
+      # No Linux native-deps / mold steps: both Linux legs build inside the
+      # cross images (ci/cross/*.Dockerfile), which carry cmake, protoc and the
+      # compilers themselves.
 
       # cmake + protoc on macOS.
       - name: Install native build deps (macOS)
@@ -165,8 +190,10 @@ jobs:
           echo "CFLAGS_x86_64_pc_windows_msvc=/MD" >> "$GITHUB_ENV"
           echo "CXXFLAGS_x86_64_pc_windows_msvc=/MD" >> "$GITHUB_ENV"
 
-      - name: ccache (lbug bundled C++, restore-only)
-        if: runner.os != 'Windows'
+      # macOS only: the Linux legs compile in cross containers, which cannot
+      # see the runner's ccache (scripts/ccache-launcher.sh passes through).
+      - name: ccache (lbug bundled C++)
+        if: runner.os == 'macOS'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: java-lbug-cxx-${{ matrix.platform }}
@@ -178,7 +205,8 @@ jobs:
       - name: Cache cargo (bindings workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: java-jni-${{ matrix.platform }}-v2
+          # v3: linux-x64-gnu moved from a native runner build to cross.
+          shared-key: java-jni-${{ matrix.platform }}-v3
           workspaces: bindings -> target
           cache-on-failure: true
 
@@ -242,18 +270,27 @@ jobs:
         working-directory: bindings
         # bindings/Cross.toml mounts the whole repo (volumes=COGNEE_REPO_ROOT)
         # so the workspace's ../ts, ../java and ../crates path-deps resolve in
-        # the container, and selects a gcc-11 image for the arm64 target (lbug
-        # needs C++20 / libstdc++ 11). cross mounts the workspace target at
-        # /target. Disable simsimd's advanced ARM SIMD kernels (SVE / NEON-bf16)
-        # the cross toolchain can't assemble.
+        # the container, and selects the pinned build image per target
+        # (ci/cross/*.Dockerfile). cross mounts the workspace target at
+        # /target. On arm64, disable simsimd's advanced ARM SIMD kernels (SVE /
+        # NEON-bf16) the cross toolchain can't assemble.
         env:
           ORT_CACHE_DIR: /target/ort-cache
           COGNEE_REPO_ROOT: ${{ github.workspace }}
         run: |
-          SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
-          TGT_US=$(echo "${{ matrix.rust-target }}" | tr '-' '_')
-          export CFLAGS_${TGT_US}="$SVE" CXXFLAGS_${TGT_US}="$SVE"
+          if [ "${{ matrix.rust-target }}" = aarch64-unknown-linux-gnu ]; then
+            SVE="-DSIMSIMD_TARGET_NEON_I8=0 -DSIMSIMD_TARGET_NEON_F16=0 -DSIMSIMD_TARGET_NEON_BF16=0 -DSIMSIMD_TARGET_SVE=0 -DSIMSIMD_TARGET_SVE_I8=0 -DSIMSIMD_TARGET_SVE_F16=0 -DSIMSIMD_TARGET_SVE_BF16=0 -DSIMSIMD_TARGET_SVE2=0"
+            export CFLAGS_aarch64_unknown_linux_gnu="$SVE" CXXFLAGS_aarch64_unknown_linux_gnu="$SVE"
+          fi
           cross build --release -p cognee-java-jni --target ${{ matrix.rust-target }}
+
+      # The promised glibc / libstdc++ floor for this target
+      # (ci/linux-glibc-floor.txt), checked on the artifact itself, so a build
+      # image or dependency change that raises it fails here instead of
+      # shipping a library that will not load on older distros.
+      - name: Assert the glibc floor (Linux)
+        if: runner.os == 'Linux'
+        run: bash ci/assert-glibc-floor.sh --target ${{ matrix.rust-target }} bindings/target/${{ matrix.rust-target }}/release/${{ matrix.libfile }}
 
       - name: Stage native lib and pack classifier jar
         shell: bash
@@ -303,7 +340,9 @@ jobs:
   publish:
     name: Publish to Maven Central
     needs: [build-platform, check-token]
-    if: ${{ needs.check-token.outputs.has_token == 'true' }}
+    # Never on pull_request: PR runs (path-filtered, see `on:`) only prove the
+    # build legs.
+    if: ${{ github.event_name != 'pull_request' && needs.check-token.outputs.has_token == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

@@ -116,6 +116,10 @@ jobs:
       - name: rustfmt (check)
         run: cargo fmt --all -- --check
 
+      # Mirrors ci.yml's lint step of the same name (see the comment there).
+      - name: Self-test the glibc floor assertion
+        run: bash ci/assert-glibc-floor.test.sh
+
       - name: Compilation check
         run: cargo check --all-targets
 

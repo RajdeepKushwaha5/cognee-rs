@@ -5,32 +5,64 @@
 #
 #   docker build -f cognee-rust/e2e-cross-sdk/Dockerfile .
 
-# ─── Stage 1: prebuilt Rust binaries (built on the runner, not here) ────────
+# The harness runtime image. It is also the base of the `rust-build-env` stage
+# the Rust binaries are compiled in, which is what makes them run here: they
+# are linked against this exact glibc and libstdc++, by construction. Change it
+# in this one place; .github/workflows/http-parity.yml reads it from this line.
+ARG HARNESS_BASE=python:3.12-slim-trixie
+
+# ─── Stage 1: Rust build environment (binaries are built OUTSIDE the image) ─
 #
 # The Rust CLI and telemetry binaries used to be compiled by a builder stage in
-# this file. They are now built on the CI runner and copied in from
-# cognee-rust/dist/ — see .github/workflows/http-parity.yml.
-#
-# Why: the builder stage recompiled ~741 crates on every run (~34 min of a
-# ~39 min job). Its cargo target dir lived in a `--mount=type=cache`, which
+# this file. That stage recompiled ~741 crates on every run (~34 min of a
+# ~39 min job): its cargo target dir lived in a `--mount=type=cache`, which
 # never survives a fresh runner, and BuildKit layer caching was measured
-# producing ZERO reuse here even at an identical commit — so nothing carried
-# over between runs. Building on the runner instead lets Swatinem/rust-cache
-# persist the target dir, which is machinery this repo has proven works.
+# producing ZERO reuse here even at an identical commit. So #133 moved the
+# build onto the runner, where Swatinem/rust-cache persists the target dir.
 #
-# Portability: the runner builds on ubuntu-24.04 (glibc 2.39, ort-sys needs
-# >= 2.38) and the harness below runs Debian Trixie (glibc 2.41). Old -> new is
-# the compatible direction for both glibc and libstdc++ (lbug's bundled C++).
-# There is no OpenSSL to satisfy: reqwest is `default-features = false` with
-# `rustls-tls`, and the resolved graph for these three binaries contains no
-# openssl-sys or native-tls.
+# That made the binaries' glibc whatever the runner image ships, and on
+# 2026-10-22 ubuntu-latest became 26.04 (glibc 2.43): the binaries then failed
+# in this Trixie (glibc 2.41) image with `GLIBC_2.43 not found`.
 #
-# To build the image outside CI, produce the binaries first — run these from
-# the cognee-rust repo root, so they land in cognee-rust/dist/ as the COPYs
-# below expect (the build context is the monorepo root above it):
-#   cargo build --release -p cognee-cli -p cognee-telemetry-emit
-#   mkdir -p dist && cp target/release/cognee-cli \
-#     target/release/cognee-telemetry-emit dist/
+# This stage keeps both properties. It is only the *toolchain environment* —
+# HARNESS_BASE plus the C/C++ build deps — and holds no sources and no Rust
+# toolchain. e2e-cross-sdk/build-rust-binaries.sh (run by CI and by hand alike)
+# builds just this target, then runs `cargo build` in it with the checkout,
+# rustup toolchain and cargo home bind-mounted at their host paths. The target dir therefore stays on the runner (rust-cache still works,
+# and the absolute paths in its fingerprints match run to run), while the
+# compile and link happen against the harness's own glibc and libstdc++.
+#
+# What this relies on in HARNESS_BASE: Debian-based (apt), and glibc >= 2.38,
+# which ort-sys's prebuilt x86_64 libonnxruntime.a needs (__isoc23_strtol &
+# co.).
+#
+# There is no OpenSSL to satisfy at runtime: reqwest is
+# `default-features = false` with `rustls-tls`, and the binaries link no
+# openssl. openssl-sys IS in the build graph, though — only as a
+# build-dependency of ort-sys (its download script uses ureq + native-tls) —
+# so the build env needs libssl-dev, which the ubuntu runner had preinstalled.
+#
+# To build the image outside CI, produce the binaries first, the same way CI
+# does — from the cognee-rust repo root:
+#   bash e2e-cross-sdk/build-rust-binaries.sh
+# It leaves them in cognee-rust/dist/, where the COPYs below expect them (the
+# image's build context is the monorepo root above), and checks they load in
+# HARNESS_BASE. Do not substitute a host `cargo build --release`: it links
+# against the host's glibc, and on any host newer than HARNESS_BASE the
+# binaries fail to start in this image ("GLIBC_2.xx not found").
+FROM ${HARNESS_BASE} AS rust-build-env
+
+# build-essential: gcc/g++ + libc6-dev, i.e. the glibc and libstdc++ the
+# binaries link against. cmake: lbug's bundled C++ tree. protobuf-compiler +
+# libprotobuf-dev: prost (lance-encoding imports google/protobuf/*.proto,
+# which only libprotobuf-dev ships). pkg-config + libssl-dev: ort-sys's
+# build script (see the OpenSSL note above). git: cargo git dependencies.
+# No mold: since Rust 1.90, x86_64-unknown-linux-gnu links with the
+# toolchain's own rust-lld, so the system linker is not on the Rust link path.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake protobuf-compiler libprotobuf-dev pkg-config git \
+    libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 
 # ─── Stage 2: Python CLI builder ────────────────────────────────────────────
@@ -96,12 +128,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 # ─── Stage 3: Test harness ──────────────────────────────────────────────────
-# Trixie (glibc 2.41) runs the runner-built binaries, which link against
-# ubuntu-24.04's glibc 2.39 — see the stage-1 note.
-FROM python:3.12-slim-trixie AS harness
+# Same base as `rust-build-env`, so the prebuilt binaries COPYd below were
+# linked against this image's glibc and libstdc++ — see the stage-1 note.
+FROM ${HARNESS_BASE} AS harness
 
-# curl/ca-certificates are for the ONNX model fetch below; they used to come
-# from the deleted rust-builder stage.
+# curl/ca-certificates are for the ONNX model fetch below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -111,8 +142,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY cognee-rust/dist/cognee-cli /usr/local/bin/cognee-cli-rust
 COPY cognee-rust/dist/cognee-telemetry-emit /usr/local/bin/cognee-telemetry-emit
 
-# ONNX embedding models (needed by the Rust CLI for cognify). Fetched here
-# rather than in the deleted builder stage; ~30 MB, a few seconds.
+# ONNX embedding models (needed by the Rust CLI for cognify). ~30 MB, a few
+# seconds.
 # --retry: these are build-time network fetches, so a transient DNS hiccup or
 # 5xx from the CDN would otherwise fail the whole image build.
 RUN mkdir -p /opt/models \

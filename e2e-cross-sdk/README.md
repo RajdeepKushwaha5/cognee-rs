@@ -14,7 +14,8 @@ SDKs by driving both CLIs and comparing the databases they produce.
 ## Architecture
 
 A multi-stage Dockerfile packages the Rust `cognee-cli` release binary (built
-on the runner, copied in from `cognee-rust/dist/`), a Python cognee venv and
+on the runner inside the Dockerfile's `rust-build-env` stage — the harness's
+own base image — and copied in from `cognee-rust/dist/`), a Python cognee venv and
 this pytest harness into one image. Each test shells out to both CLIs in
 isolated tmpfs workspaces and compares the resulting SQLite state.
 
@@ -24,10 +25,13 @@ isolated tmpfs workspaces and compares the resulting SQLite state.
 cd cognee-rust/e2e-cross-sdk
 touch ../.env                         # stub required by docker-compose env_file
 
-# Build the binaries the image expects, from the cognee-rust repo root:
-#   cargo build --release -p cognee-cli -p cognee-telemetry-emit
-#   mkdir -p dist && cp target/release/cognee-cli \
-#     target/release/cognee-telemetry-emit dist/
+# Build the binaries the image expects, from the cognee-rust repo root —
+# in the harness's own base image, exactly as CI does (needs docker and a
+# stock rustup install; see the script header):
+#   bash e2e-cross-sdk/build-rust-binaries.sh
+# Not a plain host `cargo build --release`: that links against the host's
+# glibc, and the binaries fail to start in the harness (Debian Trixie,
+# glibc 2.41) on any newer host.
 
 # Telemetry parity (no LLM):
 docker compose -f docker-compose.yml run --rm e2e-telemetry

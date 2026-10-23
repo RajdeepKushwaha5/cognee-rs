@@ -7,7 +7,10 @@
 # CMake toolchain file (cross points CMAKE_TOOLCHAIN_FILE at /opt/toolchain.cmake).
 #
 # Note: binaries produced here require glibc >= 2.35 on the target (Ubuntu
-# 22.04 / Debian 12 era).
+# 22.04 / Debian 12 era). That floor is recorded in ci/linux-glibc-floor.txt
+# and asserted on every shipped artifact by ci/assert-glibc-floor.sh; changing
+# this base image means updating both. The x86_64 counterpart is
+# x86_64-gnu.Dockerfile.
 FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main AS crossbase
 
 FROM ubuntu:22.04

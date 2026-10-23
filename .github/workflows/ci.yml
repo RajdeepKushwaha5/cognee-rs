@@ -203,10 +203,17 @@ jobs:
 
       # Sub-second path-contract check for the bindings/ workspace. Lives in the
       # lint job rather than its own, because ts-prebuild.yml and
-      # java-prebuild.yml never run on PRs and a dedicated job would cost a
-      # runner to assert a handful of paths.
+      # java-prebuild.yml run on PRs only when their build environment changes
+      # and a dedicated job would cost a runner to assert a handful of paths.
       - name: Check bindings layout contract
         run: bash ci/assert-bindings-layout.sh
+
+      # Self-test of the glibc-floor assertion the Linux prebuild legs run on
+      # their artifacts. Those legs only run on PRs that touch their build
+      # environment, so without this a broken script or floor file would
+      # first show up on a release tag. Sub-second; mirrored in community.yml.
+      - name: Self-test the glibc floor assertion
+        run: bash ci/assert-glibc-floor.test.sh
 
       - name: Compilation check
         run: cargo check --all-targets
@@ -1514,6 +1521,19 @@ jobs:
         env:
           ORT_CACHE_DIR: ${{ github.workspace }}/capi/target/ort-cache
         run: bash capi/scripts/check.sh
+
+      # The x86_64 glibc floor (ci/linux-glibc-floor.txt), on every PR. The
+      # release legs that enforce it on shipped artifacts only run on tags and
+      # on PRs touching their build environment, so a dependency bump that
+      # starts importing a newer glibc/libstdc++ symbol would otherwise first
+      # fail at release time. This job already links the full-stack C API
+      # cdylib (the same dependency graph as the Neon and JNI libraries) on
+      # ubuntu-24.04 — glibc 2.39, GCC 13, the same distro as the pinned
+      # x86_64 release image — so checking it costs under a second and no
+      # extra build. (It is a debug build, whose imports can differ marginally
+      # from release; a dependency that newly needs a symbol shows up in both.)
+      - name: Assert the x86_64 glibc floor on the C API build
+        run: bash ci/assert-glibc-floor.sh --target x86_64-unknown-linux-gnu capi/target/debug/libcognee_capi.so
 
   python-check:
     name: Python Bindings Check (${{ matrix.python-version }})
