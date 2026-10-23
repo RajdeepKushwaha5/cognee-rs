@@ -145,6 +145,11 @@ rand = "0.8"
 rayon = "1.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json", "stream", "multipart"] }
+# Floors only, never imported: reqwest's rustls-tls compiles these roots into
+# every binary, and Cargo.lock is not committed, so without a floor a build can
+# still resolve roots that trust the revoked eMudhra intermediates (SDK-1218).
+rustls-webpki = ">=0.103.16, <0.104"
+webpki-roots = ">=1.0.10, <2"
 scraper = "0.21"
 # `preserve_order` makes `schemars::Map` an `IndexMap`, so a generated schema
 # lists properties in DECLARATION order instead of alphabetically. That is not
