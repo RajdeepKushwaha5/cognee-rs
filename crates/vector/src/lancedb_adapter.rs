@@ -44,6 +44,10 @@ use crate::models::{
 use crate::vector_db_trait::VectorDB;
 use crate::zero_norm::{warn_zero_norm_points, warn_zero_norm_query};
 
+/// Ids per `id IN (...)` predicate in [`VectorDB::score_by_ids`] (Python's
+/// `LanceDBAdapter.SCORE_ID_BATCH_SIZE`).
+const SCORE_ID_BATCH: usize = 1000;
+
 fn collection_name(data_type: &str, field_name: &str) -> String {
     format!("{data_type}_{field_name}")
 }
@@ -151,12 +155,13 @@ fn points_to_batch(
     .map_err(|e| VectorDBError::StorageError(format!("record batch build: {e}")))
 }
 
-/// `id IN (X'…', …)` over the points' UUID bytes, as SQL hex literals.
-fn id_predicate(points: &[VectorPoint]) -> String {
-    let id_values: Vec<String> = points
-        .iter()
-        .map(|p| {
-            let hex: String = p.id.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
+/// `id IN (X'…', …)` over the ids' UUID bytes, as SQL hex literals. The one
+/// place every id-scoped read, write and delete builds its predicate.
+fn id_predicate<'a>(ids: impl IntoIterator<Item = &'a Uuid>) -> String {
+    let id_values: Vec<String> = ids
+        .into_iter()
+        .map(|id| {
+            let hex: String = id.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
             format!("X'{hex}'")
         })
         .collect();
@@ -328,7 +333,7 @@ impl LanceDbAdapter {
         validate_points(&name, dimension, &points)?;
 
         // Upsert by id so re-indexing existing points replaces them.
-        let predicate = id_predicate(&points);
+        let predicate = id_predicate(points.iter().map(|p| &p.id));
 
         // Read the membership of any existing rows we're about to replace, then
         // union it into the incoming points. Point IDs are content-addressed, so
@@ -493,7 +498,7 @@ impl VectorDB for LanceDbAdapter {
         // still keeps a repeated id from landing as two physical rows.
         let points = dedup_points_by_id_last_wins_cow(points);
         validate_points(&name, dimension, &points)?;
-        let predicate = id_predicate(&points);
+        let predicate = id_predicate(points.iter().map(|p| &p.id));
         table
             .delete(predicate.as_str())
             .await
@@ -564,14 +569,7 @@ impl VectorDB for LanceDbAdapter {
         };
         // Same hex-literal `id IN (X'..', ...)` predicate the writer path
         // (index_points / delete_points) builds.
-        let id_values: Vec<String> = ids
-            .iter()
-            .map(|id| {
-                let hex: String = id.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
-                format!("X'{hex}'")
-            })
-            .collect();
-        let predicate = format!("id IN ({})", id_values.join(", "));
+        let predicate = id_predicate(ids);
         let stream = table
             .query()
             .only_if(predicate)
@@ -592,6 +590,46 @@ impl VectorDB for LanceDbAdapter {
                 metadata,
             })
             .collect())
+    }
+
+    async fn score_by_ids(
+        &self,
+        data_type: &str,
+        field_name: &str,
+        ids: &[Uuid],
+        query_vector: &[f32],
+    ) -> VectorDBResult<Option<Vec<SearchResult>>> {
+        if ids.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let name = collection_name(data_type, field_name);
+        warn_zero_norm_query("lancedb", &name, query_vector);
+        let table = match self.connection.open_table(&name).execute().await {
+            Ok(t) => t,
+            Err(lancedb::Error::TableNotFound { .. }) => return Ok(Some(vec![])),
+            Err(other) => return Err(map_lance_err(other)),
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        // Bounded `id IN (...)` predicates, as Python's `SCORE_ID_BATCH_SIZE`.
+        for chunk in ids.chunks(SCORE_ID_BATCH) {
+            // Prefilter (the vector-query default) and bypass the ANN index, so
+            // an indexed table still scores every requested row, including
+            // neighbours far from the query.
+            let stream = table
+                .query()
+                .only_if(id_predicate(chunk))
+                .nearest_to(query_vector)
+                .map_err(map_lance_err)?
+                .distance_type(DistanceType::Cosine)
+                .bypass_vector_index()
+                .limit(chunk.len())
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            out.extend(search_results_from_batches(batches)?);
+        }
+        Ok(Some(out))
     }
 
     async fn delete_collection(&self, data_type: &str, field_name: &str) -> VectorDBResult<()> {
@@ -627,14 +665,7 @@ impl VectorDB for LanceDbAdapter {
                 }
                 other => map_lance_err(other),
             })?;
-        let id_values: Vec<String> = point_ids
-            .iter()
-            .map(|id| {
-                let hex: String = id.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
-                format!("X'{hex}'")
-            })
-            .collect();
-        let predicate = format!("id IN ({})", id_values.join(", "));
+        let predicate = id_predicate(point_ids);
         table
             .delete(predicate.as_str())
             .await
@@ -1061,6 +1092,47 @@ mod tests {
         }
         let r1 = results.iter().find(|r| r.id == id1).unwrap();
         assert_eq!(r1.metadata.get("kind").unwrap(), &json!("a"));
+    }
+
+    /// Scores every requested row, including one far from the query, and
+    /// returns `search_similar`'s similarity scale.
+    #[tokio::test]
+    async fn score_by_ids_scores_requested_rows_only() {
+        let (adapter, _dir) = fresh_adapter().await;
+        adapter.create_collection("Chunk", "text", 2).await.unwrap();
+        let near = Uuid::new_v4();
+        let far = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        adapter
+            .index_points(
+                "Chunk",
+                "text",
+                &[
+                    point(near, vec![0.6, 0.8], "a"),
+                    point(far, vec![-1.0, 0.0], "b"),
+                    point(other, vec![1.0, 0.0], "c"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let scored = adapter
+            .score_by_ids("Chunk", "text", &[near, far, Uuid::new_v4()], &[1.0, 0.0])
+            .await
+            .unwrap()
+            .unwrap();
+        let by_id: std::collections::HashMap<Uuid, f32> =
+            scored.iter().map(|r| (r.id, r.score)).collect();
+        assert_eq!(by_id.len(), 2, "{by_id:?}");
+        assert!((by_id[&near] - 0.6).abs() < 1e-3, "{by_id:?}");
+        assert!((by_id[&far] + 1.0).abs() < 1e-3, "{by_id:?}");
+
+        let missing = adapter
+            .score_by_ids("Nope", "text", &[near], &[1.0, 0.0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]
