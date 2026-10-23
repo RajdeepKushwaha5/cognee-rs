@@ -147,6 +147,24 @@ async fn search_emits_pgvector_span() {
         Some("DocumentChunk_text"),
     );
     assert!(s.field_i64("cognee.vector.result_count").unwrap_or(0) >= 1);
+    // One row against top_k = 5: whatever plan answered, it was short, so the
+    // exact fallback answered and the span must say so — that count is how a
+    // full-scan latency regression gets attributed.
+    assert_eq!(s.field_i64("cognee.vector.exact_fallbacks"), Some(1));
+
+    // A full answer records an explicit zero, so "no fallback" is
+    // distinguishable from "not instrumented".
+    let capture = SpanCapture::install();
+    adapter
+        .search_similar("DocumentChunk", "text", &[0.1, 0.2, 0.3, 0.4], 1)
+        .await
+        .expect("search");
+    let spans = capture.spans();
+    let s = spans
+        .iter()
+        .find(|s| s.name == "cognee.db.vector.search")
+        .expect("expected search span");
+    assert_eq!(s.field_i64("cognee.vector.exact_fallbacks"), Some(0));
 }
 
 #[tokio::test]

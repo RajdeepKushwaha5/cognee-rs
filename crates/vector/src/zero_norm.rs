@@ -7,7 +7,7 @@
 //! | backend       | zero-norm row                                   |
 //! |---------------|-------------------------------------------------|
 //! | LanceDB       | distance is `NaN`; `KNNVectorDistanceExec` filters `NaN` rows out, so the row is read from storage and silently discarded |
-//! | pgvector      | `vector <=> $1` yields `NaN` for a zero operand, so the row sorts and scores unusably |
+//! | pgvector      | the cosine HNSW index does not store a zero-norm row, so a search the index answers in full never returns it; an exact scan — a collection too small for the planner to use the index, a bulk load, or the fallback for an index answer short of `top_k` — returns it last with a `NaN` score, because `vector <=> $1` yields `NaN` for a zero operand |
 //! | brute-force   | `cosine_similarity` clamps the denominator with `max(f32::EPSILON)`, so the row survives with score `0.0` and ranks last |
 //! | MockVectorDB  | returns `0.0` when either magnitude is zero — same last-place ranking as brute-force |
 //!
@@ -76,7 +76,9 @@ pub(crate) fn warn_zero_norm_points(backend: &str, collection: &str, points: &[V
         total_points = points.len(),
         sample_ids = %sample.join(", "),
         "indexing zero-norm embedding vectors — cosine similarity is undefined for these, so \
-         they are dropped from KNN results on LanceDB/pgvector and ranked last on brute-force; \
+         they are dropped from KNN results on LanceDB, left out of pgvector's HNSW index (an \
+         exact pgvector scan returns them last with a NaN score) and ranked last on \
+         brute-force; \
          usual cause is empty or whitespace-only input text, or MOCK_EMBEDDING=zero"
     );
 }
@@ -84,7 +86,9 @@ pub(crate) fn warn_zero_norm_points(backend: &str, collection: &str, points: &[V
 /// Warn if a query vector is zero-norm.
 ///
 /// A zero-norm query cannot rank anything, so the search returns nothing
-/// useful regardless of what the collection holds — the single most confusing
+/// useful regardless of what the collection holds — nothing at all on LanceDB,
+/// and on pgvector up to `top_k` rows in no meaningful order, every one scored
+/// `NaN` (the HNSW scan and the exact scan alike; measured on pgvector 0.8.7) — the single most confusing
 /// version of this failure, because the data is fine and the query is at fault.
 pub(crate) fn warn_zero_norm_query(backend: &str, collection: &str, query_vector: &[f32]) {
     if !is_zero_norm(query_vector) {
@@ -94,7 +98,8 @@ pub(crate) fn warn_zero_norm_query(backend: &str, collection: &str, query_vector
         backend,
         collection,
         "zero-norm query vector — cosine similarity is undefined, so this search cannot rank \
-         any row and will return nothing (LanceDB/pgvector) or an arbitrary order (brute-force); \
+         any row and will return nothing (LanceDB), NaN-scored rows in no meaningful order \
+         (pgvector) or an arbitrary order (brute-force); \
          usual cause is an empty or whitespace-only query string, or MOCK_EMBEDDING=zero"
     );
 }
