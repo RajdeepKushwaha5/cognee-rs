@@ -25,7 +25,7 @@ pub fn py_to_arc(obj: &Bound<'_, PyAny>) -> Arc<dyn Value> {
 ///
 /// If the value is a `PyValue` (originated from Python), unwrap it directly.
 /// Otherwise, attempt to convert common Rust types to Python equivalents.
-pub fn arc_to_py(py: Python<'_>, val: &Arc<dyn Value>) -> PyResult<PyObject> {
+pub fn arc_to_py(py: Python<'_>, val: &Arc<dyn Value>) -> PyResult<Py<PyAny>> {
     let any = (**val).as_any();
 
     // Fast path: unwrap PyValue back to the original Python object.
@@ -59,8 +59,8 @@ pub fn arc_to_py(py: Python<'_>, val: &Arc<dyn Value>) -> PyResult<PyObject> {
 }
 
 /// Convert a `Vec<Arc<dyn Value>>` to a Python list.
-pub fn results_to_py(py: Python<'_>, values: &[Arc<dyn Value>]) -> PyResult<PyObject> {
-    let items: Vec<PyObject> = values
+pub fn results_to_py(py: Python<'_>, values: &[Arc<dyn Value>]) -> PyResult<Py<PyAny>> {
+    let items: Vec<Py<PyAny>> = values
         .iter()
         .map(|v| arc_to_py(py, v))
         .collect::<PyResult<_>>()?;

@@ -32,23 +32,27 @@ env:
   CARGO_INCREMENTAL: "0"
   ORT_CACHE_DIR: ${{ github.workspace }}/target/ort-cache
   CCACHE_COMPILERCHECK: content
-  # Pin the interpreter pyo3-build-config resolves. Without this it probes
-  # whatever `python3` the image ships (3.14 on ubuntu-26.04, newer than PyO3
-  # 0.23 supports), and it caches that result in OUT_DIR, re-resolving only
-  # when a PYO3_* variable changes, so a rust-cache saved on one image can
-  # carry a stale interpreter into another. python3.12 is noble's system
-  # Python. maturin-driven jobs set their own PYO3_PYTHON and are unaffected.
-  PYO3_PYTHON: python3.12
+  # No workflow-wide PYO3_PYTHON pin: PyO3 0.29 supports CPython 3.8-3.15, so
+  # pyo3-build-config accepts whatever `python3` the runner image ships (3.12
+  # on 24.04, 3.14 on 26.04). Do not reintroduce a versioned pin such as
+  # `python3.12` — it names an interpreter that only some images have, which
+  # is exactly the coupling to the image that broke main on 2026-10-22. The
+  # crate is never linked against libpython or executed by cargo (python/
+  # Cargo.toml disables every harness target), so the interpreter only feeds
+  # `Py_3_x` cfgs into `cargo check`/`clippy`; maturin-driven jobs set their
+  # own PYO3_PYTHON.
 
 jobs:
   # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
-  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
-  # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
-  # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
-  # changes every `runs-on:` / matrix runner under .github/workflows/ at once,
-  # updates PYO3_PYTHON above (python3.12 does not exist on 26.04), and bumps
-  # every rust-cache shared-key (the key does not include the image, so a
-  # target dir built on the old image would otherwise be restored on the new).
+  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than the
+  # PyO3 0.23 we had then supported) and glibc 2.43 (binaries built on it no
+  # longer ran in the Debian e2e harness image). The Python coupling is gone
+  # (PyO3 0.29 supports 3.8-3.15, and PYO3_PYTHON is no longer pinned above);
+  # the glibc one still holds for every binary built natively on the runner.
+  # Move off 24.04 deliberately, in one PR that changes every
+  # `runs-on:` / matrix runner under .github/workflows/ at once and bumps every
+  # rust-cache shared-key (the key does not include the image, so a target dir
+  # built on the old image would otherwise be restored on the new).
   # ── Lint: fmt + check + clippy (no secrets) ───────────────────────────
   lint:
     name: Lint (fmt + check + clippy)

@@ -41,7 +41,7 @@ pub fn py_sdk_add<'py>(
         let result = pipeline::add(&handle, inputs_json, &dataset, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -59,7 +59,7 @@ pub fn py_sdk_cognify<'py>(
         let result = pipeline::cognify(&handle, &dataset, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -79,7 +79,7 @@ pub fn py_sdk_add_and_cognify<'py>(
         let result = pipeline::add_and_cognify(&handle, inputs_json, &dataset, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 

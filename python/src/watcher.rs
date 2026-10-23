@@ -8,6 +8,10 @@ use cognee_core::pipeline::{PipelineRunInfo, PipelineStatus, PipelineWatcher, Ta
 ///
 /// Each trait method checks whether the Python object has the corresponding
 /// method (via `hasattr`) and calls it if present. Missing methods are no-ops.
+///
+/// Hooks run on tokio worker threads and are best-effort: if the interpreter
+/// cannot be attached to (e.g. it is finalizing while a background run is
+/// still going), the hook is skipped rather than panicking — see `crate::gil`.
 pub struct PyWatcherBridge {
     inner: Py<PyAny>,
 }
@@ -22,7 +26,7 @@ impl PyWatcherBridge {
 impl PipelineWatcher for PyWatcherBridge {
     async fn on_pipeline(&self, pipeline_id: Uuid, status: PipelineStatus) {
         let status_str = pipeline_status_to_string(&status);
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_pipeline", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_pipeline") {
                 let _ = self.inner.call_method1(
                     py,
@@ -42,7 +46,7 @@ impl PipelineWatcher for PyWatcherBridge {
         status: TaskStatus,
     ) {
         let status_str = task_status_to_string(&status);
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_task", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task") {
                 let _ = self.inner.call_method1(
                     py,
@@ -60,7 +64,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_started(&self, run: &PipelineRunInfo) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_run_started", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_started") {
                 let _ = self.inner.call_method1(
                     py,
@@ -72,7 +76,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_completed(&self, run: &PipelineRunInfo, output_count: usize) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_run_completed", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_completed") {
                 let _ = self.inner.call_method1(
                     py,
@@ -84,7 +88,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_pipeline_run_errored(&self, run: &PipelineRunInfo, error: &str) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_run_errored", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_run_errored") {
                 let _ = self.inner.call_method1(
                     py,
@@ -96,7 +100,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_started(&self, run: &PipelineRunInfo, task_name: &str, task_index: usize) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_task_started", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_started") {
                 let _ = self.inner.call_method1(
                     py,
@@ -108,7 +112,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_completed(&self, run: &PipelineRunInfo, task_name: &str, output_count: usize) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_task_completed", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_completed") {
                 let _ = self.inner.call_method1(
                     py,
@@ -120,7 +124,7 @@ impl PipelineWatcher for PyWatcherBridge {
     }
 
     async fn on_task_errored(&self, run: &PipelineRunInfo, task_name: &str, error: &str) {
-        Python::with_gil(|py| {
+        crate::gil::attach_best_effort("on_task_errored", |py| {
             if let Ok(true) = self.inner.bind(py).hasattr("on_task_errored") {
                 let _ = self.inner.call_method1(
                     py,

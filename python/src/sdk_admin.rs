@@ -57,7 +57,7 @@ impl PyCogneeNotebooks {
             let result = admin::run_list_notebooks(&handle)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -92,7 +92,7 @@ impl PyCogneeNotebooks {
             let result = admin::run_create_notebook(&handle, name, cells_val, true)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -118,7 +118,7 @@ impl PyCogneeNotebooks {
             let result = admin::run_update_notebook(&handle, &id, patch_val)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -137,7 +137,7 @@ impl PyCogneeNotebooks {
             let result = admin::run_delete_notebook(&handle, &id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 }
@@ -166,7 +166,7 @@ impl PyCognee {
             let result = admin::run_reset_pipeline_run_status(&handle, &dataset_id, &pipeline_name)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -186,7 +186,7 @@ impl PyCognee {
             let result = admin::run_reset_dataset_pipeline_run_status(&handle, &dataset_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -204,7 +204,7 @@ impl PyCognee {
             let result = admin::run_get_or_create_default_user(&handle)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 }

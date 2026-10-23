@@ -4,6 +4,7 @@ mod cancellation;
 mod config;
 mod default_subscriber;
 mod error;
+mod gil;
 mod graph_spec;
 mod json;
 mod logging;
@@ -30,7 +31,17 @@ mod watcher;
 // package, which does not expose them.
 
 /// Python bindings for the cognee-core pipeline engine.
-#[pymodule]
+///
+/// `gil_used = true`: since PyO3 0.28 free-threading support is opt-OUT, so a
+/// bare `#[pymodule]` tells a free-threaded CPython (3.14t) that this module
+/// needs no GIL, and CPython would then run it with the GIL disabled. The
+/// bindings have not been audited for that: they rely on the GIL for mutual
+/// exclusion — e.g. two threads calling `PipelineRunHandle.wait` (`&mut self`)
+/// on one handle would race on the pyclass borrow ("Already mutably
+/// borrowed") instead of serialising. Declaring the GIL used makes 3.14t
+/// re-enable it on import (with a RuntimeWarning). Drop this only after an
+/// audit for free-threaded execution.
+#[pymodule(gil_used = true)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Gap 07 task 02 — install the default tracing → Python `logging`
     // bridge before any class registration so events emitted during

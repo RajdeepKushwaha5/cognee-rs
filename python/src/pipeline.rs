@@ -143,7 +143,7 @@ impl PyPipeline {
                 .await
                 .map_err(execution_error_to_pyerr)?;
 
-            Python::with_gil(|py| results_to_py(py, &results))
+            crate::gil::attach_or_err(|py| results_to_py(py, &results))
         })
     }
 
@@ -158,7 +158,7 @@ impl PyPipeline {
         inputs: Vec<Bound<'_, PyAny>>,
         ctx: &PyTaskContext,
         watcher: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let rust_inputs: Vec<Arc<dyn cognee_core::Value>> =
             inputs.iter().map(|obj| py_to_arc(obj)).collect();
         let ctx_inner = Arc::clone(&ctx.inner);
@@ -170,9 +170,8 @@ impl PyPipeline {
 
         // Release the GIL during blocking execution so Python task closures
         // can re-acquire it when called by the executor.
-        let result = py.allow_threads(|| {
-            execute_blocking(&self.inner, rust_inputs, ctx_inner, watcher_box.as_ref())
-        });
+        let result = py
+            .detach(|| execute_blocking(&self.inner, rust_inputs, ctx_inner, watcher_box.as_ref()));
 
         let run_result = result.map_err(execution_error_to_pyerr)?;
         results_to_py(py, &run_result.outputs)
@@ -230,7 +229,7 @@ impl PyPipelineRunHandle {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let run_result = handle.wait().await.map_err(execution_error_to_pyerr)?;
-            Python::with_gil(|py| results_to_py(py, &run_result.outputs))
+            crate::gil::attach_or_err(|py| results_to_py(py, &run_result.outputs))
         })
     }
 }

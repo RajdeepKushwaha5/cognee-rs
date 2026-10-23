@@ -66,7 +66,7 @@ impl PyCogneeDatasets {
             let result = datasets::list_datasets(&handle)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -86,7 +86,7 @@ impl PyCogneeDatasets {
             let result = datasets::list_data(&handle, &dataset_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -108,7 +108,7 @@ impl PyCogneeDatasets {
             let result = datasets::has_data(&handle, &dataset_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -134,7 +134,7 @@ impl PyCogneeDatasets {
             let result = datasets::dataset_status(&handle, ids_val)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -154,7 +154,7 @@ impl PyCogneeDatasets {
             let result = datasets::empty_dataset(&handle, &dataset_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -193,7 +193,7 @@ impl PyCogneeDatasets {
             let result = datasets::delete_data(&handle, &dataset_id, &data_id, &opts_val)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -210,7 +210,7 @@ impl PyCogneeDatasets {
             let result = datasets::delete_all_datasets(&handle)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 }

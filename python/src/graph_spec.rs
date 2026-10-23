@@ -16,7 +16,7 @@ use crate::sdk_error::sdk_error_to_py;
 pub(crate) fn graph_spec_to_json_schema(
     py: Python<'_>,
     spec: Bound<'_, PyAny>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let spec = py_to_serde(&spec)?;
     let schema = cognee_bindings_common::ops::pipeline::graph_spec_to_json_schema(&spec)
         .map_err(sdk_error_to_py)?;

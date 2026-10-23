@@ -42,7 +42,7 @@ pub fn py_sdk_remember<'py>(
         let result = memory::run_remember(&handle, inputs_json, &dataset, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -65,7 +65,7 @@ pub fn py_sdk_remember_entry<'py>(
             memory::run_remember_entry(&handle, entry_json, &dataset, &session, &opts_json)
                 .await
                 .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -81,7 +81,7 @@ pub fn py_sdk_memify<'py>(
         let result = memory::run_memify_op(&handle, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -98,7 +98,7 @@ pub fn py_sdk_improve<'py>(
         let result = memory::run_improve(&handle, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 

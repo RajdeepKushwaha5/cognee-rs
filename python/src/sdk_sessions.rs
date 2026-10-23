@@ -63,7 +63,7 @@ impl PyCogneeSessions {
             let result = sessions::run_get_session(&handle, &session_id, &opts_val)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -94,7 +94,7 @@ impl PyCogneeSessions {
             let result = sessions::run_add_feedback(&handle, &session_id, &qa_id, &opts_val)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -117,7 +117,7 @@ impl PyCogneeSessions {
             let result = sessions::run_delete_feedback(&handle, &session_id, &qa_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -139,7 +139,7 @@ impl PyCogneeSessions {
             let result = sessions::run_get_graph_context(&handle, &session_id)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 
@@ -161,7 +161,7 @@ impl PyCogneeSessions {
             let result = sessions::run_set_graph_context(&handle, &session_id, &context)
                 .await
                 .map_err(sdk_error_to_py)?;
-            Python::with_gil(|py| serde_to_py(py, &result))
+            crate::gil::attach_or_err(|py| serde_to_py(py, &result))
         })
     }
 }

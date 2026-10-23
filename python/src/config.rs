@@ -76,7 +76,7 @@ impl PyCogneeConfig {
     ///
     /// Secret fields (``llm_api_key``, ``embedding_api_key``, etc.) are replaced
     /// with ``"***REDACTED***"`` before being returned.
-    fn get(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = cognee_bindings_common::config_snapshot(self.inner.cm.config());
         serde_to_py(py, &value)
     }

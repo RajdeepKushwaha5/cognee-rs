@@ -83,16 +83,16 @@ fn py_to_serde_inner(val: &Bound<'_, PyAny>, depth: usize) -> PyResult<serde_jso
 
     // bytes/bytearray → base64 string: JSON has no binary type, and the shared
     // wire layer (`wire::marshal_bytes`) expects base64-encoded payloads.
-    if let Ok(b) = val.downcast::<PyBytes>() {
+    if let Ok(b) = val.cast::<PyBytes>() {
         let encoded = base64::engine::general_purpose::STANDARD.encode(b.as_bytes());
         return Ok(serde_json::Value::String(encoded));
     }
-    if let Ok(b) = val.downcast::<PyByteArray>() {
+    if let Ok(b) = val.cast::<PyByteArray>() {
         let encoded = base64::engine::general_purpose::STANDARD.encode(b.to_vec());
         return Ok(serde_json::Value::String(encoded));
     }
 
-    if let Ok(list) = val.downcast::<PyList>() {
+    if let Ok(list) = val.cast::<PyList>() {
         let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_to_serde_inner(&item, depth + 1)?);
@@ -100,7 +100,7 @@ fn py_to_serde_inner(val: &Bound<'_, PyAny>, depth: usize) -> PyResult<serde_jso
         return Ok(serde_json::Value::Array(arr));
     }
 
-    if let Ok(dict) = val.downcast::<PyDict>() {
+    if let Ok(dict) = val.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in dict.iter() {
             let key: String = k.extract().map_err(|_| {
@@ -129,7 +129,7 @@ fn py_to_serde_inner(val: &Bound<'_, PyAny>, depth: usize) -> PyResult<serde_jso
 /// - `String` → `str`
 /// - `Array`  → `list`
 /// - `Object` → `dict`
-pub(crate) fn serde_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {
+pub(crate) fn serde_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match val {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => {

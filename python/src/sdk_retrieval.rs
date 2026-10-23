@@ -42,7 +42,7 @@ pub fn py_sdk_search<'py>(
         let result = retrieval::search(&handle, &query, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -62,7 +62,7 @@ pub fn py_sdk_recall<'py>(
         let result = retrieval::recall(&handle, &query, &opts_json)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 

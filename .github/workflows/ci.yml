@@ -80,23 +80,27 @@ env:
   # updates touch /usr/bin/cc+gcc mtimes and would silently invalidate the
   # whole cache. Hash the compiler content instead.
   CCACHE_COMPILERCHECK: content
-  # Pin the interpreter pyo3-build-config resolves. Without this it probes
-  # whatever `python3` the image ships (3.14 on ubuntu-26.04, newer than PyO3
-  # 0.23 supports), and it caches that result in OUT_DIR, re-resolving only
-  # when a PYO3_* variable changes, so a rust-cache saved on one image can
-  # carry a stale interpreter into another. python3.12 is noble's system
-  # Python. maturin-driven jobs set their own PYO3_PYTHON and are unaffected.
-  PYO3_PYTHON: python3.12
+  # No workflow-wide PYO3_PYTHON pin: PyO3 0.29 supports CPython 3.8-3.15, so
+  # pyo3-build-config accepts whatever `python3` the runner image ships (3.12
+  # on 24.04, 3.14 on 26.04). Do not reintroduce a versioned pin such as
+  # `python3.12` — it names an interpreter that only some images have, which
+  # is exactly the coupling to the image that broke main on 2026-10-22. The
+  # crate is never linked against libpython or executed by cargo (python/
+  # Cargo.toml disables every harness target), so the interpreter only feeds
+  # `Py_3_x` cfgs into `cargo check`/`clippy`; maturin-driven jobs set their
+  # own PYO3_PYTHON.
 
 jobs:
   # Every Linux job pins ubuntu-24.04 rather than ubuntu-latest. On 2026-10-22
-  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than
-  # PyO3 0.23 supports) and glibc 2.43 (binaries built on it no longer run in
-  # the Debian e2e harness image). Move off 24.04 deliberately, in one PR that
-  # changes every `runs-on:` / matrix runner under .github/workflows/ at once,
-  # updates PYO3_PYTHON above (python3.12 does not exist on 26.04), and bumps
-  # every rust-cache shared-key (the key does not include the image, so a
-  # target dir built on the old image would otherwise be restored on the new).
+  # ubuntu-latest became ubuntu-26.04, which ships Python 3.14 (newer than the
+  # PyO3 0.23 we had then supported) and glibc 2.43 (binaries built on it no
+  # longer ran in the Debian e2e harness image). The Python coupling is gone
+  # (PyO3 0.29 supports 3.8-3.15, and PYO3_PYTHON is no longer pinned above);
+  # the glibc one still holds for every binary built natively on the runner.
+  # Move off 24.04 deliberately, in one PR that changes every
+  # `runs-on:` / matrix runner under .github/workflows/ at once and bumps every
+  # rust-cache shared-key (the key does not include the image, so a target dir
+  # built on the old image would otherwise be restored on the new).
   # ── Stage 1: Quick lints (fast fail) ──────────────────────────────────
   lint:
     name: Lint (fmt + check + clippy)
@@ -1512,11 +1516,21 @@ jobs:
         run: bash capi/scripts/check.sh
 
   python-check:
-    name: Python Bindings Check
+    name: Python Bindings Check (${{ matrix.python-version }})
     needs: lint
     runs-on: ubuntu-24.04
-    # Build against the venv's interpreter (setup-python 3.11 below), not the
-    # workflow-wide python3.12. maturin overrides PYO3_PYTHON anyway; this makes
+    # The oldest Python CI covers and the newest pyproject.toml advertises
+    # (classifiers list 3.9-3.14). The legs run in parallel and share the
+    # restore-only cache below; only pyo3 and the extension crate rebuild per
+    # interpreter, so the second leg adds runner time, not wall time.
+    # `needs.python-check.result` in `notify` is the matrix aggregate: any
+    # failing leg makes it `failure`.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.11", "3.14" ]
+    # Build against the venv's interpreter (setup-python below), not the
+    # image's `python3`. maturin overrides PYO3_PYTHON anyway; this makes
     # any direct cargo call in check.sh agree with the interpreter pytest uses.
     env:
       PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
@@ -1576,7 +1590,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       # Only maturin: python/scripts/check.sh runs `maturin develop --extras
       # test`, which builds the extension and installs the test extra itself.
       # Pre-installing the project here with `pip install -e ".[test]"` would

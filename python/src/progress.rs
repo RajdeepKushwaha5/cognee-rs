@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 
 use cognee_core::ProgressToken;
 
-#[pyclass(name = "ProgressToken")]
+#[pyclass(name = "ProgressToken", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyProgressToken {
     pub(crate) inner: ProgressToken,

@@ -51,7 +51,7 @@ pub fn py_sdk_forget<'py>(
         let result = data::forget(&handle, target_value, &opts_value)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -80,7 +80,7 @@ pub fn py_sdk_update<'py>(
         )
         .await
         .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 
@@ -91,7 +91,7 @@ pub fn py_sdk_prune_data<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         data::prune_data(&handle).await.map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| Ok(py.None()))
+        crate::gil::attach_or_err(|py| Ok(py.None()))
     })
 }
 
@@ -110,7 +110,7 @@ pub fn py_sdk_prune_system<'py>(
         let result = data::prune_system(&handle, &opts_value)
             .await
             .map_err(sdk_error_to_py)?;
-        Python::with_gil(|py| serde_to_py(py, &result))
+        crate::gil::attach_or_err(|py| serde_to_py(py, &result))
     })
 }
 

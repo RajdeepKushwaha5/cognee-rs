@@ -68,10 +68,14 @@ pub fn make_task(py: Python<'_>, callable: &Bound<'_, PyAny>, batch: bool) -> Py
 // ---------------------------------------------------------------------------
 // Single-value task wrappers
 // ---------------------------------------------------------------------------
+//
+// Every closure below runs on an executor thread (often a tokio worker), so
+// it attaches through `crate::gil::attach_or_err`: if the interpreter is
+// finalizing the task fails with a RuntimeError instead of panicking.
 
 fn make_sync_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::sync(move |input: Arc<dyn Value>, _ctx: Arc<TaskContext>| {
-        Python::with_gil(|py| {
+        crate::gil::attach_or_err(|py| {
             let py_input = arc_to_py(py, &input)?;
             let result = callable.call1(py, (py_input,))?;
             Ok(py_to_arc(result.bind(py)))
@@ -84,7 +88,7 @@ fn make_async_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::async_fn(move |input: Arc<dyn Value>, _ctx: Arc<TaskContext>| {
         let callable = Arc::clone(&callable);
         Box::pin(async move {
-            let future = Python::with_gil(|py| {
+            let future = crate::gil::attach_or_err(|py| {
                 let py_input = arc_to_py(py, &input)?;
                 let coro = callable.call1(py, (py_input,))?;
                 pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone())
@@ -95,14 +99,15 @@ fn make_async_task(callable: Arc<Py<PyAny>>) -> Task {
                 .await
                 .map_err(|e: PyErr| -> TaskError { Box::new(e) })?;
 
-            Python::with_gil(|py| Ok(py_to_arc(result.bind(py))))
+            crate::gil::attach_or_err(|py| Ok(py_to_arc(result.bind(py))))
+                .map_err(|e: PyErr| -> TaskError { Box::new(e) })
         })
     })
 }
 
 fn make_sync_iter_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::sync_iter(move |input: Arc<dyn Value>, _ctx: Arc<TaskContext>| {
-        Python::with_gil(|py| {
+        crate::gil::attach_or_err(|py| {
             let py_input = arc_to_py(py, &input)?;
             let generator = callable.call1(py, (py_input,))?;
             // Eagerly collect the generator to avoid holding the GIL across
@@ -126,7 +131,7 @@ fn make_async_stream_task(callable: Arc<Py<PyAny>>) -> Task {
         let callable = Arc::clone(&callable);
 
         // Call the async generator function to get the async iterator object.
-        let agen = Python::with_gil(|py| {
+        let agen = crate::gil::attach_or_err(|py| {
             let py_input = arc_to_py(py, &input)?;
             callable.call1(py, (py_input,))
         })
@@ -148,7 +153,7 @@ fn make_async_stream_task(callable: Arc<Py<PyAny>>) -> Task {
 
 fn make_sync_batch_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::sync_batch(move |items: &[Box<dyn Value>], _ctx: Arc<TaskContext>| {
-        Python::with_gil(|py| {
+        crate::gil::attach_or_err(|py| {
             let py_list = items_to_py_list(py, items)?;
             let result = callable.call1(py, (py_list,))?;
             Ok(py_to_arc(result.bind(py)))
@@ -163,7 +168,7 @@ fn make_async_batch_task(callable: Arc<Py<PyAny>>) -> Task {
         // Clone items into owned PyObjects so we can move into the future. A
         // conversion failure is reported from inside the future (this closure
         // must return one) rather than silently batching an empty list.
-        let owned_items: PyResult<Vec<PyObject>> = Python::with_gil(|py| {
+        let owned_items: PyResult<Vec<Py<PyAny>>> = crate::gil::attach_or_err(|py| {
             items
                 .iter()
                 .map(|v| item_to_py(py, v.as_ref()))
@@ -172,7 +177,7 @@ fn make_async_batch_task(callable: Arc<Py<PyAny>>) -> Task {
 
         Box::pin(async move {
             let owned_items = owned_items.map_err(|e: PyErr| -> TaskError { Box::new(e) })?;
-            let future = Python::with_gil(|py| {
+            let future = crate::gil::attach_or_err(|py| {
                 let py_list = PyList::new(py, &owned_items)?;
                 let coro = callable.call1(py, (py_list,))?;
                 pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone())
@@ -183,14 +188,15 @@ fn make_async_batch_task(callable: Arc<Py<PyAny>>) -> Task {
                 .await
                 .map_err(|e: PyErr| -> TaskError { Box::new(e) })?;
 
-            Python::with_gil(|py| Ok(py_to_arc(result.bind(py))))
+            crate::gil::attach_or_err(|py| Ok(py_to_arc(result.bind(py))))
+                .map_err(|e: PyErr| -> TaskError { Box::new(e) })
         })
     })
 }
 
 fn make_sync_iter_batch_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::sync_iter_batch(move |items: &[Box<dyn Value>], _ctx: Arc<TaskContext>| {
-        Python::with_gil(|py| {
+        crate::gil::attach_or_err(|py| {
             let py_list = items_to_py_list(py, items)?;
             let generator = callable.call1(py, (py_list,))?;
             let mut collected: Vec<Box<dyn Value>> = Vec::new();
@@ -210,7 +216,7 @@ fn make_sync_iter_batch_task(callable: Arc<Py<PyAny>>) -> Task {
 fn make_async_stream_batch_task(callable: Arc<Py<PyAny>>) -> Task {
     Task::async_stream_batch(move |items: &[Box<dyn Value>], _ctx: Arc<TaskContext>| {
         let callable = Arc::clone(&callable);
-        let owned_items: Vec<PyObject> = Python::with_gil(|py| {
+        let owned_items: Vec<Py<PyAny>> = crate::gil::attach_or_err(|py| {
             items
                 .iter()
                 .map(|v| item_to_py(py, v.as_ref()))
@@ -218,7 +224,7 @@ fn make_async_stream_batch_task(callable: Arc<Py<PyAny>>) -> Task {
         })
         .map_err(|e: PyErr| -> TaskError { Box::new(e) })?;
 
-        let agen = Python::with_gil(|py| {
+        let agen = crate::gil::attach_or_err(|py| {
             let py_list = PyList::new(py, &owned_items)?;
             callable.call1(py, (py_list,))
         })
@@ -246,7 +252,7 @@ fn make_async_stream_batch_task(callable: Arc<Py<PyAny>>) -> Task {
 /// including one raised while obtaining the `__anext__` awaitable — is
 /// yielded as `Some(Err(..))`, which fails the producing task.
 async fn drive_async_gen_next(agen: &Py<PyAny>) -> Option<Result<Box<dyn Value>, TaskError>> {
-    let next_future = Python::with_gil(|py| {
+    let next_future = crate::gil::attach_or_err(|py| {
         let coro = agen.call_method0(py, "__anext__")?;
         pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone())
     });
@@ -257,17 +263,18 @@ async fn drive_async_gen_next(agen: &Py<PyAny>) -> Option<Result<Box<dyn Value>,
 
     match next_future.await {
         Ok(val) => {
-            let boxed: Box<dyn Value> = Python::with_gil(|py| {
-                Box::new(PyValue {
-                    inner: val.clone_ref(py),
-                })
-            });
+            // `val` is already an owned reference; moving it needs no attach.
+            let boxed: Box<dyn Value> = Box::new(PyValue { inner: val });
             Some(Ok(boxed))
         }
         Err(e) => {
-            let is_stop = Python::with_gil(|py| {
+            // If the interpreter cannot be attached to (finalizing), the error
+            // cannot be classified; surface it rather than ending the stream as
+            // if the generator had finished normally.
+            let is_stop = Python::try_attach(|py| {
                 e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
-            });
+            })
+            .unwrap_or(false);
             if is_stop {
                 None
             } else {
@@ -286,15 +293,15 @@ fn items_to_py_list<'py>(
     py: Python<'py>,
     items: &[Box<dyn Value>],
 ) -> PyResult<Bound<'py, PyList>> {
-    let py_items: Vec<PyObject> = items
+    let py_items: Vec<Py<PyAny>> = items
         .iter()
         .map(|v| item_to_py(py, v.as_ref()))
         .collect::<PyResult<_>>()?;
     PyList::new(py, &py_items)
 }
 
-/// Convert a single `&dyn Value` to a PyObject.
-fn item_to_py(py: Python<'_>, val: &dyn Value) -> PyResult<PyObject> {
+/// Convert a single `&dyn Value` to a Python object.
+fn item_to_py(py: Python<'_>, val: &dyn Value) -> PyResult<Py<PyAny>> {
     let any = val.as_any();
     if let Some(pv) = any.downcast_ref::<PyValue>() {
         return Ok(pv.inner.clone_ref(py));

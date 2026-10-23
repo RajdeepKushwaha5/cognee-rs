@@ -100,13 +100,13 @@ pdf-pure-rust = ["cognee/pdf-pure-rust"]
 # extension module needs on macOS.
 #
 # Track `pyo3`'s *minor* version below, not its major: these are 0.x crates, so
-# 0.23 -> 0.24 is the breaking step. In practice pyo3 already pins it for us —
-# pyo3 0.23.5 declares `pyo3-build-config = "=0.23.5"` as its own
+# 0.29 -> 0.30 is the breaking step. In practice pyo3 already pins it for us —
+# pyo3 0.29.3 declares `pyo3-build-config = "=0.29.3"` as its own
 # build-dependency, so cargo unifies both to one version and Cargo.lock holds a
 # single entry. Bumping `pyo3` here without bumping this line would resolve two
 # different pyo3-build-config copies, and this script would emit link args from
 # a version that no longer matches the pyo3 the crate compiles against.
-pyo3-build-config = "0.23"
+pyo3-build-config = "0.29"
 
 [dependencies]
 # Shared SDK facade (HandleState, CogneeServices, SdkError).
@@ -126,7 +126,7 @@ cognee-logging = { path = "../crates/logging" }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-log        = "0.2"
-pyo3-log           = "0.12"
+pyo3-log           = "0.13"
 log                = "0.4"
 
 # Optional opentelemetry / send_telemetry surfaces. Both have noop
@@ -136,8 +136,11 @@ log                = "0.4"
 # gap 07 decision 3).
 cognee-observability = { path = "../crates/observability", features = ["telemetry"] }
 cognee-telemetry     = { path = "../crates/telemetry",     features = ["telemetry"] }
-pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+# PyO3 0.29 supports CPython 3.8-3.15. 0.29 rather than 0.30 because pyo3-log
+# 0.13.x (the newest) still declares `pyo3 >=0.26, <0.30`; the three crates
+# must agree on one pyo3, so bump them together.
+pyo3 = { version = "0.29", features = ["extension-module", "multiple-pymethods"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }

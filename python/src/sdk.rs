@@ -191,7 +191,7 @@ impl PyCognee {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             handle.services().await.map_err(sdk_error_to_py)?;
             // Return Python None (not the empty tuple that Ok(()) would produce).
-            Python::with_gil(|py| Ok(py.None()))
+            crate::gil::attach_or_err(|py| Ok(py.None()))
         })
     }
 
@@ -235,7 +235,7 @@ impl PyCognee {
         // Release the GIL while blocking: the teardown is pure Rust and needs no
         // interpreter, and holding the GIL would stall every other Python thread
         // for the duration of the close.
-        py.allow_threads(|| self.inner.close_blocking(rt.handle()));
+        py.detach(|| self.inner.close_blocking(rt.handle()));
     }
 
     /// Enter the synchronous context manager (returns ``self``).
