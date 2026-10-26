@@ -65,6 +65,7 @@ mod retry;
 pub mod schema;
 pub mod transcriber;
 pub mod types;
+pub mod unconfigured;
 
 pub use adapters::{AnthropicAdapter, OpenAIAdapter};
 pub use config::{LlmConfig, LlmProvider};
@@ -84,3 +85,4 @@ pub use types::{
     DEFAULT_MAX_COMPLETION_TOKENS, GenerationOptions, GenerationResponse, Message, MessageRole,
     StructuredOutputMode, TokenUsage,
 };
+pub use unconfigured::UnconfiguredLlm;
