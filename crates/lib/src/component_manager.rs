@@ -318,6 +318,14 @@ impl ComponentManager {
         self.registry.build_llm(&ctx).await
     }
 
+    /// Whether the configured LLM can make calls: its provider needs no API
+    /// key, or one is set. Without one, [`PipelineContext::llm`] returns an
+    /// LLM whose every call fails with "LLM API key is not set.".
+    pub async fn llm_available(&self) -> Result<bool, ComponentError> {
+        let ctx = self.build_context().await?;
+        self.registry.llm_available(&ctx)
+    }
+
     /// Build the session store selected by `session.store` (default
     /// `relational`: the session tables in this manager's relational
     /// database). Not cached: each pipeline/service build owns its store.
@@ -1155,6 +1163,27 @@ mod tests {
             .await
             .expect("provider=mock should initialize offline");
         assert_eq!(llm.model(), "mock-model");
+    }
+
+    #[tokio::test]
+    async fn llm_without_an_api_key_is_unavailable_but_builds() {
+        let settings = Settings {
+            sections: [
+                ("llm.provider".to_string(), serde_json::json!("openai")),
+                ("llm.api_key".to_string(), serde_json::json!("")),
+            ]
+            .into(),
+            ..Settings::default()
+        };
+        let cm = ComponentManager::new(ConfigManager::new(settings));
+        assert!(
+            !cm.llm_available()
+                .await
+                .expect("openai is a built-in provider")
+        );
+        cm.llm()
+            .await
+            .expect("a missing key should not fail the build");
     }
 
     #[cfg(feature = "mock-llm")]

@@ -383,7 +383,11 @@ Python SDK, whose `_API_KEY_REQUIRED_PROVIDERS` omits Bedrock and lists it under
 `_NO_API_KEY_PROVIDERS` instead; for a local Ollama any non-empty value works).
 On `bedrock` an unset or empty `LLM_API_KEY` is a supported configuration — it
 falls through to SigV4 signing rather than erroring (see
-[Bedrock](#bedrock-llm_providerbedrock) below). The OpenAI-only request quirks
+[Bedrock](#bedrock-llm_providerbedrock) below). A missing required key does not
+fail setup: the LLM is unavailable (`ComponentManager::llm_available()` returns
+`false`), and each call to it fails with "LLM API key is not set.", as in Python.
+An external provider that needs no key says so by overriding
+`LlmFactory::requires_api_key`. The OpenAI-only request quirks
 are gated on the `api.openai.com` host, so they never fire against another
 endpoint.
 

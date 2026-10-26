@@ -82,6 +82,13 @@ pub trait LlmFactory: Send + Sync {
     fn config_sections(&self) -> Vec<&'static SectionSchema> {
         Vec::new()
     }
+    /// Whether this provider needs an API key to make calls. Without one, the
+    /// LLM counts as unavailable and is not built.
+    ///
+    /// Defaults to `true`.
+    fn requires_api_key(&self, _ctx: &BackendBuildContext) -> bool {
+        true
+    }
     /// Construct the raw LLM adapter from the resolved context.
     async fn build(&self, ctx: &BackendBuildContext) -> Result<Arc<dyn Llm>, ComponentError>;
     /// Construct a transcriber for this provider, or `Ok(None)` when the

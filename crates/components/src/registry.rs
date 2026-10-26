@@ -9,7 +9,7 @@ use cognee_config_core::{ConfigSchema, SchemaError, SectionSchema};
 use cognee_database::RelationalDb;
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
-use cognee_llm::{Llm, Transcriber};
+use cognee_llm::{Llm, Transcriber, UnconfiguredLlm};
 use cognee_ontology::{NoOpOntologyResolver, OntologyResolver};
 use cognee_session::SessionStore;
 use cognee_storage::StorageTrait;
@@ -599,6 +599,17 @@ impl ComponentRegistry {
         factory.build(ctx).await
     }
 
+    /// Whether the LLM selected by `ctx.llm.provider` can make calls: it needs
+    /// no API key, or has one. Reads the configuration only; it does not check
+    /// that the key works.
+    pub fn llm_available(&self, ctx: &BackendBuildContext) -> Result<bool, ComponentError> {
+        if ctx.llm.mock || ctx.llm.provider == "mock" {
+            return Ok(true);
+        }
+        let factory = self.llm_factory(ctx)?;
+        Ok(llm_factory_available(factory.as_ref(), ctx))
+    }
+
     /// Build the LLM adapter selected by `ctx.llm.provider`.
     ///
     /// A mock request (`ctx.llm.mock` or `provider == "mock"`) replaces the
@@ -606,6 +617,10 @@ impl ComponentRegistry {
     /// `ctx.llm.record_path` wraps the built real adapter in a recorder. Both
     /// are applied here so every provider — including externally-registered
     /// ones — gets identical mock/record semantics.
+    ///
+    /// When the LLM is not [available](Self::llm_available), the factory is
+    /// not called: the result is an [`UnconfiguredLlm`], whose every call
+    /// fails with "LLM API key is not set.".
     pub async fn build_llm(
         &self,
         ctx: &BackendBuildContext,
@@ -614,20 +629,30 @@ impl ComponentRegistry {
             return llm::build_mock_llm(ctx);
         }
 
-        let key = ctx.llm.provider.to_lowercase();
-        let factory = self.llm.get(&key).ok_or_else(|| {
-            ComponentError::Config(unsupported_msg(
-                "llm_provider",
-                &ctx.llm.provider,
-                &self.llm_providers(),
-            ))
-        })?;
+        let factory = self.llm_factory(ctx)?;
+        if !llm_factory_available(factory.as_ref(), ctx) {
+            return Ok(Arc::new(UnconfiguredLlm::new(&ctx.llm.provider)));
+        }
         let adapter = factory.build(ctx).await?;
 
         if !ctx.llm.record_path.trim().is_empty() {
             return llm::wrap_recording(adapter, &ctx.llm.record_path);
         }
         Ok(adapter)
+    }
+
+    fn llm_factory(
+        &self,
+        ctx: &BackendBuildContext,
+    ) -> Result<&Arc<dyn LlmFactory>, ComponentError> {
+        let key = ctx.llm.provider.to_lowercase();
+        self.llm.get(&key).ok_or_else(|| {
+            ComponentError::Config(unsupported_msg(
+                "llm_provider",
+                &ctx.llm.provider,
+                &self.llm_providers(),
+            ))
+        })
     }
 
     /// Build a transcriber for `ctx.llm.provider`, or `Ok(None)` when the
@@ -957,6 +982,10 @@ fn canonical_vector_provider(provider: &str) -> String {
         "brute-force" | "brute_force" | "bruteforce" => "brute-force".to_string(),
         other => other.to_string(),
     }
+}
+
+fn llm_factory_available(factory: &dyn LlmFactory, ctx: &BackendBuildContext) -> bool {
+    !factory.requires_api_key(ctx) || !ctx.llm.api_key.trim().is_empty()
 }
 
 fn unsupported_msg(field: &str, provider: &str, supported: &[String]) -> String {
@@ -1468,6 +1497,60 @@ pub(crate) mod tests {
     // a `ComponentError::Config` naming an API key = an Anthropic-style
     // key-required check crept in. Offline for the same reason — the route check
     // is the first statement in `new`.
+    #[test]
+    fn llm_available_rejects_an_unknown_provider() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        ctx.llm.provider = "no-such-provider".to_string();
+        assert!(reg.llm_available(&ctx).is_err());
+    }
+
+    #[test]
+    fn llm_with_an_api_key_is_available() {
+        let reg = ComponentRegistry::with_builtins();
+        let available = reg
+            .llm_available(&test_ctx())
+            .expect("openai is a built-in provider");
+        assert!(available);
+    }
+
+    #[test]
+    fn llm_without_a_required_api_key_is_unavailable() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        ctx.llm.api_key = "  ".to_string();
+        let available = reg
+            .llm_available(&ctx)
+            .expect("openai is a built-in provider");
+        assert!(!available);
+    }
+
+    #[tokio::test]
+    async fn llm_without_a_required_api_key_builds_and_fails_on_call() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        ctx.llm.api_key = String::new();
+        let llm = reg
+            .build_llm(&ctx)
+            .await
+            .expect("a missing key should not fail the build");
+        let err = llm.generate(Vec::new(), None).await.unwrap_err();
+        assert!(err.to_string().contains("LLM API key is not set."), "{err}");
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[test]
+    fn bedrock_without_an_api_key_is_available() {
+        let reg = ComponentRegistry::with_builtins();
+        let mut ctx = test_ctx();
+        ctx.llm.provider = "bedrock".to_string();
+        ctx.llm.api_key = String::new();
+        let available = reg
+            .llm_available(&ctx)
+            .expect("bedrock is a built-in provider");
+        assert!(available);
+    }
+
     #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn bedrock_empty_api_key_is_never_a_config_rejection() {

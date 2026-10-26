@@ -457,7 +457,7 @@ async fn close_releases_the_embedded_graph_wal_and_unlocks_the_path() {
 /// probe has to say so.
 ///
 /// `CogneeServices::build` warms slot by slot and resolves the LLM near the end,
-/// so an empty `llm_api_key` fails **after** the SQLite pool (and the graph) are
+/// so an unknown `llm.provider` fails **after** the SQLite pool (and the graph) are
 /// cached. The services slot is then `None` — and a probe that only looked there
 /// reported "nothing to release", so `Drop for PyCognee` / neon's `Finalize`
 /// skipped the teardown and the open database survived until process exit.
@@ -467,7 +467,7 @@ async fn a_failed_warm_still_reports_open_resources_and_releases_them() {
     let db_path = dir.path().join("cognee.db");
     let (wal, shm) = sidecars(&db_path);
 
-    // Everything valid except the LLM key, which is resolved strictly and last.
+    // Everything valid except the LLM provider, which is resolved last.
     let settings = Settings {
         sections: [
             (
@@ -478,7 +478,10 @@ async fn a_failed_warm_still_reports_open_resources_and_releases_them() {
                 "embedding.provider".to_string(),
                 serde_json::json!("mock".to_owned()),
             ),
-            ("llm.api_key".to_string(), serde_json::json!(String::new())),
+            (
+                "llm.provider".to_string(),
+                serde_json::json!("no-such-provider"),
+            ),
         ]
         .into(),
         data_root_directory: dir.path().join("data").to_string_lossy().into_owned(),
@@ -488,12 +491,12 @@ async fn a_failed_warm_still_reports_open_resources_and_releases_them() {
     let state = std::sync::Arc::new(HandleState::from_settings(settings));
 
     let err = match state.services().await {
-        Ok(_) => panic!("warm must fail without an LLM key"),
+        Ok(_) => panic!("warm must fail with an unknown LLM provider"),
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("llm_api_key"),
-        "expected the LLM key to be what failed, got: {err}"
+        err.to_string().contains("no-such-provider"),
+        "expected the LLM provider to be what failed, got: {err}"
     );
 
     // The pool is open even though the bundle was never cached.

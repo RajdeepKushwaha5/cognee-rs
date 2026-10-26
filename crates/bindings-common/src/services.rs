@@ -296,10 +296,8 @@ impl CogneeServices {
     /// helper with a DB-backed equivalent that upserts a row in the `users`
     /// table; the call shape is identical, so this assembly path is unchanged.
     ///
-    /// The LLM is resolved **strictly** here (the simplest correct v1 per the
-    /// plan): callers that need keyless warm must set a non-empty dummy
-    /// `llm_api_key` — `OpenAIAdapter::new` performs no network I/O at
-    /// construction, so this never reaches the network.
+    /// A missing `llm_api_key` does not fail the build: the services get an
+    /// LLM whose every call fails with "LLM API key is not set.".
     pub async fn build(cm: &Arc<ComponentManager>) -> Result<(Self, Uuid), SdkError> {
         // --- 1. Raw engines (errors map to ComponentError → SdkError). ---
         let storage = cm.storage().await?;

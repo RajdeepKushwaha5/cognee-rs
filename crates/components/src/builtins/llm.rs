@@ -407,6 +407,11 @@ impl LlmFactory for BedrockLlmFactory {
         vec![<crate::sections::AwsConfig as cognee_config_core::ConfigSection>::schema()]
     }
 
+    /// Without a key, Bedrock signs requests with AWS credentials (see `build`).
+    fn requires_api_key(&self, _ctx: &BackendBuildContext) -> bool {
+        false
+    }
+
     async fn build(&self, ctx: &BackendBuildContext) -> Result<Arc<dyn Llm>, ComponentError> {
         // Bedrock is a first-class provider, so it gets the same dispatch
         // pacing as the other three. `install_pacer` is first-call-wins, so in

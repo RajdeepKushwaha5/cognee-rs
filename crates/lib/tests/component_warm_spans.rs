@@ -36,13 +36,20 @@ fn cm() -> (ComponentManager, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let root = dir.path();
     let settings = Settings {
-        sections: [(
-            "relational.url".to_string(),
-            serde_json::json!(format!(
-                "sqlite:{}?mode=rwc",
-                root.join("cognee.db").to_string_lossy()
-            )),
-        )]
+        sections: [
+            (
+                "relational.url".to_string(),
+                serde_json::json!(format!(
+                    "sqlite:{}?mode=rwc",
+                    root.join("cognee.db").to_string_lossy()
+                )),
+            ),
+            // No such provider is registered, so the LLM build fails.
+            (
+                "llm.provider".to_string(),
+                serde_json::json!("no-such-provider"),
+            ),
+        ]
         .into(),
         system_root_directory: root.join("system").to_string_lossy().into_owned(),
         data_root_directory: root.join("data").to_string_lossy().into_owned(),
@@ -56,7 +63,7 @@ fn names(spans: &[cognee_test_utils::CapturedSpan]) -> Vec<String> {
 }
 
 /// Every engine constructor emits its span. `llm` is included deliberately: it
-/// fails to build under default settings (no API key), and the `err` flag on the
+/// fails to build here (unknown provider), and the `err` flag on the
 /// `#[instrument]` means the span must still be recorded — a failed engine build
 /// is exactly the case someone will be debugging.
 #[tokio::test]
@@ -70,11 +77,10 @@ async fn each_component_construction_emits_a_span() {
     let _ = cm.graph_db().await;
     let _ = cm.vector_db().await;
     let _ = cm.embedding_engine().await;
-    // Errors under default settings (strict LLM resolution, no key).
     let llm = cm.llm().await;
     assert!(
         llm.is_err(),
-        "precondition: default settings have no LLM key, so this build must fail \
+        "precondition: the LLM provider is unknown, so this build must fail \
          — the point of the assertion below is that the span fires anyway"
     );
 

@@ -23,6 +23,9 @@ Three pieces, all in `cognee-components` and re-exported from `cognee`:
 Your factory is looked up by the same path as every built-in one
 (`ComponentRegistry::build_vector` / `build_graph` / `build_llm`), so it gets
 identical treatment — including the LLM mock-override and recording wrappers.
+An `LlmFactory` whose provider needs no API key overrides `requires_api_key` to
+return `false`; otherwise, with `LLM_API_KEY` empty, `build()` is not called and
+the LLM is unavailable.
 
 ## Registering one
 
