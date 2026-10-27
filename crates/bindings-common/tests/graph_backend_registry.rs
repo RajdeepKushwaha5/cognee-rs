@@ -587,3 +587,119 @@ async fn the_sub_step_config_carries_the_configured_default() {
         .expect("a backend, not the LLM");
     assert_eq!(backend.name(), "stub-default");
 }
+
+// ---------------------------------------------------------------------------
+// 6. Python's per-call `extractor` opt and the `auto` default.
+// ---------------------------------------------------------------------------
+
+/// `extractor` selects a kind like a bare `graphBackend` string, `graphBackend`
+/// wins when both are given, and a non-string `extractor` is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_extractor_opt_selects_and_graph_backend_wins() {
+    let dir = TempDir::new().expect("tempdir");
+    let state = HandleState::from_settings_with_registry(settings_under(&dir), stub_registry());
+    let svc = state.services().await.expect("warm");
+
+    let cfg = cognify_config_with_opts(&svc, &json!({ "extractor": "stub-registry" }))
+        .await
+        .expect("registered extractor builds");
+    assert_eq!(
+        cfg.graph_backend.as_ref().expect("attached").0.name(),
+        "stub-default"
+    );
+
+    let opts = json!({ "graphBackend": "llm", "extractor": "stub-registry" });
+    let cfg = cognify_config_with_opts(&svc, &opts).await.expect("config");
+    assert!(cfg.graph_backend.is_none(), "`graphBackend` wins");
+
+    // With a usable LLM, `auto` is the built-in extractor.
+    let cfg = cognify_config_with_opts(&svc, &json!({ "extractor": "auto" }))
+        .await
+        .expect("config");
+    assert!(cfg.graph_backend.is_none());
+
+    let err = check_graph_backend_registered(&svc.component_manager, &json!({ "extractor": 7 }))
+        .expect_err("a non-string extractor");
+    assert!(matches!(err, SdkError::Validation(_)), "got {err:?}");
+    assert!(err.to_string().contains("`extractor`"), "{err}");
+}
+
+/// With no usable LLM, the `auto` default asks for GLiNER: refused with the
+/// keyless-setup remedy when nothing serves it, never run with the LLM. An
+/// explicit `llm` is still the built-in extractor.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_without_an_llm_or_gliner_is_refused() {
+    let cm = bare_cm();
+    let err = check_graph_backend_registered(&cm, &json!({})).expect_err("no gliner");
+    assert!(matches!(err, SdkError::Validation(_)), "got {err:?}");
+    let message = err.to_string();
+    assert!(message.contains("no usable LLM is configured"), "{message}");
+    assert!(message.contains("NOT run with the LLM"), "{message}");
+
+    check_graph_backend_registered(&cm, &json!({ "extractor": "llm" }))
+        .expect("an explicit llm needs no backend");
+
+    // Named explicitly, a missing GLiNER is an ordinary unknown kind.
+    let err = check_graph_backend_registered(&cm, &json!({ "extractor": "gliner_demo" }))
+        .expect_err("no gliner");
+    assert!(err.to_string().contains("\"gliner\""), "{err}");
+}
+
+/// A `graphBackend` naming no kind has always meant the built-in extractor,
+/// whatever the default; a legacy shim kind is found whatever its case; and
+/// `auto` is reserved there as in the registry.
+#[tokio::test(flavor = "multi_thread")]
+async fn blank_graph_backend_is_the_llm_and_legacy_kinds_ignore_case() {
+    let cm = bare_cm();
+    for opts in [
+        json!({ "graphBackend": "" }),
+        json!({ "graphBackend": { "kind": " " } }),
+    ] {
+        assert!(
+            graph_backend_from_opts(&cm, &opts)
+                .await
+                .expect("llm")
+                .is_none(),
+            "{opts}"
+        );
+    }
+
+    fn mixed(_spec: Value) -> GraphBackendFuture {
+        Box::pin(async { Ok(Arc::new(StubExtractor("mixed")) as Arc<dyn ChunkGraphExtractor>) })
+    }
+    register_graph_backend("MixedCase-Legacy", mixed).expect("first registration");
+    for kind in ["MixedCase-Legacy", "mixedcase-legacy"] {
+        let opts = json!({ "graphBackend": kind });
+        check_graph_backend_registered(&cm, &opts).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        let backend = graph_backend_from_opts(&cm, &opts)
+            .await
+            .expect("builds")
+            .expect("the shim backend");
+        assert_eq!(backend.name(), "mixed");
+    }
+    assert!(register_graph_backend("mixedcase-legacy", mixed).is_err());
+    assert!(register_graph_backend("AUTO", mixed).is_err());
+}
+
+/// A keyless `auto` that selected GLiNER explains a `graphSchema` conflict
+/// by the missing LLM, not by a `graph_backend` the caller never set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_schema_under_keyless_auto_names_the_missing_llm() {
+    let dir = TempDir::new().expect("tempdir");
+    let state = HandleState::from_settings_with_registry(settings_under(&dir), stub_registry());
+    state
+        .cm
+        .config()
+        .set("llm_api_key", json!(""))
+        .expect("known key");
+    let svc = state.services().await.expect("a keyless handle warms");
+    let err = cognee_bindings_common::ops::pipeline::check_cognify_opts(
+        &svc,
+        &json!({ "graphSchema": { "title": "M", "type": "object", "properties": { "name": { "type": "string" } } } }),
+    )
+    .expect_err("gliner cannot serve a graph schema");
+    assert!(
+        err.to_string().contains("no usable LLM is configured"),
+        "{err}"
+    );
+}

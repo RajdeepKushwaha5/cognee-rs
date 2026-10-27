@@ -173,6 +173,8 @@ const ENV_VARS: &[&str] = &[
     "ENABLE_LAST_ACCESSED",
     "COGNEE_SINGLE_PROCESS",
     "COGNEE_STRICT_CONFIG",
+    "COGNEE_SKIP_PREFLIGHT",
+    "COGNEE_SKIP_CONNECTION_TEST",
     // Component config sections of a default build.
     "GRAPH_MAX_DB_SIZE",
     "COGNEE_DEBUG_LLM_REQUEST",

@@ -2631,6 +2631,70 @@
   "COGNEE_SINGLE_PROCESS=\"{\\\"ssl\\\":true}\"": {
     "single_process": false
   },
+  "COGNEE_SKIP_CONNECTION_TEST=\"  \"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"-1\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"0\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"1\"": {
+    "skip_connection_test": true
+  },
+  "COGNEE_SKIP_CONNECTION_TEST=\"1.5\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"42\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"5000000000\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"70000\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"TRUE\"": {
+    "skip_connection_test": true
+  },
+  "COGNEE_SKIP_CONNECTION_TEST=\"[1]\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"abc\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"false\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"no\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"on\"": {
+    "skip_connection_test": true
+  },
+  "COGNEE_SKIP_CONNECTION_TEST=\"require\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"true\"": {
+    "skip_connection_test": true
+  },
+  "COGNEE_SKIP_CONNECTION_TEST=\"v\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"yes\"": {
+    "skip_connection_test": true
+  },
+  "COGNEE_SKIP_CONNECTION_TEST=\"{\\\"a\\\":1}\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
+  "COGNEE_SKIP_CONNECTION_TEST=\"{\\\"ssl\\\":true}\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"  \"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"-1\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"0\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"1\"": {
+    "skip_preflight": true
+  },
+  "COGNEE_SKIP_PREFLIGHT=\"1.5\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"42\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"5000000000\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"70000\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"TRUE\"": {
+    "skip_preflight": true
+  },
+  "COGNEE_SKIP_PREFLIGHT=\"[1]\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"abc\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"false\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"no\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"on\"": {
+    "skip_preflight": true
+  },
+  "COGNEE_SKIP_PREFLIGHT=\"require\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"true\"": {
+    "skip_preflight": true
+  },
+  "COGNEE_SKIP_PREFLIGHT=\"v\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"yes\"": {
+    "skip_preflight": true
+  },
+  "COGNEE_SKIP_PREFLIGHT=\"{\\\"a\\\":1}\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"{\\\"ssl\\\":\\\"verify-full\\\"}\"": {},
+  "COGNEE_SKIP_PREFLIGHT=\"{\\\"ssl\\\":true}\"": {},
   "COGNEE_STRICT_CONFIG=\"  \"": {},
   "COGNEE_STRICT_CONFIG=\"\"": {},
   "COGNEE_STRICT_CONFIG=\"-1\"": {},

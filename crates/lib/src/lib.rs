@@ -167,7 +167,7 @@ pub use api::notebooks::{
     NotebookError, create_notebook, delete_notebook, list_notebooks, update_notebook,
 };
 pub use api::{DatasetDb, DatasetError, DatasetManager};
-pub use component_manager::{ComponentManager, WithTranscriber};
+pub use component_manager::{ComponentManager, GraphExtractorChoice, WithTranscriber};
 pub use config::{ConfigError, ConfigManager, Settings};
 pub use context::PipelineContext;
 pub use error::ComponentError;
@@ -175,9 +175,10 @@ pub use error::ComponentError;
 // register factories via `cognee::` paths without a direct dependency edge
 // beyond where they define the impls.
 pub use cognee_components::{
-    BackendBuildContext, ComponentRegistry, DefaultEmbeddingFactory, EmbeddingFactory,
-    EmbeddingInputs, GraphDbFactory, GraphExtractorFactory, LLM_GRAPH_EXTRACTOR, LlmFactory,
-    LlmInputs, OntologyResolverFactory, StorageFactory, VectorDbFactory,
+    AUTO_GRAPH_EXTRACTOR, BackendBuildContext, ComponentRegistry, DefaultEmbeddingFactory,
+    EmbeddingFactory, EmbeddingInputs, GLINER_GRAPH_EXTRACTOR, GraphDbFactory,
+    GraphExtractorFactory, LLM_GRAPH_EXTRACTOR, LlmFactory, LlmInputs, OntologyResolverFactory,
+    StorageFactory, VectorDbFactory, is_auto_graph_extractor, keyless_extractor_unavailable,
 };
 
 /// Convenience re-exports for common usage.

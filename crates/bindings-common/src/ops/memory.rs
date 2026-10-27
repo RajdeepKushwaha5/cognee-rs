@@ -22,8 +22,13 @@
 //!
 //! ### `remember` opts
 //! ```json
-//! {"sessionId":"...", "selfImprovement":bool, "tenant":"<uuid>"}
+//! {"sessionId":"...", "selfImprovement":bool, "tenant":"<uuid>",
+//!  "extractor":"auto"|"llm"|"gliner", "graphBackend":...}
 //! ```
+//!
+//! `extractor` (Python's argument) and `graphBackend` select the graph
+//! extractor as for `cognify`; `extractor` with `sessionId` is an error, as in
+//! Python, since a session-scoped remember does not cognify.
 //!
 //! ### `remember_entry` entry (discriminated union on `"type"`)
 //! ```json
@@ -228,6 +233,15 @@ pub async fn run_remember(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let session_id: Option<&str> = session_id_owned.as_deref();
+    if session_id.is_some()
+        && opts
+            .get(crate::graph_backend::EXTRACTOR_OPT)
+            .is_some_and(|v| !v.is_null())
+    {
+        return Err(SdkError::Validation(
+            "`extractor` is not supported when `sessionId` is provided".to_string(),
+        ));
+    }
     let self_improvement = opts
         .get("selfImprovement")
         .and_then(|v| v.as_bool())
@@ -237,9 +251,14 @@ pub async fn run_remember(
     let owner_id = state.owner_id().await?;
 
     // Resolved before `remember` writes anything: an unregistered extractor
-    // kind fails here instead of after ingestion.
-    let cognify_config =
-        Arc::new(super::pipeline::cognify_config_with_graph_backend(svc.as_ref(), opts).await?);
+    // kind fails here instead of after ingestion. A session-scoped remember
+    // does not cognify, so it resolves none (with no LLM key, `auto` would
+    // otherwise fail it over a GLiNER extractor it never uses).
+    let cognify_config = Arc::new(if session_id.is_some() {
+        svc.cognify_config.clone()
+    } else {
+        super::pipeline::cognify_config_with_graph_backend(svc.as_ref(), opts).await?
+    });
 
     let result = remember(
         inputs,
@@ -436,8 +455,26 @@ pub async fn run_improve(
         .map(memify_result_json)
         .unwrap_or(serde_json::Value::Null);
 
+    // Per-stage records, Python's `ImproveResult.stages`. Only the truth
+    // stage reports one so far.
+    let stages: Vec<serde_json::Value> = result
+        .stages
+        .iter()
+        .map(|stage| {
+            json!({
+                "stage": stage.stage,
+                "status": stage.status.as_str(),
+                "reason": stage.reason,
+                "error": stage.error,
+                "counts": stage.counts,
+                "durationMs": stage.duration_ms,
+            })
+        })
+        .collect();
+
     Ok(json!({
         "stagesRun": result.stages_run,
+        "stages": stages,
         "memifyResult": memify_json,
         "feedbackEntriesProcessed": result.feedback_entries_processed,
         "feedbackEntriesApplied": result.feedback_entries_applied,

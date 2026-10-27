@@ -1434,12 +1434,18 @@ weighs `1.0`. The default of `0.75` is the centre of the measured plateau — th
 summary lane searches a *derivative* of the same documents the chunk lane
 searches, so it is a second opinion rather than an independent channel.
 
-**Reserved (Phase 2, inert).** These keys are parsed and stored but have no
-effect in Phase 1 — passing `true` must behave identically to the default:
+**Truth weighting.** `use_truth_weight` (default `false`) re-ranks the chunk
+lane by truth-subspace alignment with the query. It needs exactly one dataset
+in scope and chunk coordinates at the live centroid epoch, which
+`improve(build_truth_subspace=true)` builds from the session's distilled
+learnings; with neither, ranking stays at baseline. A failed build keeps the
+previous epoch live and reports the `build_truth_subspace` stage as `errored`;
+a graph backend without truth-state support (`GraphDBTrait::supports_truth_state`)
+reports it as `skipped` / `backend_unsupported`.
 
-- `use_truth_weight` (default `false`) — truth-subspace weighting is Phase 2
-  only; the Python `build_truth_subspace` path runs on `improve()`, not
-  implemented on the Rust side yet.
+**Reserved (inert).** These keys are parsed and stored but have no effect yet —
+passing `true` must behave identically to the default:
+
 - `include_global_context_index` (default `false`) and
   `global_context_index_top_k` (default `3`) — the global-context lane depends
   on a `GlobalContextSummary` node type and global-context utilities not yet
@@ -1495,14 +1501,19 @@ picks the extractor cognify uses to turn chunks into graph facts.
 
 | Env var | Key (alias) | Default |
 |---|---|---|
-| `GRAPH_EXTRACTOR` | `graph_extraction.backend` (`graph_extractor`) | `llm` |
+| `GRAPH_EXTRACTOR` | `graph_extraction.backend` (`graph_extractor`) | `auto` |
 
-`llm` is cognify's built-in LLM extractor. Other kinds (GLiNER, …) are
-`GraphExtractorFactory`s that an external crate registers with
-`register_graph_extractor`, together with their own config sections. A binding's
-per-call `graphBackend` cognify option (a kind string, or `{"kind": …, …tuning}`)
-overrides the default. A kind nothing is registered under is an error; cognify
-never falls back to the LLM extractor silently.
+`llm` is cognify's built-in LLM extractor. `auto`, the default as in Python,
+picks `llm` when an LLM is usable and `gliner` otherwise (see
+[Keyless cognify](#keyless-cognify)). `gliner_demo`, Python's name, means
+`gliner`. Other kinds (GLiNER, …) are `GraphExtractorFactory`s that an external
+crate registers with `register_graph_extractor`, together with their own config
+sections. The setting is overridden per call by Python's `extractor` argument:
+the bindings' `extractor` option and the CLI's `--extractor` flag on `cognify`,
+`add-and-cognify` and `remember`. A binding's `graphBackend` cognify option (a
+kind string, or `{"kind": …, …tuning}`) overrides both. A kind nothing is
+registered under is an error; cognify never falls back to the LLM extractor
+silently, and neither does `auto`.
 
 Every operation that cognifies honours the setting: `cognify` and
 `add-and-cognify` in the CLI and the bindings, and the operations that cognify
@@ -1510,8 +1521,48 @@ as a sub-step (`remember`, `improve`, and the bindings' `update`). Each one
 resolves the extractor before any side effect, so an unregistered kind fails
 before data is ingested or deleted. Library callers that build a `CognifyConfig`
 themselves get the configured backend from
-`ComponentManager::configured_graph_extractor` and attach it with
-`with_graph_backend`.
+`ComponentManager::configured_graph_extractor` (or `graph_extractor` with a
+per-call selection) and attach it with `with_graph_backend`;
+`ComponentManager::resolve_graph_extractor` returns the resolved kind.
+
+### Keyless cognify
+
+With no usable LLM, cognify runs on local models instead of failing, as in
+Python (`keyless_local_defaults_apply`):
+
+* the `auto` graph extractor resolves to `gliner`. Nothing in this repository
+  registers a `gliner` extractor, so a build without one fails cognify with an
+  error naming the remedies: set `LLM_API_KEY`, register a `gliner` extractor,
+  or set `GRAPH_EXTRACTOR` to a registered kind;
+* an embedder with no embedding setting configured (provider and model at the
+  stock default, no `EMBEDDING_API_KEY`, no `EMBEDDING_ENDPOINT`) runs on the
+  local ONNX model (`onnx`, `BGE-Small-v1.5`, 384 dimensions; Python uses
+  fastembed's `BAAI/bge-small-en-v1.5`). The model is downloaded on first use.
+
+"Usable" is `ComponentManager::llm_available()` (see [LLM](#llm)): the
+provider needs no key (`LlmFactory::requires_api_key` is `false`, as for
+Bedrock and the mock LLM) or `LLM_API_KEY` is set. Without one, setup still
+succeeds and only a call that needs the LLM (a completion search, the `llm`
+extractor chosen explicitly) fails. Python also counts `llama_cpp`, Azure
+managed identity and an MCP sampling session; this port has none of those
+providers.
+
+These settings keep the configuration as given (the LLM extractor and the
+configured embedder), for runs with deliberately partial or fake provider
+config:
+
+| Env var | Key | Default |
+|---|---|---|
+| `COGNEE_SKIP_PREFLIGHT` | `skip_preflight` | `false` |
+| `COGNEE_SKIP_CONNECTION_TEST` | `skip_connection_test` | `false` |
+| `MOCK_EMBEDDING` | `embedding.mock` (`mock_embedding`) | _(empty)_ |
+
+Python reads the same three env vars for this; it counts `MOCK_EMBEDDING` only
+as `true`/`1`/`yes`, while here any mock mode (`zero`, `deterministic`, …)
+counts. Python's settings report the effective embedder; here the configured
+`embedding.*` values are what `config get` and the telemetry snapshot show,
+while `ComponentManager::effective_embedding` (used by `cognee-cli export` to
+label the vectors) reports the one in use.
 
 ### Custom graph schema (per call)
 

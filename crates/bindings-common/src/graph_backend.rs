@@ -44,14 +44,21 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
-use cognee::ComponentManager;
-use cognee::LLM_GRAPH_EXTRACTOR;
 use cognee::cognify::ChunkGraphExtractor;
+use cognee::{
+    AUTO_GRAPH_EXTRACTOR, ComponentManager, GraphExtractorChoice, LLM_GRAPH_EXTRACTOR,
+    keyless_extractor_unavailable,
+};
 
 use crate::SdkError;
 
 /// The opts key carrying the backend selection.
 pub const GRAPH_BACKEND_OPT: &str = "graphBackend";
+
+/// The opts key carrying Python's per-call `extractor` selection: `auto`,
+/// `llm`, `gliner` (alias `gliner_demo`) or another registered kind, as a
+/// bare string. [`GRAPH_BACKEND_OPT`] wins when both are given.
+pub const EXTRACTOR_OPT: &str = "extractor";
 
 /// What a [`GraphBackendFactory`] returns.
 ///
@@ -89,8 +96,9 @@ static REGISTRY: RwLock<BTreeMap<String, GraphBackendFactory>> = RwLock::new(BTr
 /// established pattern for that case.
 ///
 /// # Errors
-/// Returns `Err(factory)` if `kind` is already registered (or is `llm`, the
-/// built-in extractor's reserved kind), leaving the existing
+/// Returns `Err(factory)` if `kind` is already registered (any case), or is
+/// `llm` (the built-in extractor) or `auto` (the selection between it and
+/// `gliner`), both reserved, leaving the existing
 /// registration in place — the same first-writer-wins contract, and the same
 /// "hand the loser back" signature, as `set_handle_factory`. Callers that
 /// register from a module initializer, where there is nothing to report an
@@ -103,7 +111,10 @@ pub fn register_graph_backend(
     // the lock; the map itself is a plain insert away from consistent, and
     // refusing to register would be a worse outcome than reading it.
     let mut registry = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
-    if registry.contains_key(kind) || kind.eq_ignore_ascii_case(LLM_GRAPH_EXTRACTOR) {
+    if legacy_key(&registry, kind).is_some()
+        || kind.eq_ignore_ascii_case(LLM_GRAPH_EXTRACTOR)
+        || kind.eq_ignore_ascii_case(AUTO_GRAPH_EXTRACTOR)
+    {
         return Err(factory);
     }
     registry.insert(kind.to_owned(), factory);
@@ -159,28 +170,52 @@ pub fn graph_backend_spec(opts: &Value) -> Result<Option<(String, Value)>, SdkEr
     }
 }
 
-/// The extractor this call uses: the opts' selection, else the configured
-/// `graph_extraction.backend`. `None` is the built-in LLM extractor.
+/// The `extractor` opt as a kind string, `None` when absent or `null`.
 ///
 /// # Errors
-/// As [`graph_backend_spec`].
+/// [`SdkError::Validation`] when present but not a string.
+fn extractor_opt(opts: &Value) -> Result<Option<String>, SdkError> {
+    match opts.get(EXTRACTOR_OPT) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(kind)) => Ok(Some(kind.clone())),
+        Some(other) => Err(SdkError::Validation(format!(
+            "`{EXTRACTOR_OPT}` must be a kind string (`auto`, `llm`, `gliner`, …), got {other}"
+        ))),
+    }
+}
+
+/// A selection resolved to a backend other than the LLM extractor.
+struct Resolved {
+    /// The kind (`auto` and the `gliner_demo` alias already resolved).
+    choice: GraphExtractorChoice,
+    /// What the factory receives (see [`GraphExtractorChoice::spec_for`]).
+    spec: Value,
+}
+
+/// The extractor this call uses: the opts' `graphBackend`, else their
+/// `extractor`, else the configured `graph_extraction.backend`, resolved by
+/// [`ComponentManager::resolve_graph_extractor`]. `None` is the built-in LLM
+/// extractor, as is a `graphBackend` naming no kind (`""`), which has always
+/// meant it. A blank `extractor` defers to the setting, as in Python.
+///
+/// # Errors
+/// As [`graph_backend_spec`], plus [`SdkError::Validation`] for a
+/// non-string `extractor`.
 fn resolve_graph_backend(
     cm: &ComponentManager,
     opts: &Value,
-) -> Result<Option<(String, Value)>, SdkError> {
-    let (kind, spec) = match graph_backend_spec(opts)? {
-        Some(selected) => selected,
-        None => {
-            let kind = cm.settings().graph_extraction().backend;
-            let spec = Value::String(kind.clone());
-            (kind, spec)
-        }
+) -> Result<Option<Resolved>, SdkError> {
+    let (selected, spec) = match graph_backend_spec(opts)? {
+        Some((kind, _)) if kind.trim().is_empty() => return Ok(None),
+        Some((kind, spec)) => (Some(kind), spec),
+        None => (extractor_opt(opts)?, Value::Null),
     };
-    let trimmed = kind.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(LLM_GRAPH_EXTRACTOR) {
+    let choice = cm.resolve_graph_extractor(selected.as_deref(), &legacy_registered);
+    if choice.is_llm() {
         return Ok(None);
     }
-    Ok(Some((kind, spec)))
+    let spec = choice.spec_for(&spec);
+    Ok(Some(Resolved { choice, spec }))
 }
 
 /// Whether this call selects a graph-extraction backend other than the
@@ -190,15 +225,35 @@ fn resolve_graph_backend(
 /// # Errors
 /// As [`graph_backend_spec`].
 pub fn selects_graph_backend(cm: &ComponentManager, opts: &Value) -> Result<bool, SdkError> {
-    Ok(resolve_graph_backend(cm, opts)?.is_some())
+    Ok(selected_graph_backend(cm, opts)?.is_some())
 }
 
-/// Whether the process-wide shim registry serves `kind`.
+/// The backend this call selects other than the built-in LLM extractor, and
+/// whether it came from `auto`, without checking that anything is
+/// registered under it.
+///
+/// # Errors
+/// As [`selects_graph_backend`].
+pub fn selected_graph_backend(
+    cm: &ComponentManager,
+    opts: &Value,
+) -> Result<Option<GraphExtractorChoice>, SdkError> {
+    Ok(resolve_graph_backend(cm, opts)?.map(|resolved| resolved.choice))
+}
+
+/// The shim registry's key for `kind`, matched without regard to case: the
+/// selection is lowercased when it is resolved, but a shim kind is stored as
+/// registered.
+fn legacy_key(registry: &BTreeMap<String, GraphBackendFactory>, kind: &str) -> Option<String> {
+    registry
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(kind))
+        .cloned()
+}
+
+/// Whether the process-wide shim registry serves `kind` (any case).
 fn legacy_registered(kind: &str) -> bool {
-    REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(kind)
+    legacy_key(&REGISTRY.read().unwrap_or_else(|e| e.into_inner()), kind).is_some()
 }
 
 /// Validate the selection without building anything: the shape parses and a
@@ -212,13 +267,14 @@ fn legacy_registered(kind: &str) -> bool {
 /// As [`graph_backend_spec`], plus [`SdkError::Validation`] for a kind nothing
 /// is registered under.
 pub fn check_graph_backend_registered(cm: &ComponentManager, opts: &Value) -> Result<(), SdkError> {
-    let Some((kind, _)) = resolve_graph_backend(cm, opts)? else {
+    let Some(resolved) = resolve_graph_backend(cm, opts)? else {
         return Ok(());
     };
-    if cm.registry().has_graph_extractor(&kind) || legacy_registered(&kind) {
+    let kind = &resolved.choice.kind;
+    if cm.registry().has_graph_extractor(kind) || legacy_registered(kind) {
         return Ok(());
     }
-    Err(unknown_kind(cm, &kind))
+    Err(unknown_kind(cm, &resolved))
 }
 
 /// Build the backend this call uses, or `None` for the built-in LLM
@@ -231,20 +287,21 @@ pub async fn graph_backend_from_opts(
     cm: &ComponentManager,
     opts: &Value,
 ) -> Result<Option<Arc<dyn ChunkGraphExtractor>>, SdkError> {
-    let Some((kind, spec)) = resolve_graph_backend(cm, opts)? else {
+    let Some(resolved) = resolve_graph_backend(cm, opts)? else {
         return Ok(None);
     };
-    if cm.registry().has_graph_extractor(&kind) {
-        return Ok(cm.graph_extractor(Some(&kind), &spec).await?);
+    let kind = &resolved.choice.kind;
+    if cm.registry().has_graph_extractor(kind) {
+        return Ok(cm.graph_extractor(Some(kind), &resolved.spec).await?);
     }
     // Copy the fn pointer out and drop the guard: a factory may await, and the
     // registry lock must not be held across that.
     let factory = {
         let registry = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
-        registry.get(&kind).copied()
+        legacy_key(&registry, kind).and_then(|key| registry.get(&key).copied())
     };
-    let factory = factory.ok_or_else(|| unknown_kind(cm, &kind))?;
-    factory(spec).await.map(Some)
+    let factory = factory.ok_or_else(|| unknown_kind(cm, &resolved))?;
+    factory(resolved.spec).await.map(Some)
 }
 
 /// Every kind `cm` can serve — its registry's and the shim's — sorted.
@@ -261,7 +318,14 @@ pub fn available_graph_backend_kinds(cm: &ComponentManager) -> Vec<String> {
 ///
 /// Spells out that cognify did **not** run, because the alternative reading —
 /// "warning, used the LLM instead" — is the one that costs money.
-fn unknown_kind(cm: &ComponentManager, kind: &str) -> SdkError {
+fn unknown_kind(cm: &ComponentManager, resolved: &Resolved) -> SdkError {
+    if resolved.choice.from_auto {
+        return SdkError::Validation(format!(
+            "{} Cognify was NOT run with the LLM extractor instead.",
+            keyless_extractor_unavailable(&available_graph_backend_kinds(cm))
+        ));
+    }
+    let kind = &resolved.choice.kind;
     SdkError::Validation(format!(
         "no graph backend is registered for `{GRAPH_BACKEND_OPT}` kind {kind:?}{}. \
          Cognify was NOT run with the LLM extractor instead.",

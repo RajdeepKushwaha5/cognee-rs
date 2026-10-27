@@ -446,6 +446,13 @@ pub struct CognifyArgs {
     #[command(flatten)]
     pub graph_schema: GraphSchemaArgs,
 
+    /// Graph extractor for this run: `auto` (the LLM when one is usable, else
+    /// the local GLiNER extractor), `llm`, `gliner` (alias `gliner_demo`) or
+    /// another registered kind. Overrides `GRAPH_EXTRACTOR`; Python's
+    /// `extractor` argument.
+    #[arg(long = "extractor")]
+    pub extractor: Option<String>,
+
     /// Tenant to run as; without `--datasets`, cognify runs on the owner's datasets
     /// in this tenant. Datasets are matched by strict tenant equality: a dataset
     /// added with `--tenant-id T` is found only with `--tenant-id T`; without the
@@ -495,6 +502,13 @@ pub struct AddAndCognifyArgs {
 
     #[command(flatten)]
     pub graph_schema: GraphSchemaArgs,
+
+    /// Graph extractor for this run: `auto` (the LLM when one is usable, else
+    /// the local GLiNER extractor), `llm`, `gliner` (alias `gliner_demo`) or
+    /// another registered kind. Overrides `GRAPH_EXTRACTOR`; Python's
+    /// `extractor` argument.
+    #[arg(long = "extractor")]
+    pub extractor: Option<String>,
 }
 
 /// Custom graph model flags shared by `cognify` and `add-and-cognify`.
@@ -733,6 +747,13 @@ pub struct RememberArgs {
     /// `self_improvement=True`).
     #[arg(long = "no-improve", default_value_t = false)]
     pub no_improve: bool,
+
+    /// Graph extractor for this run: `auto` (the LLM when one is usable, else
+    /// the local GLiNER extractor), `llm`, `gliner` (alias `gliner_demo`) or
+    /// another registered kind. Overrides `GRAPH_EXTRACTOR`; Python's
+    /// `extractor` argument.
+    #[arg(long = "extractor")]
+    pub extractor: Option<String>,
 
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,

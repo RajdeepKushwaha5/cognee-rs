@@ -32,6 +32,14 @@ pub fn run(args: RememberArgs, cm: Arc<ComponentManager>) -> Result<(), CliError
 
     let tenant_id = super::parse_tenant_id(args.tenant_id.as_deref())?;
 
+    // As in Python: a session-scoped remember never cognifies, so an explicit
+    // extractor there is a mistake, not a no-op.
+    if args.session_id.is_some() && args.extractor.is_some() {
+        return Err(CliError::Validation(
+            "--extractor is not supported with --session-id".to_string(),
+        ));
+    }
+
     // `--no-improve` flips the default-on self-improvement (memify) pass.
     let self_improvement = !args.no_improve;
 
@@ -43,11 +51,20 @@ pub fn run(args: RememberArgs, cm: Arc<ComponentManager>) -> Result<(), CliError
 
     crate::teardown::run_command(Arc::clone(&cm), async {
         // `graph_extraction.backend`, resolved before any side effect: an
-        // unregistered kind is an error, never a silent LLM-extractor run.
+        // unregistered kind is an error, never a silent LLM-extractor run. A
+        // session-scoped remember does not cognify, so it resolves none.
         let mut cognify_config = cm.settings().cognify_config();
-        if let Some(backend) = cm.configured_graph_extractor().await.map_err(|error| {
-            CliError::Runtime(format!("Graph extractor initialization failed: {error}"))
-        })? {
+        if args.session_id.is_none()
+            && let Some(backend) = cm
+                .graph_extractor(
+                    args.extractor.as_deref(),
+                    &serde_json::Value::String(String::new()),
+                )
+                .await
+                .map_err(|error| {
+                    CliError::Runtime(format!("Graph extractor initialization failed: {error}"))
+                })?
+        {
             cognify_config = cognify_config.with_graph_backend(backend);
         }
 

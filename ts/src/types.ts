@@ -53,6 +53,13 @@ export interface CogneeCognifyOptions {
    * `graphSchema` or `graphSpec`.
    */
   chunkAttachment?: "direct" | "all";
+  /**
+   * Graph extractor for this run — Python's `extractor`: `"auto"` (the
+   * LLM when one is usable, else the local GLiNER extractor), `"llm"`,
+   * `"gliner"` (alias `"gliner_demo"`) or another registered kind.
+   * Overrides `GRAPH_EXTRACTOR`.
+   */
+  extractor?: string;
 }
 
 /**
@@ -437,6 +444,11 @@ export interface CogneeRememberOptions {
   selfImprovement?: boolean;
   /** Tenant UUID string (multi-tenant scoping). */
   tenant?: string;
+  /**
+   * Graph extractor for the cognify step, as for `cognify`. Not
+   * together with `sessionId`.
+   */
+  extractor?: string;
 }
 
 /**
@@ -562,9 +574,24 @@ export interface CogneeImproveOptions {
   tenant?: string;
 }
 
+/** What one improve stage did (Python's `StageResult`). */
+export interface CogneeImproveStage {
+  stage: string;
+  status: "completed" | "already_completed" | "skipped" | "errored";
+  /** Why the stage was skipped; set whenever `status` is `"skipped"`. */
+  reason: string | null;
+  error: string | null;
+  /** Integer counts the stage reported, keyed as the stage names them. */
+  counts: Record<string, number>;
+  /** Wall time of the stage's run; 0 for a stage its gate skipped. */
+  durationMs: number;
+}
+
 /** Result of `cogneeImprove`. Hand-built from `ImproveResult` (not Serialize). */
 export interface CogneeImproveResult {
   stagesRun: string[];
+  /** Per-stage records; only `build_truth_subspace` reports one so far. */
+  stages: CogneeImproveStage[];
   memifyResult: CogneeMemifyResult | null;
   feedbackEntriesProcessed: number;
   feedbackEntriesApplied: number;

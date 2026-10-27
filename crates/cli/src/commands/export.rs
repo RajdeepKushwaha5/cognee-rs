@@ -26,9 +26,9 @@ pub fn run(args: ExportArgs, cm: Arc<ComponentManager>) -> Result<(), CliError> 
     let pack = args.pack;
 
     crate::teardown::run_command(Arc::clone(&cm), async move {
-        // Scoped so the settings read guard is dropped before the awaits
-        // below (clippy::await_holding_lock).
-        let embedding_model = cm.settings().embedding().model.clone();
+        // The embedder the vectors were written with: the local model when
+        // the keyless defaults switched to it, not the configured one.
+        let embedding_model = cm.effective_embedding().model;
 
         let graph_db = cm
             .graph_db()

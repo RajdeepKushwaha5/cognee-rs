@@ -59,9 +59,15 @@ pub fn run(args: AddAndCognifyArgs, cm: Arc<ComponentManager>) -> Result<(), Cli
         // `graph_extraction.backend`, resolved before the add: an unregistered
         // kind must not get the documents ingested by a call that was always
         // going to fail (nor silently fall back to the LLM extractor).
-        let graph_backend = cm.configured_graph_extractor().await.map_err(|error| {
-            CliError::Runtime(format!("Graph extractor initialization failed: {error}"))
-        })?;
+        let graph_backend = cm
+            .graph_extractor(
+                args.extractor.as_deref(),
+                &serde_json::Value::String(String::new()),
+            )
+            .await
+            .map_err(|error| {
+                CliError::Runtime(format!("Graph extractor initialization failed: {error}"))
+            })?;
         let mut cognify_config = flag_config;
         if let Some(backend) = graph_backend {
             cognify_config = cognify_config.with_graph_backend(backend);

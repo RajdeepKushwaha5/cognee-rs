@@ -418,6 +418,8 @@ static KEYS: &[KeySpec] = &[
     // -- Feature flags ------------------------------------------------------
     row!(enable_last_accessed: bool, env ["ENABLE_LAST_ACCESSED"]),
     row!(strict_config: bool, env ["COGNEE_STRICT_CONFIG"]),
+    row!(skip_preflight: bool, env ["COGNEE_SKIP_PREFLIGHT"]),
+    row!(skip_connection_test: bool, env ["COGNEE_SKIP_CONNECTION_TEST"]),
     KeySpec {
         key: "single_process",
         key_aliases: &[],

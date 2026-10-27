@@ -358,9 +358,11 @@ impl ComponentRegistry {
         f: Arc<dyn GraphExtractorFactory>,
     ) -> Result<(), ComponentError> {
         let kind = f.provider().to_lowercase();
-        if kind == LLM_GRAPH_EXTRACTOR {
+        if kind == LLM_GRAPH_EXTRACTOR || kind == AUTO_GRAPH_EXTRACTOR {
             return Err(ComponentError::Config(format!(
-                "graph extractor kind `{LLM_GRAPH_EXTRACTOR}` is reserved for the built-in extractor"
+                "graph extractor kind `{kind}` is reserved (`{LLM_GRAPH_EXTRACTOR}` is the \
+                 built-in extractor, `{AUTO_GRAPH_EXTRACTOR}` the selection between it and \
+                 `{GLINER_GRAPH_EXTRACTOR}`)"
             )));
         }
         self.graph_extractor.insert(kind, f);
@@ -901,9 +903,81 @@ impl ComponentRegistry {
     }
 }
 
-/// The graph-extraction kind of cognify's own LLM extractor
-/// (`graph_extraction.backend`'s default).
+/// The graph-extraction kind of cognify's own LLM extractor.
 pub const LLM_GRAPH_EXTRACTOR: &str = "llm";
+
+/// The graph-extraction selection that picks [`LLM_GRAPH_EXTRACTOR`] when an
+/// LLM is usable and [`GLINER_GRAPH_EXTRACTOR`] otherwise
+/// (`graph_extraction.backend`'s default, as in Python).
+pub const AUTO_GRAPH_EXTRACTOR: &str = "auto";
+
+/// The graph-extraction kind of the local GLiNER extractor: what
+/// [`AUTO_GRAPH_EXTRACTOR`] resolves to with no usable LLM. Nothing in this
+/// repository registers it; a backend crate does.
+pub const GLINER_GRAPH_EXTRACTOR: &str = "gliner";
+
+/// Python's name for [`GLINER_GRAPH_EXTRACTOR`] (`gliner_demo`); Python maps
+/// `gliner` to it, this crate maps it to `gliner`.
+const GLINER_DEMO_ALIAS: &str = "gliner_demo";
+
+/// The graph-extraction kind one cognify run uses (Python's
+/// `resolve_extractor`): `selected` trimmed and lowercased, with an empty
+/// selection or [`AUTO_GRAPH_EXTRACTOR`] resolved to `gliner` when `keyless`
+/// (no usable LLM, see [`ComponentRegistry::llm_available`]) and to `llm`
+/// otherwise, and Python's `gliner_demo` read as `gliner`.
+///
+/// The registry stays the authority on kinds: a kind `is_registered` serves
+/// is returned as given, so a backend registered under `gliner_demo` is not
+/// redirected (`auto` and `llm` cannot be registered). Any other kind is
+/// also returned as given, for the registry to accept or refuse.
+#[must_use]
+pub fn resolve_graph_extractor_kind(
+    selected: &str,
+    keyless: bool,
+    is_registered: &dyn Fn(&str) -> bool,
+) -> String {
+    let kind = selected.trim().to_lowercase();
+    if is_auto_graph_extractor(&kind) {
+        let resolved = if keyless {
+            GLINER_GRAPH_EXTRACTOR
+        } else {
+            LLM_GRAPH_EXTRACTOR
+        };
+        return resolved.to_string();
+    }
+    if kind == GLINER_DEMO_ALIAS && !is_registered(&kind) {
+        return GLINER_GRAPH_EXTRACTOR.to_string();
+    }
+    kind
+}
+
+/// Whether `selected` asks for [`AUTO_GRAPH_EXTRACTOR`] (an empty selection
+/// does too), so that GLiNER missing under it is a keyless-setup problem, not
+/// an unknown kind.
+#[must_use]
+pub fn is_auto_graph_extractor(selected: &str) -> bool {
+    let selected = selected.trim();
+    selected.is_empty() || selected.eq_ignore_ascii_case(AUTO_GRAPH_EXTRACTOR)
+}
+
+/// The error for an `auto` selection that resolved to GLiNER with no GLiNER
+/// extractor registered (Python's `KeylessExtractorNotInstalledError`).
+/// `registered` lists the kinds that are.
+#[must_use]
+pub fn keyless_extractor_unavailable(registered: &[String]) -> String {
+    let registered = if registered.is_empty() {
+        "none".to_string()
+    } else {
+        registered.join(", ")
+    };
+    format!(
+        "no usable LLM is configured, so the `{AUTO_GRAPH_EXTRACTOR}` graph extractor selected \
+         the local `{GLINER_GRAPH_EXTRACTOR}` extractor, but none is registered in this build \
+         (registered: {registered}). Set LLM_API_KEY (or select an LLM provider that needs no \
+         key) to extract with the LLM, register a `{GLINER_GRAPH_EXTRACTOR}` graph extractor, \
+         or set GRAPH_EXTRACTOR to a registered kind."
+    )
+}
 
 impl Default for ComponentRegistry {
     fn default() -> Self {

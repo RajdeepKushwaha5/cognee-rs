@@ -54,10 +54,14 @@ pub use dataset_storage::{
     default_graph_handler, default_vector_handler,
 };
 pub use error::ComponentError;
-pub use registry::{ComponentRegistry, LLM_GRAPH_EXTRACTOR, default_graph_provider};
+pub use registry::{
+    AUTO_GRAPH_EXTRACTOR, ComponentRegistry, GLINER_GRAPH_EXTRACTOR, LLM_GRAPH_EXTRACTOR,
+    default_graph_provider, is_auto_graph_extractor, keyless_extractor_unavailable,
+    resolve_graph_extractor_kind,
+};
 pub use sections::{
     AnthropicConfig, AwsConfig, CognifySettings, EmbeddingConfig, FsSessionConfig, GraphConfig,
-    GraphExtractionConfig, HybridSearchSettings, LlmConfig, OllamaEmbeddingConfig,
+    GraphExtractionConfig, HybridSearchSettings, LOCAL_EMBEDDING, LlmConfig, OllamaEmbeddingConfig,
     OnnxEmbeddingConfig, OntologyConfig, OpenAiCompatibleConfig, OpenAiCompatibleEmbeddingConfig,
     RedisSessionConfig, RelationalConfig, SearchSettings, SessionConfig, StorageConfig,
     VectorConfig,
