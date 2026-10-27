@@ -219,7 +219,7 @@ async fn add_audio_stores_transcript_pg() {
     impl_add_audio_stores_transcript(&url).await;
 }
 
-/// `flac` is classified as audio but Whisper does not accept it, so the
+/// `aac` is classified as audio but Whisper does not accept it, so the
 /// loader refuses it before any transcription call.
 #[cfg(feature = "audio-loader")]
 #[tokio::test]
@@ -232,18 +232,18 @@ async fn add_audio_rejects_format_whisper_does_not_accept() {
     let error = pipeline
         .add(
             vec![DataInput::Binary {
-                data: b"fLaC-fake-payload".to_vec(),
-                name: "speech.flac".to_string(),
+                data: b"fake-aac-payload".to_vec(),
+                name: "speech.aac".to_string(),
             }],
             "audio",
             Uuid::new_v4(),
             None,
         )
         .await
-        .expect_err("flac must be refused");
+        .expect_err("aac must be refused");
 
     assert!(
-        error.to_string().contains("flac"),
+        error.to_string().contains("aac"),
         "unexpected error: {error}"
     );
 }

@@ -672,6 +672,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cognee-llm`: `flac` and `ogg` audio are transcribed.** The Whisper format
+  whitelist left out two formats the OpenAI transcription API and Python's
+  audio loader accept, so both failed with `Unsupported audio format`.
+
 - **`cognee-cognify`: temporal LLM failures are no longer silent.** Both temporal
   passes caught their own errors and returned `Ok`:
   `TemporalEventExtractor::extract_events` warned and returned an empty `Vec`,
