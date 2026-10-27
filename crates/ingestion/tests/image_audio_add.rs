@@ -149,7 +149,7 @@ async fn add_audio_errors_without_loader_pg() {
 }
 
 // ---------------------------------------------------------------------------
-// Audio add with a transcriber — the transcript is stored as text
+// Audio add with a transcriber: the transcript is stored as text
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "audio-loader")]
@@ -217,6 +217,89 @@ async fn add_audio_stores_transcript_pg() {
         return;
     };
     impl_add_audio_stores_transcript(&url).await;
+}
+
+/// Re-adding the same audio reuses the stored transcript: no second (paid)
+/// transcription, whose text could differ, and no second stored file.
+#[cfg(feature = "audio-loader")]
+async fn impl_re_adding_audio_transcribes_it_once(db_url: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let (pipeline, _db, storage) = make_pipeline(&dir, db_url).await;
+    let whisper = Arc::new(cognee_test_utils::MockTranscriber::new(
+        "mock-whisper",
+        ["first take", "second take"]
+            .into_iter()
+            .map(|text| cognee_llm::TranscriptionOutput {
+                text: text.to_string(),
+                language: None,
+                duration: None,
+            })
+            .collect(),
+    ));
+    let pipeline = pipeline.with_transcriber(whisper.clone());
+    let owner = Uuid::new_v4();
+    let add = || {
+        pipeline.add(
+            vec![DataInput::Binary {
+                data: b"ID3\x04\x00\x00\x00fake-mp3-payload".to_vec(),
+                name: "speech.mp3".to_string(),
+            }],
+            "audio",
+            owner,
+            None,
+        )
+    };
+
+    let first = add().await.expect("first add").remove(0);
+    let again = add().await.expect("re-add").remove(0);
+
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.raw_data_location, first.raw_data_location);
+    assert_eq!(again.raw_content_hash, first.raw_content_hash);
+    assert_eq!(
+        storage.retrieve(&again.raw_data_location).await.unwrap(),
+        b"first take"
+    );
+    let next = cognee_llm::Transcriber::transcribe_audio(&*whisper, b"", "mp3", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.text, "second take",
+        "the re-add must not transcribe again"
+    );
+    let stored_files = walkdir(&dir.path().join("storage"));
+    assert_eq!(stored_files.len(), 1, "stored files: {stored_files:?}");
+}
+
+#[cfg(feature = "audio-loader")]
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root).expect("read storage dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            files.extend(walkdir(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_transcribes_it_once_sqlite() {
+    let dir = TempDir::new().expect("tempdir");
+    let url = sqlite_db_url(&dir);
+    impl_re_adding_audio_transcribes_it_once(&url).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_transcribes_it_once_pg() {
+    let Some(url) = cognee_test_utils::pg_test_url() else {
+        return;
+    };
+    impl_re_adding_audio_transcribes_it_once(&url).await;
 }
 
 /// `aac` is classified as audio but Whisper does not accept it, so the

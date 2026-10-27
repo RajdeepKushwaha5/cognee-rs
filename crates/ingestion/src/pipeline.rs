@@ -132,13 +132,20 @@ pub async fn process_input(
         owner_id,
         tenant_id,
         &LoaderRegistry::default_registry(),
+        None,
     )
     .await
 }
 
 /// [`process_input`] with the loaders of `registry` instead of
 /// [`LoaderRegistry::default_registry`].
-#[instrument(name = "ingestion.process_input", skip(input, storage, registry))]
+///
+/// With `database`, content whose data row already holds that loader's stored
+/// text is not extracted again (see [`reusable_stored_text`]).
+#[instrument(
+    name = "ingestion.process_input",
+    skip(input, storage, registry, database)
+)]
 async fn process_input_with_registry(
     input: &DataInput,
     storage: &dyn StorageTrait,
@@ -146,6 +153,7 @@ async fn process_input_with_registry(
     owner_id: Uuid,
     tenant_id: Option<Uuid>,
     registry: &LoaderRegistry,
+    database: Option<&dyn IngestDb>,
 ) -> Result<ProcessedInput, Box<dyn std::error::Error>> {
     use tokio::sync::Mutex;
 
@@ -206,6 +214,8 @@ async fn process_input_with_registry(
     let mut stored_extension = stored_extension;
     let mut stored_mime_type = stored_mime_type;
     let mut loader_engine = loader_engine;
+    // Set when a re-add reuses the stored text, whose row already has its URI.
+    let mut reused_data_uri = None;
 
     // Buffer the (effective) input bytes. For URL inputs `effective_input` is
     // the already-extracted text; for everything else it is the raw original
@@ -290,40 +300,51 @@ async fn process_input_with_registry(
                 }) as Box<dyn std::error::Error>
             })?;
 
-            // Minimal Document descriptor for the loader (only metadata fields
-            // the loaders read; the bytes are passed separately).
-            let descriptor = build_loader_descriptor(
-                data_id,
-                &extract_name(input, &content_hash),
-                &original_extension,
-                &original_mime_type,
-            );
+            if let Some(stored) =
+                reusable_stored_text(database, storage, data_id, loader.engine_name()).await?
+            {
+                stored_extension = stored.extension;
+                stored_mime_type = stored.mime_type;
+                loader_engine = loader.engine_name().to_string();
+                reused_data_uri = Some(stored.uri.clone());
+                (stored.uri, stored.raw_content_hash)
+            } else {
+                // Minimal Document descriptor for the loader (only metadata fields
+                // the loaders read; the bytes are passed separately).
+                let descriptor = build_loader_descriptor(
+                    data_id,
+                    &extract_name(input, &content_hash),
+                    &original_extension,
+                    &original_mime_type,
+                );
 
-            let extracted_text = match loader.extract(&collected, &descriptor).await? {
-                LoaderOutput::Text(t) => t,
-                LoaderOutput::Rows(rows) => rows.join("\n\n"),
-                LoaderOutput::SingleChunk { text, .. } => text,
-            };
-            let extracted_bytes = extracted_text.into_bytes();
+                let extracted_text = match loader.extract(&collected, &descriptor).await? {
+                    LoaderOutput::Text(t) => t,
+                    LoaderOutput::Rows(rows) => rows.join("\n\n"),
+                    LoaderOutput::SingleChunk { text, .. } => text,
+                };
+                let extracted_bytes = extracted_text.into_bytes();
 
-            let stored_name = format!("text_{content_hash}.txt");
-            let location = storage.store(&extracted_bytes, &stored_name).await?;
+                let stored_name = format!("text_{content_hash}.txt");
+                let location = storage.store(&extracted_bytes, &stored_name).await?;
 
-            // Stored-file metadata now describes the extracted text.
-            stored_extension = "txt".to_string();
-            stored_mime_type = "text/plain".to_string();
-            loader_engine = loader.engine_name().to_string();
+                // Stored-file metadata now describes the extracted text.
+                stored_extension = "txt".to_string();
+                stored_mime_type = "text/plain".to_string();
+                loader_engine = loader.engine_name().to_string();
 
-            let raw_content_hash = crate::content_hasher::ContentHasher::hash_content(
-                &extracted_bytes,
-                hash_algorithm,
-            );
-            (location, raw_content_hash)
+                let raw_content_hash = crate::content_hasher::ContentHasher::hash_content(
+                    &extracted_bytes,
+                    hash_algorithm,
+                );
+                (location, raw_content_hash)
+            }
         }
     };
 
     // Compute derived fields that previously lived in add()
-    let raw_data_uri = storage_location_to_uri(storage.base_path(), &storage_location);
+    let raw_data_uri = reused_data_uri
+        .unwrap_or_else(|| storage_location_to_uri(storage.base_path(), &storage_location));
     let name = extract_name(input, &content_hash);
     let original_location = if let Some(uri) = raw_source_uri.clone() {
         uri
@@ -358,6 +379,47 @@ async fn process_input_with_registry(
         node_set: None,
         importance_weight: None,
     })
+}
+
+/// The stored text of an existing data row, reused on re-add.
+struct StoredText {
+    uri: String,
+    raw_content_hash: String,
+    extension: String,
+    mime_type: String,
+}
+
+/// The stored text of the data row `data_id`, when `loader_engine` wrote it
+/// and the file is still in storage.
+///
+/// Re-adding content keeps its row as it is (see
+/// [`persist_data_with_acl_and_locks`]), so extracting again would only cost
+/// another loader run (a paid transcription for audio, whose text can differ)
+/// and leave a second stored file no row points at.
+async fn reusable_stored_text(
+    database: Option<&dyn IngestDb>,
+    storage: &dyn StorageTrait,
+    data_id: Uuid,
+    loader_engine: &str,
+) -> Result<Option<StoredText>, Box<dyn std::error::Error>> {
+    let Some(database) = database else {
+        return Ok(None);
+    };
+    let Some(row) = database.get_data(data_id).await? else {
+        return Ok(None);
+    };
+    let (Some(engine), Some(raw_content_hash)) = (row.loader_engine, row.raw_content_hash) else {
+        return Ok(None);
+    };
+    if engine != loader_engine || !storage.exists(&row.raw_data_location).await? {
+        return Ok(None);
+    }
+    Ok(Some(StoredText {
+        uri: row.raw_data_location,
+        raw_content_hash,
+        extension: row.extension,
+        mime_type: row.mime_type,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,21 +1318,25 @@ pub fn make_process_input_task(
         owner_id,
         tenant_id,
         Arc::new(LoaderRegistry::default_registry()),
+        None,
     )
 }
 
-/// [`make_process_input_task`] with the loaders of `registry`.
+/// [`make_process_input_task`] with the loaders of `registry`, and with
+/// `database` to reuse the stored text of content added before.
 fn make_process_input_task_with_registry(
     storage: Arc<dyn StorageTrait>,
     hash_algorithm: HashAlgorithm,
     owner_id: Uuid,
     tenant_id: Option<Uuid>,
     registry: Arc<LoaderRegistry>,
+    database: Option<Arc<dyn IngestDb>>,
 ) -> TypedTask<DataInput, ProcessedInput> {
     TypedTask::async_fn(move |input: &DataInput, _ctx| {
         let input = input.clone();
         let storage = Arc::clone(&storage);
         let registry = Arc::clone(&registry);
+        let database = database.clone();
         Box::pin(async move {
             process_input_with_registry(
                 &input,
@@ -1279,6 +1345,7 @@ fn make_process_input_task_with_registry(
                 owner_id,
                 tenant_id,
                 &registry,
+                database.as_deref(),
             )
             .await
             .map(Box::new)
@@ -1464,6 +1531,7 @@ fn build_add_pipeline_internal(
             owner_id,
             tenant_id,
             registry,
+            Some(Arc::clone(&database)),
         ),
     )
     .add_task(make_persist_data_task_with_acl_and_params(

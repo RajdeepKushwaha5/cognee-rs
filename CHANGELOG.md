@@ -527,7 +527,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   providers with a Whisper-style route (`openai`, `custom` /
   `openai_compatible`) transcribe; with any other provider, or when no
   transcriber can be built (no API key, say, logged at `warn`), `add` keeps the
-  old error for audio and text adds are unaffected.
+  old error for audio and text adds are unaffected. Re-adding content whose
+  data row already holds the loader's stored text reuses it instead of running
+  the loader again, so the same audio file is transcribed once.
   `LoaderRegistry::with_audio` registers the audio loader for both add and
   cognify.
 
