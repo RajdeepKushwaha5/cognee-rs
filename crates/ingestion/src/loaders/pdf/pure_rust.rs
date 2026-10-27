@@ -22,7 +22,18 @@ use crate::loaders::LoaderError;
 /// `xref` are corrected in a copy and the parse is retried once (see
 /// [`super::startxref`]). A file that parses is never rewritten, and the
 /// stored bytes are untouched either way.
+///
+/// A parse that "succeeds" with no pages at all is an error. A PDF has at
+/// least one page, and `pdf-extract` stops at the first page number it cannot
+/// find, so zero pages means the page tree, or page 1, was unreadable. One
+/// known cause is an inline `/Encrypt` dictionary, which `lopdf` does not
+/// decrypt (see [`no_pages_error`]).
+///
+/// A document with pages but no text (scanned or image-only, encrypted or
+/// not) still returns `""` with a warning, as PDFium and Python's pypdf do.
 pub fn extract_text(bytes: &[u8]) -> Result<String, LoaderError> {
+    // The bytes that were actually parsed: the input, or its repaired copy.
+    let mut repaired = None;
     let page_texts = match pdf_extract::extract_text_from_mem_by_pages(bytes) {
         Ok(pages) => pages,
         Err(original) => {
@@ -43,12 +54,20 @@ pub fn extract_text(bytes: &[u8]) -> Result<String, LoaderError> {
             );
             // On a second failure the file's own error is the one to report:
             // the repaired copy is an internal attempt, not the document.
-            pdf_extract::extract_text_from_mem_by_pages(&repair.bytes).map_err(|retry| {
-                tracing::debug!(error = %retry, "repaired PDF still failed to parse");
-                extraction_failed(original)
-            })?
+            let pages =
+                pdf_extract::extract_text_from_mem_by_pages(&repair.bytes).map_err(|retry| {
+                    tracing::debug!(error = %retry, "repaired PDF still failed to parse");
+                    extraction_failed(original)
+                })?;
+            repaired = Some(repair.bytes);
+            pages
         }
     };
+    let parsed = repaired.as_deref().unwrap_or(bytes);
+
+    if page_texts.is_empty() {
+        return Err(no_pages_error(parsed));
+    }
 
     let pages: Vec<(usize, Result<String, String>)> = page_texts
         .into_iter()
@@ -75,6 +94,29 @@ pub fn extract_text(bytes: &[u8]) -> Result<String, LoaderError> {
         );
     }
     Ok(text)
+}
+
+/// The error for a parse that produced no pages, naming the cause when it is
+/// encryption. Parses `bytes` again, so it is only reached on that path, never
+/// on a successful extraction.
+fn no_pages_error(bytes: &[u8]) -> LoaderError {
+    const UNREADABLE: &str = "PDF parsed but no pages could be read";
+    let doc = pdf_extract::Document::load_mem(bytes).ok();
+    let message = match &doc {
+        // `lopdf` removes `/Encrypt` from the trailer once it has decrypted,
+        // so one still there is an encryption it did not act on.
+        Some(doc) if doc.trailer.get(b"Encrypt").is_ok() => format!(
+            "{UNREADABLE}: the document is encrypted in a form the pdf-pure-rust backend \
+             cannot decrypt (for example an inline /Encrypt dictionary). The pdf-pdfium \
+             backend reads such files."
+        ),
+        Some(doc) if doc.was_encrypted() => format!(
+            "{UNREADABLE}: the document was decrypted, but its page tree or first page is \
+             unreadable."
+        ),
+        _ => format!("{UNREADABLE} (its page tree or first page is unreadable)."),
+    };
+    LoaderError::ExtractionFailed(message)
 }
 
 fn extraction_failed(e: pdf_extract::OutputError) -> LoaderError {
@@ -223,6 +265,143 @@ mod tests {
                 .collect();
             assert_eq!(extract_text(&pdf).unwrap(), format_pages(&pages));
         }
+    }
+
+    /// A classic-xref PDF whose objects are `objects`, numbered from 1, with
+    /// object 1 as the catalog.
+    fn pdf_of(objects: &[&str]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// One page with an empty content stream: what a scanned page looks like
+    /// to a text extractor, minus the image.
+    fn blank_page_pdf() -> Vec<u8> {
+        pdf_of(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            "<< /Length 0 >>\nstream\n\nendstream",
+        ])
+    }
+
+    /// `sample.pdf` encrypted by `mutool clean -E rc4-128` and left as mutool
+    /// wrote it, with `/Encrypt` inline in the trailer. `lopdf` 0.42 only
+    /// decrypts an indirect `/Encrypt`; see `tests/fixtures/pdf/README.md`.
+    const INLINE_ENCRYPT_PDF: &[u8] =
+        include_bytes!("../../../tests/fixtures/pdf/sample.encrypted-inline-rc4-128.pdf");
+
+    /// No pages at all: an empty page tree.
+    fn no_pages_pdf() -> Vec<u8> {
+        pdf_of(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [] /Count 0 >>",
+        ])
+    }
+
+    /// [`ENCRYPTED_BLANK_PDF`] with its (cleartext) page tree emptied in place:
+    /// `/Count 1/Kids[4 0 R]` becomes the same-length `/Count 0/Kids[     ]`,
+    /// so every xref offset stays valid. It decrypts, then has no pages.
+    fn encrypted_no_pages_pdf() -> Vec<u8> {
+        const FROM: &[u8] = b"/Count 1/Kids[4 0 R]";
+        const TO: &[u8] = b"/Count 0/Kids[     ]";
+        let mut pdf = ENCRYPTED_BLANK_PDF.to_vec();
+        let at = pdf
+            .windows(FROM.len())
+            .position(|w| w == FROM)
+            .expect("the fixture's page tree is written as `/Count 1/Kids[4 0 R]`");
+        pdf[at..at + FROM.len()].copy_from_slice(TO);
+        pdf
+    }
+
+    /// A blank one-page PDF encrypted with an empty user password, with an
+    /// indirect `/Encrypt` that `lopdf` does decrypt.
+    const ENCRYPTED_BLANK_PDF: &[u8] =
+        include_bytes!("../../../tests/fixtures/pdf/blank.encrypted-rc4-128.pdf");
+
+    #[test]
+    fn the_empty_extraction_fixtures_reproduce_what_pdf_extract_does() {
+        // Guards the tests below: each input must reach `extract_text` as an
+        // Ok with no text, either zero pages (which this module turns into an
+        // error) or one empty page (which it keeps). If `pdf-extract` starts
+        // failing (or reading) these on its own, the tests below would pass
+        // without exercising anything.
+        let pages = pdf_extract::extract_text_from_mem_by_pages(INLINE_ENCRYPT_PDF).unwrap();
+        assert!(pages.is_empty(), "{pages:?}");
+
+        for pdf in [no_pages_pdf(), encrypted_no_pages_pdf()] {
+            let pages = pdf_extract::extract_text_from_mem_by_pages(&pdf).unwrap();
+            assert!(pages.is_empty(), "{pages:?}");
+        }
+
+        for pdf in [ENCRYPTED_BLANK_PDF, &blank_page_pdf()] {
+            let pages = pdf_extract::extract_text_from_mem_by_pages(pdf).unwrap();
+            assert_eq!(pages.len(), 1);
+            assert!(pages[0].trim().is_empty(), "{pages:?}");
+        }
+    }
+
+    #[test]
+    fn a_pdf_with_no_pages_is_an_error() {
+        let err = extract_text(&no_pages_pdf()).expect_err("zero pages is never valid");
+        assert!(matches!(err, LoaderError::ExtractionFailed(_)), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("page tree or first page is unreadable"),
+            "{msg}"
+        );
+        assert!(!msg.contains("encrypt"), "{msg}");
+    }
+
+    #[test]
+    fn an_inline_encrypt_dictionary_is_an_error_not_an_empty_document() {
+        let err = extract_text(INLINE_ENCRYPT_PDF).expect_err("unreadable, so it must fail");
+        assert!(matches!(err, LoaderError::ExtractionFailed(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("cannot decrypt"), "{msg}");
+        assert!(msg.contains("pdf-pdfium"), "{msg}");
+    }
+
+    #[test]
+    fn a_decrypted_pdf_with_no_pages_is_an_error_that_does_not_blame_decryption() {
+        let err = extract_text(&encrypted_no_pages_pdf()).expect_err("zero pages");
+        assert!(matches!(err, LoaderError::ExtractionFailed(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("was decrypted"), "{msg}");
+        assert!(!msg.contains("cannot decrypt"), "{msg}");
+    }
+
+    #[test]
+    fn an_encrypted_pdf_with_blank_pages_still_extracts_to_empty_text() {
+        // As PDFium and pypdf do: encryption alone is no reason to reject a
+        // document whose pages decrypt fine but carry no text.
+        assert_eq!(extract_text(ENCRYPTED_BLANK_PDF).unwrap(), "");
+    }
+
+    #[test]
+    fn an_unencrypted_pdf_with_blank_pages_still_extracts_to_empty_text() {
+        // Image-only and scanned documents land here. Failing them would
+        // reject files Python's pypdf loader accepts; they keep the warning.
+        assert_eq!(extract_text(&blank_page_pdf()).unwrap(), "");
     }
 
     #[test]
