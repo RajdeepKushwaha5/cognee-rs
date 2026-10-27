@@ -1637,16 +1637,10 @@ impl AddPipeline {
     /// The loaders `add` runs: the default registry, plus the audio loader
     /// when a transcriber is attached.
     fn loader_registry(&self) -> LoaderRegistry {
-        #[allow(unused_mut)]
-        let mut registry = LoaderRegistry::default_registry();
+        let registry = LoaderRegistry::default_registry();
         #[cfg(feature = "audio-loader")]
         if let Some(transcriber) = &self.transcriber {
-            registry.register(
-                "audio",
-                Arc::new(crate::loaders::audio::AudioLoader::new(Arc::clone(
-                    transcriber,
-                ))),
-            );
+            return registry.with_audio(Arc::clone(transcriber));
         }
         registry
     }

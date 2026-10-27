@@ -528,6 +528,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openai_compatible`) transcribe; with any other provider, or when no
   transcriber can be built (no API key, say, logged at `warn`), `add` keeps the
   old error for audio and text adds are unaffected.
+  `LoaderRegistry::with_audio` registers the audio loader for both add and
+  cognify.
 
 - **`LLM_STRUCTURED_OUTPUT_MODE=json_schema` — constrained decoding on
   OpenAI-compatible endpoints, with a demotion ladder.** The adapter can now send
