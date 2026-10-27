@@ -632,9 +632,29 @@ fn add_url_rejects_loopback_target() {
     drop(server);
 }
 
+/// A `make_cmd_in` whose LLM settings come from the config file only: the
+/// keyed CI lane exports the key and endpoint under every alias, and env vars
+/// take priority over the config.
+fn make_cmd_without_llm_env(config_home: &TempDir, workdir: &Path) -> Command {
+    let mut command = make_cmd_in(config_home, workdir);
+    for var in [
+        "LLM_API_KEY",
+        "OPENAI_TOKEN",
+        "LLM_ENDPOINT",
+        "OPENAI_URL",
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "OPENAI_MODEL",
+    ] {
+        command.env_remove(var);
+    }
+    command
+}
+
 /// `add` of an audio file transcribes it through the configured provider and
-/// stores the transcript. Without an API key there is no transcriber, so the
-/// same file fails as an unsupported type while text still adds.
+/// stores the transcript; adding it again reuses that transcript. Without an
+/// API key there is no transcriber, so the same file fails as an unsupported
+/// type while text still adds.
 #[test]
 fn add_audio_file_stores_the_transcript() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -675,16 +695,14 @@ fn add_audio_file_stores_the_transcript() {
     );
     config_set(&config_home, workdir.path(), "llm_provider", "\"openai\"");
 
-    make_cmd_in(&config_home, workdir.path())
-        .env_remove("LLM_API_KEY")
+    make_cmd_without_llm_env(&config_home, workdir.path())
         .args(["add", &audio_arg, "--dataset-name", "no_key"])
         .assert()
         .failure()
         .stdout(predicate::str::contains(
             "Unsupported document type at ingest: audio",
         ));
-    make_cmd_in(&config_home, workdir.path())
-        .env_remove("LLM_API_KEY")
+    make_cmd_without_llm_env(&config_home, workdir.path())
         .args(["add", "text needs no key", "--dataset-name", "no_key"])
         .assert()
         .success();
@@ -696,10 +714,12 @@ fn add_audio_file_stores_the_transcript() {
         "llm_endpoint",
         &format!("\"{}\"", server.url()),
     );
-    make_cmd_in(&config_home, workdir.path())
-        .args(["add", &audio_arg, "--dataset-name", "audio"])
-        .assert()
-        .success();
+    for _ in 0..2 {
+        make_cmd_without_llm_env(&config_home, workdir.path())
+            .args(["add", &audio_arg, "--dataset-name", "audio"])
+            .assert()
+            .success();
+    }
     rt.block_on(whisper.assert_async());
 
     let conn = Connection::open(&db_file_path).expect("open sqlite database");
@@ -718,7 +738,6 @@ fn add_audio_file_stores_the_transcript() {
         std::fs::read_to_string(stored_path).expect("read the stored transcript"),
         "Hello from the meeting."
     );
-    drop(server);
 }
 
 /// `graph_extraction.backend` (`GRAPH_EXTRACTOR`) is honoured by the CLI's
