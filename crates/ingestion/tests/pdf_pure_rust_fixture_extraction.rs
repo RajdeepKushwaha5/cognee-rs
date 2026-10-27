@@ -56,15 +56,21 @@
 )]
 
 use cognee_ingestion::loaders::{DocumentLoader, LoaderError, LoaderOutput, pdf::PdfLoader};
-use cognee_models::{DataPoint, Document};
 use encrypted::ENCRYPTED_EMPTY_USER_PASSWORD;
-use uuid::Uuid;
+use support::{ENCRYPT_NULL_TEXT, document, encrypt_null_pdf};
 
 /// The same fixture the PDFium test reads. See `fixtures/pdf/README.md`.
 const SAMPLE_PDF: &[u8] = include_bytes!("fixtures/pdf/sample.pdf");
 
 #[path = "fixtures/pdf/encrypted.rs"]
 mod encrypted;
+
+#[path = "fixtures/pdf/support.rs"]
+#[allow(
+    dead_code,
+    reason = "shared with pdf_fixture_extraction.rs, which uses all of it"
+)]
+mod support;
 
 const EXPECTED_PURE_RUST: &str = include_str!("fixtures/pdf/sample.expected.pure-rust.txt");
 const EXPECTED_PDFIUM: &str = include_str!("fixtures/pdf/sample.expected.txt");
@@ -139,17 +145,23 @@ async fn rejects_a_pdf_that_needs_a_user_password() {
 }
 
 async fn extract(name: &str, bytes: &[u8]) -> Result<LoaderOutput, LoaderError> {
-    let doc = Document {
-        base: DataPoint::new("PdfDocument", None),
-        document_type: "pdf".to_string(),
-        name: name.to_string(),
-        raw_data_location: format!("file:///{name}"),
-        mime_type: "application/pdf".to_string(),
-        extension: "pdf".to_string(),
-        data_id: Uuid::new_v4(),
-        external_metadata: None,
-    };
-    PdfLoader.extract(bytes, &doc).await
+    PdfLoader.extract(bytes, &document(name)).await
+}
+
+/// `lopdf` loads none of the objects of a file with any trailer `/Encrypt`
+/// it cannot authenticate, even `null`, which means no encryption. The pure
+/// backend ignores such an entry and parses again; PDFium reads it directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_text_from_a_pdf_whose_encrypt_entry_is_null() {
+    const TEST: &str = "extracts_text_from_a_pdf_whose_encrypt_entry_is_null";
+    let result = extract("encrypt-null.pdf", &encrypt_null_pdf()).await;
+    if skipped_for_missing_pdfium(TEST, &result) {
+        return;
+    }
+    match result {
+        Ok(LoaderOutput::Text(text)) => assert!(text.contains(ENCRYPT_NULL_TEXT), "{text:?}"),
+        other => panic!("an /Encrypt null file is not encrypted: {other:?}"),
+    }
 }
 
 /// With both features on, the loader binds PDFium, which has to be resolved

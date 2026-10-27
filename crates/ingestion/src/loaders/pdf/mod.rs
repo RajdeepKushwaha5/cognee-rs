@@ -22,6 +22,11 @@
 //! `pdf-pdfium` build. Chunk boundaries, and therefore embeddings and extracted
 //! graph nodes, can differ between the two. `tests/pdf_fixture_extraction.rs`
 //! and `tests/pdf_pure_rust_fixture_extraction.rs` pin each backend's output.
+//!
+//! Both backends also share one rule, in `format::format_document`: a document
+//! with no pages, or whose every page failed, is
+//! `LoaderError::ExtractionFailed`, never an empty text. Pages that were read
+//! but have no text (scanned, image-only) still extract to `""`.
 
 mod format;
 

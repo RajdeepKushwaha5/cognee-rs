@@ -123,11 +123,23 @@ without text):
 
 - `sample.encrypted-inline-rc4-128.pdf` is `mutool clean -E rc4-128` output
   left as is, with `/Encrypt` inline in the trailer. `lopdf` does not decrypt
-  that form (see below), and `pdf-extract` returns zero pages for it.
+  that form (see below): it loads no objects from the file at all, so
+  `pdf-extract` returns zero pages for it. (For an indirect `/Encrypt` it
+  cannot authenticate, such as the user-password file below, it loads only
+  the encryption dictionary, and `pdf-extract` then fails the parse.) Its catalog and page tree are plain
+  objects (MuPDF 1.23 writes no object streams), so this also covers that
+  shape. `pdf_fixture_extraction.rs` reads it through PDFium, which decrypts
+  it and must extract `sample.expected.txt`, as the pure-rust error message
+  promises.
 - `blank.encrypted-rc4-128.pdf` is a blank one-page document (from
   `mutool create` with only a `%%MediaBox 0 0 612 792` line), encrypted like
   the others: it decrypts fine and has no text, so it extracts to `""`. A test
   also empties its page tree in place to get a decrypted file with no pages.
+
+`support.rs` holds helpers the two test files share: the `Document` the
+loader is given, and `pdf_of`, which writes small classic-xref PDFs in the
+test itself, such as an unencrypted file with `/Encrypt null` in its trailer
+(PDFium reads it, and the pure-rust backend reads it by ignoring the entry).
 
 `sample.encrypted-user-password-rc4-128.pdf` is the opposite case: the user
 password is `secret`, which the loader cannot supply, so extraction must fail
