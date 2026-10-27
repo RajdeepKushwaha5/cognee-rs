@@ -167,7 +167,7 @@ pub use api::notebooks::{
     NotebookError, create_notebook, delete_notebook, list_notebooks, update_notebook,
 };
 pub use api::{DatasetDb, DatasetError, DatasetManager};
-pub use component_manager::ComponentManager;
+pub use component_manager::{ComponentManager, WithTranscriber};
 pub use config::{ConfigError, ConfigManager, Settings};
 pub use context::PipelineContext;
 pub use error::ComponentError;

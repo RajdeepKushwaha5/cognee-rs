@@ -22,7 +22,7 @@ use cognee::database::{IngestDb, PipelineRunRepository};
 use cognee::models::DataInput;
 use cognee::ontology::{NoOpOntologyResolver, OntologyResolver};
 use cognee::search::{SearchBuilder, SearchRequest, SearchType, SessionManager};
-use cognee::{ComponentManager, PipelineContext};
+use cognee::{ComponentManager, PipelineContext, WithTranscriber};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -710,8 +710,9 @@ async fn phase_add(
         .with_graph_db(graph_db)
         .with_vector_db(vector_db)
         .with_database(Arc::clone(&database))
-        .with_pipeline_run_repo(pipeline_run_repo);
-    let pipeline = cm.attach_transcriber(pipeline).await;
+        .with_pipeline_run_repo(pipeline_run_repo)
+        .with_configured_transcriber(cm)
+        .await;
 
     let inputs: Vec<DataInput> = memories
         .iter()
