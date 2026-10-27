@@ -4,7 +4,9 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-//! The `pdf-pure-rust` half of [`pdf_fixture_extraction`], over the same PDF.
+//! The `pdf-pure-rust` half of [`pdf_fixture_extraction`], over the same PDF
+//! and the same copies of it encrypted with an empty user password, plus a copy
+//! that needs a real user password and must be rejected.
 //!
 //! It exists because `pdf-pure-rust` is what a container build wants — no
 //! native library and no runtime download — and it is what the Python, TS and
@@ -53,12 +55,16 @@
     reason = "tests drive configuration through the process env"
 )]
 
-use cognee_ingestion::loaders::{DocumentLoader, LoaderOutput, pdf::PdfLoader};
+use cognee_ingestion::loaders::{DocumentLoader, LoaderError, LoaderOutput, pdf::PdfLoader};
 use cognee_models::{DataPoint, Document};
+use encrypted::ENCRYPTED_EMPTY_USER_PASSWORD;
 use uuid::Uuid;
 
 /// The same fixture the PDFium test reads. See `fixtures/pdf/README.md`.
 const SAMPLE_PDF: &[u8] = include_bytes!("fixtures/pdf/sample.pdf");
+
+#[path = "fixtures/pdf/encrypted.rs"]
+mod encrypted;
 
 const EXPECTED_PURE_RUST: &str = include_str!("fixtures/pdf/sample.expected.pure-rust.txt");
 const EXPECTED_PDFIUM: &str = include_str!("fixtures/pdf/sample.expected.txt");
@@ -84,46 +90,106 @@ fn in_ci() -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracts_text_from_a_real_pdf() {
+    let _ =
+        assert_extracts_the_sample_text("extracts_text_from_a_real_pdf", "sample.pdf", SAMPLE_PDF)
+            .await;
+}
+
+/// `sample.pdf` encrypted with the user password `secret`, which this loader
+/// has no way to supply.
+const ENCRYPTED_USER_PASSWORD: &[u8] =
+    include_bytes!("fixtures/pdf/sample.encrypted-user-password-rc4-128.pdf");
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_text_from_a_pdf_encrypted_with_an_empty_user_password() {
+    for (name, bytes) in ENCRYPTED_EMPTY_USER_PASSWORD {
+        // The same pages as `sample.pdf`, so the same expected text: a reader
+        // that opens the file at all must not see different content in it.
+        let checked = assert_extracts_the_sample_text(
+            "extracts_text_from_a_pdf_encrypted_with_an_empty_user_password",
+            name,
+            bytes,
+        )
+        .await;
+        if !checked {
+            // Skipped: libpdfium is unobtainable, and that is the cause for
+            // every fixture, so one notice is enough.
+            break;
+        }
+    }
+}
+
+/// A file that needs a real user password must fail, not extract to empty
+/// text or to ciphertext. `lopdf` 0.42 only logs a warning when the empty
+/// password does not authenticate and carries on loading; the error comes from
+/// `pdf-extract`'s own `decrypt("")`. Pinned so that a dependency bump which
+/// loses that error cannot turn these files back into silent empty documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_a_pdf_that_needs_a_user_password() {
+    const TEST: &str = "rejects_a_pdf_that_needs_a_user_password";
+    const NAME: &str = "sample.encrypted-user-password-rc4-128.pdf";
+    let result = extract(NAME, ENCRYPTED_USER_PASSWORD).await;
+    if skipped_for_missing_pdfium(TEST, &result) {
+        return;
+    }
+    match result {
+        Err(LoaderError::ExtractionFailed(_)) => {}
+        other => panic!("{NAME}: expected ExtractionFailed, got {other:?}"),
+    }
+}
+
+async fn extract(name: &str, bytes: &[u8]) -> Result<LoaderOutput, LoaderError> {
     let doc = Document {
         base: DataPoint::new("PdfDocument", None),
         document_type: "pdf".to_string(),
-        name: "sample.pdf".to_string(),
-        raw_data_location: "file:///sample.pdf".to_string(),
+        name: name.to_string(),
+        raw_data_location: format!("file:///{name}"),
         mime_type: "application/pdf".to_string(),
         extension: "pdf".to_string(),
         data_id: Uuid::new_v4(),
         external_metadata: None,
     };
+    PdfLoader.extract(bytes, &doc).await
+}
 
-    let result = PdfLoader.extract(SAMPLE_PDF, &doc).await;
+/// With both features on, the loader binds PDFium, which has to be resolved
+/// at runtime and can legitimately be unobtainable. Returns `true` (after
+/// printing a notice naming `test`) when that is why `result` failed. See the
+/// skip note in `pdf_fixture_extraction.rs` for why this is kept this narrow.
+fn skipped_for_missing_pdfium<T>(test: &str, result: &Result<T, LoaderError>) -> bool {
+    let Err(e) = result else { return false };
+    if !cfg!(feature = "pdf-pdfium") || !e.to_string().contains(LIBRARY_UNOBTAINABLE) {
+        return false;
+    }
+    // As in `pdf_fixture_extraction.rs`: a skip is invisible in a passing
+    // test, so CI must not be allowed to go green having never pinned the
+    // selection rule below.
+    assert!(
+        !in_ci(),
+        "{test}: libpdfium could not be obtained, so the pdfium-priority rule was never \
+         checked — and a CI lane must not report green on that. Provision the library and \
+         set PDFIUM_LIB_PATH. Cause: {e}"
+    );
+    eprintln!(
+        "SKIP {test}: both PDF backends are enabled, so the loader selected PDFium, and \
+         libpdfium could not be obtained on this machine. Set PDFIUM_LIB_PATH to an \
+         existing libpdfium shared library to run it. Cause: {e}"
+    );
+    true
+}
 
-    // With both features on, the loader binds PDFium, which has to be resolved
-    // at runtime and can legitimately be unobtainable. See the skip note in
-    // `pdf_fixture_extraction.rs` for why this branch is kept this narrow.
-    if cfg!(feature = "pdf-pdfium")
-        && let Err(e) = &result
-        && e.to_string().contains(LIBRARY_UNOBTAINABLE)
-    {
-        // As in `pdf_fixture_extraction.rs`: a skip is invisible in a passing
-        // test, so CI must not be allowed to go green having never pinned the
-        // selection rule below.
-        assert!(
-            !in_ci(),
-            "libpdfium could not be obtained, so the pdfium-priority rule was never checked — \
-             and a CI lane must not report green on that. Provision the library and set \
-             PDFIUM_LIB_PATH. Cause: {e}"
-        );
-        eprintln!(
-            "SKIP extracts_text_from_a_real_pdf: both PDF backends are enabled, so the loader \
-             selected PDFium, and libpdfium could not be obtained on this machine. Set \
-             PDFIUM_LIB_PATH to an existing libpdfium shared library to run it. Cause: {e}"
-        );
-        return;
+/// Extracts `bytes` with [`PdfLoader`] and asserts the output is the expected
+/// text of `sample.pdf` for whichever backend the loader selects. Returns
+/// `false` if the check was skipped because PDFium is unobtainable.
+async fn assert_extracts_the_sample_text(test: &str, name: &str, bytes: &[u8]) -> bool {
+    let result = extract(name, bytes).await;
+    if skipped_for_missing_pdfium(test, &result) {
+        return false;
     }
 
-    let output = result.expect("extraction of a valid PDF must succeed");
+    let output = result.unwrap_or_else(|e| panic!("{name}: extraction must succeed: {e}"));
     let LoaderOutput::Text(text) = output else {
-        panic!("the PDF loader must yield text, got {output:?}");
+        panic!("{name}: the PDF loader must yield text, got {output:?}");
     };
 
     // `loaders::pdf` documents that pdfium wins when both features are on.
@@ -137,7 +203,7 @@ async fn extracts_text_from_a_real_pdf() {
         // cannot rot in either direction.
         assert!(
             !text.contains('\r'),
-            "pdf-extract is documented to emit LF within a page; if that changed, \
+            "{name}: pdf-extract is documented to emit LF within a page; if that changed, \
              update the `loaders::pdf` module docs and both expected files. Got: {text:?}"
         );
         (
@@ -149,6 +215,7 @@ async fn extracts_text_from_a_real_pdf() {
     assert_eq!(
         normalise(&text),
         normalise(expected),
-        "extracted text does not match {fixture}"
+        "{name}: extracted text does not match {fixture}"
     );
+    true
 }
