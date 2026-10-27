@@ -53,6 +53,13 @@ export interface CogneeCognifyOptions {
    * `graphSchema` or `graphSpec`.
    */
   chunkAttachment?: "direct" | "all";
+  /**
+   * Graph extractor for this run — Python's `extractor`: `"auto"` (the
+   * LLM when one is usable, else the local GLiNER extractor), `"llm"`,
+   * `"gliner"` (alias `"gliner_demo"`) or another registered kind.
+   * Overrides `GRAPH_EXTRACTOR`.
+   */
+  extractor?: string;
 }
 
 /**
@@ -437,6 +444,11 @@ export interface CogneeRememberOptions {
   selfImprovement?: boolean;
   /** Tenant UUID string (multi-tenant scoping). */
   tenant?: string;
+  /**
+   * Graph extractor for the cognify step, as for `cognify`. Not
+   * together with `sessionId`.
+   */
+  extractor?: string;
 }
 
 /**

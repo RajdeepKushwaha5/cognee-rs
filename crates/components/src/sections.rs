@@ -269,9 +269,14 @@ impl AwsConfig {
     }
 }
 
+/// The local embedding model as `(provider, model, dimensions)`: the default
+/// on Android, and what embeddings switch to elsewhere when cognify's keyless
+/// defaults apply (Python's fastembed `BAAI/bge-small-en-v1.5`).
+pub const LOCAL_EMBEDDING: (&str, &str, u32) = ("onnx", "BGE-Small-v1.5", 384);
+
 #[cfg(target_os = "android")]
 fn default_embedding() -> (&'static str, &'static str, u32) {
-    ("onnx", "BGE-Small-v1.5", 384)
+    LOCAL_EMBEDDING
 }
 #[cfg(not(target_os = "android"))]
 fn default_embedding() -> (&'static str, &'static str, u32) {
@@ -618,10 +623,11 @@ config_section! {
     /// Graph extraction during cognify. Registered by the graph-extraction
     /// kind.
     pub struct GraphExtractionConfig in "graph_extraction" {
-        /// The default extractor kind: `llm` (the built-in extractor) or a
-        /// registered backend such as `gliner`. A per-call `graphBackend`
-        /// selection overrides it.
-        pub backend: String = "llm".to_string() => {
+        /// The default extractor kind: `auto` (the LLM when one is usable,
+        /// else `gliner`), `llm` (the built-in extractor), or a registered
+        /// backend such as `gliner` (alias `gliner_demo`). A per-call
+        /// `extractor` or `graphBackend` selection overrides it.
+        pub backend: String = crate::AUTO_GRAPH_EXTRACTOR.to_string() => {
             env: ["GRAPH_EXTRACTOR"], alias: ["graph_extractor"], secret: false,
         },
     }

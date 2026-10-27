@@ -15010,6 +15010,126 @@
     "err": "TypeMismatch",
     "key": "single_process"
   },
+  "skip_connection_test <- \"\"": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- \"1\"": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- \"s\"": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- \"true\"": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- -1": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- 0": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- 1": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- 5000000000": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- 70000": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- [1]": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- false": {
+    "ok": {}
+  },
+  "skip_connection_test <- null": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_connection_test <- true": {
+    "ok": {
+      "skip_connection_test": true
+    }
+  },
+  "skip_connection_test <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "skip_connection_test"
+  },
+  "skip_preflight <- \"\"": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- \"1\"": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- \"s\"": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- \"true\"": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- -1": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- 0": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- 1": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- 1.5": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- 5000000000": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- 70000": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- [1]": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- false": {
+    "ok": {}
+  },
+  "skip_preflight <- null": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
+  "skip_preflight <- true": {
+    "ok": {
+      "skip_preflight": true
+    }
+  },
+  "skip_preflight <- {\"a\":1}": {
+    "err": "TypeMismatch",
+    "key": "skip_preflight"
+  },
   "storage.backend <- \"\"": {
     "ok": {
       "storage.backend": ""

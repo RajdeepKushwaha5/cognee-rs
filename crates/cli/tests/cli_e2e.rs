@@ -706,6 +706,98 @@ fn cognify_refuses_an_unregistered_graph_extractor() {
         .stdout(predicate::str::contains("no-such-extractor-cli"));
 }
 
+/// With no usable LLM the default `auto` extractor asks for GLiNER, which this
+/// build does not register: `add-and-cognify` refuses with the keyless-setup
+/// remedy before ingesting, never extracting with the LLM. `--extractor`
+/// overrides `GRAPH_EXTRACTOR`, and is refused together with `--session-id`.
+#[test]
+fn the_extractor_flag_and_the_keyless_auto_default() {
+    let config_home = TempDir::new().expect("temp dir should be created");
+    let workdir = TempDir::new().expect("temp dir should be created");
+    let db_file_path = workdir.path().join("cognee.db");
+    std::fs::File::create(&db_file_path).expect("sqlite database file should be created");
+    config_set(
+        &config_home,
+        workdir.path(),
+        "relational_db_url",
+        &format!("\"sqlite://{}\"", db_file_path.display()),
+    );
+    config_set(
+        &config_home,
+        workdir.path(),
+        "data_root_directory",
+        &format!("\"{}\"", workdir.path().join("cognee_data").display()),
+    );
+    let keyless = || {
+        let mut cmd = make_cmd_in(&config_home, workdir.path());
+        for var in [
+            "LLM_API_KEY",
+            "OPENAI_TOKEN",
+            "EMBEDDING_API_KEY",
+            "LLM_PROVIDER",
+            "MOCK_LLM",
+            "MOCK_EMBEDDING",
+            "COGNEE_SKIP_PREFLIGHT",
+            "COGNEE_SKIP_CONNECTION_TEST",
+            "GRAPH_EXTRACTOR",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd
+    };
+
+    keyless()
+        .args([
+            "add-and-cognify",
+            "Alice knows Bob.",
+            "--dataset-name",
+            "kl_ds",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no usable LLM is configured"));
+
+    // The flag beats the setting: with a usable LLM, an unregistered kind
+    // named by `--extractor` is refused even though `GRAPH_EXTRACTOR=llm`.
+    make_cmd_in(&config_home, workdir.path())
+        .env("GRAPH_EXTRACTOR", "llm")
+        .env("LLM_API_KEY", "sk-test")
+        .env("MOCK_EMBEDDING", "true")
+        .args([
+            "add-and-cognify",
+            "Alice knows Bob.",
+            "--dataset-name",
+            "kl_ds",
+            "--extractor",
+            "no-such-extractor-flag",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("no-such-extractor-flag"));
+
+    // A session-scoped remember does not cognify, so the keyless `auto`
+    // default does not fail it over the missing GLiNER extractor.
+    keyless()
+        .args(["remember", "Alice knows Bob.", "--session-id", "s1"])
+        .assert()
+        .stdout(predicate::str::contains("Graph extractor").not());
+
+    keyless()
+        .args([
+            "remember",
+            "Alice knows Bob.",
+            "--session-id",
+            "s1",
+            "--extractor",
+            "llm",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "--extractor is not supported with --session-id",
+        ));
+}
+
 #[test]
 fn delete_all_preview_and_force_execution() {
     let config_home = TempDir::new().expect("temp dir should be created");

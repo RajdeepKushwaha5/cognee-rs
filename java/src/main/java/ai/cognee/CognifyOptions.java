@@ -13,6 +13,13 @@ public final class CognifyOptions extends Options {
     public CognifyOptions triplet(boolean b) { put("triplet", b); return this; }
 
     /**
+     * Graph extractor for this run (Python's {@code extractor}): {@code "auto"} (the LLM when one
+     * is usable, else the local GLiNER extractor), {@code "llm"}, {@code "gliner"} (alias
+     * {@code "gliner_demo"}) or another registered kind. Overrides {@code GRAPH_EXTRACTOR}.
+     */
+    public CognifyOptions extractor(String kind) { put("extractor", kind); return this; }
+
+    /**
      * A custom graph model's JSON Schema, given as JSON text, extracted instead of the default
      * {@code KnowledgeGraph} (Python's {@code graph_model}). {@code "{}"} means the default model.
      * The text is parsed and the schema validated natively: invalid JSON or an invalid schema fails

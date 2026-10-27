@@ -289,6 +289,16 @@ pub struct Settings {
     /// compiled into or registered with this build.
     pub strict_config: bool,
 
+    /// Disable the keyless local defaults (`COGNEE_SKIP_PREFLIGHT`): with no
+    /// usable LLM, cognify keeps the LLM extractor and the configured
+    /// embedder instead of switching to GLiNER and local ONNX embeddings.
+    /// Python's preflight-skip switch, which disables the same rerouting.
+    pub skip_preflight: bool,
+
+    /// Same effect as [`Self::skip_preflight`]
+    /// (`COGNEE_SKIP_CONNECTION_TEST`), kept as its own key as in Python.
+    pub skip_connection_test: bool,
+
     /// Values of the component-owned config sections (see
     /// [`cognee_config_core::section`]), keyed by canonical key such as
     /// `graph.ladybug.max_db_size`.
@@ -639,6 +649,33 @@ impl Settings {
         } else {
             relational.url.clone()
         }
+    }
+
+    /// Whether cognify's keyless local defaults are switched off: by
+    /// `skip_preflight`, `skip_connection_test`, or a mock embedder. These
+    /// mean the caller runs with deliberately partial or fake provider
+    /// config, which must be honoured, not replaced (Python's
+    /// `_skip_preflight`, which reads the same three env vars).
+    #[must_use]
+    pub fn keyless_defaults_disabled(&self) -> bool {
+        self.skip_preflight || self.skip_connection_test || self.embedding().mock_mode().is_some()
+    }
+
+    /// Whether any embedding setting was configured: the provider or model
+    /// differs from the stock default, or an embedding key or endpoint is set
+    /// (Python's `embedding_settings_configured`). A configured embedder is
+    /// never replaced by the keyless local default.
+    #[must_use]
+    pub fn embedding_settings_configured(&self) -> bool {
+        let embedding = self.embedding();
+        let stock = cognee_components::EmbeddingConfig::default();
+        !(embedding
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(&stock.provider)
+            && embedding.model.trim() == stock.model
+            && embedding.api_key.trim().is_empty()
+            && embedding.endpoint.trim().is_empty())
     }
 
     /// Lower these settings into a [`BackendBuildContext`] for
@@ -1058,6 +1095,8 @@ impl Default for Settings {
             enable_last_accessed: false,
             single_process: None,
             strict_config: false,
+            skip_preflight: false,
+            skip_connection_test: false,
             sections: cognee_config_core::ConfigValues::new(),
         }
     }

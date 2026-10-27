@@ -190,15 +190,24 @@ impl ComponentManager {
         }
         // No `.await` between the config read and storing the result, so the
         // (non-`Send`) settings guard never crosses an await point.
-        let ctx = {
-            let settings = self.config.read();
-            // The configuration changed (or this is the first build): keep the
-            // key reported by product analytics in step with it.
-            self.telemetry_key.update(Some(&settings.llm().api_key));
-            settings.backend_context()
-        };
+        let ctx = self.lower();
         *guard = Some((current_ver, ctx.clone()));
         Ok(ctx)
+    }
+
+    /// Lower the current settings into a build context, with the keyless
+    /// embedding switch applied. The one place a context is lowered: callers
+    /// cache the result per config version.
+    fn lower(&self) -> cognee_components::BackendBuildContext {
+        let settings = self.config.read();
+        // The configuration changed (or this is the first build): keep the
+        // key reported by product analytics in step with it.
+        self.telemetry_key.update(Some(&settings.llm().api_key));
+        let mut ctx = settings.backend_context();
+        if self.keyless(&settings, &ctx) && !settings.embedding_settings_configured() {
+            apply_local_embedding(&mut ctx);
+        }
+        ctx
     }
 
     // Each `init_*` below carries an INFO span so that engine construction —
@@ -351,46 +360,140 @@ impl ComponentManager {
         self.registry.build_ontology_resolver(&ctx, file_path).await
     }
 
+    /// Python's `keyless_local_defaults_apply` over a lowered context: no usable
+    /// LLM ([`ComponentRegistry::llm_available`]) and the keyless defaults not
+    /// switched off ([`Settings::keyless_defaults_disabled`]).
+    ///
+    /// A provider nothing is registered under counts as usable when a key is
+    /// set (Python: a provider it does not know needs one); building it then
+    /// fails, naming what is registered.
+    fn keyless(&self, settings: &Settings, ctx: &cognee_components::BackendBuildContext) -> bool {
+        let available = self
+            .registry
+            .llm_available(ctx)
+            .unwrap_or_else(|_| !ctx.llm.api_key.trim().is_empty());
+        !settings.keyless_defaults_disabled() && !available
+    }
+
+    /// The lowered context for the current config version without awaiting:
+    /// the cached one when it is current, else a fresh lowering, cached when
+    /// the slot is free (so the async accessors do not lower it again).
+    fn current_context(&self) -> cognee_components::BackendBuildContext {
+        let current_ver = self.config.version();
+        if let Ok(guard) = self.context.try_read()
+            && let Some((ver, ctx)) = &*guard
+            && *ver == current_ver
+        {
+            return ctx.clone();
+        }
+        let ctx = self.lower();
+        if let Ok(mut guard) = self.context.try_write() {
+            *guard = Some((current_ver, ctx.clone()));
+        }
+        ctx
+    }
+
+    /// The embedding inputs cognify runs with: the configured embedder, or
+    /// the local model when the keyless defaults switched to it. Prefer this
+    /// over `settings().embedding()` wherever the embedder in use matters
+    /// (e.g. labelling exported vectors).
+    pub fn effective_embedding(&self) -> cognee_components::EmbeddingInputs {
+        self.current_context().embedding
+    }
+
+    /// Whether cognify runs on local models because no LLM is usable: the
+    /// `auto` graph extractor then resolves to GLiNER, and an unconfigured
+    /// embedder to the local ONNX model (Python's
+    /// `keyless_local_defaults_apply`).
+    pub fn keyless_local_defaults_apply(&self) -> bool {
+        let ctx = self.current_context();
+        let settings = self.settings();
+        self.keyless(&settings, &ctx)
+    }
+
+    /// The graph extractor a cognify run uses (Python's `resolve_extractor`):
+    /// `selected` (the caller's per-call choice) unless blank, else
+    /// `graph_extraction.backend`, resolved by
+    /// [`cognee_components::resolve_graph_extractor_kind`] with `auto` decided
+    /// by [`Self::keyless_local_defaults_apply`].
+    ///
+    /// `also_registered` reports kinds served outside this manager's registry
+    /// (the bindings' process-wide shim), so a backend registered under
+    /// `gliner_demo` there is not redirected to `gliner` either.
+    pub fn resolve_graph_extractor(
+        &self,
+        selected: Option<&str>,
+        also_registered: &dyn Fn(&str) -> bool,
+    ) -> GraphExtractorChoice {
+        let selected = match selected {
+            Some(kind) if !kind.trim().is_empty() => kind.to_string(),
+            _ => self.settings().graph_extraction().backend,
+        };
+        let keyless = self.keyless_local_defaults_apply();
+        let is_registered =
+            |kind: &str| self.registry.has_graph_extractor(kind) || also_registered(kind);
+        let kind =
+            cognee_components::resolve_graph_extractor_kind(&selected, keyless, &is_registered);
+        let from_auto = cognee_components::is_auto_graph_extractor(&selected);
+        if from_auto && kind == cognee_components::GLINER_GRAPH_EXTRACTOR {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            NOTICE.call_once(|| {
+                tracing::info!(
+                    "no usable LLM is configured: the knowledge graph is extracted with the \
+                     local GLiNER extractor"
+                );
+            });
+        }
+        GraphExtractorChoice { kind, from_auto }
+    }
+
     /// Build the graph-extraction backend for one cognify run.
     ///
     /// `kind` is the caller's selection, or `graph_extraction.backend` when
-    /// `None`. `Ok(None)` means cognify's own LLM extractor (`llm`).
+    /// `None`; it is resolved by [`Self::resolve_graph_extractor`]. `Ok(None)`
+    /// means cognify's own LLM extractor (`llm`). The factory sees the
+    /// resolved kind: as the spec when `spec` is a bare string, as its `kind`
+    /// when it is an object.
     ///
     /// # Errors
     /// [`ComponentError::GraphExtractor`] when no backend is registered under
-    /// the kind (never a silent fallback to the LLM extractor), or whatever
-    /// the factory returns.
+    /// the resolved kind (never a silent fallback to the LLM extractor), or
+    /// whatever the factory returns.
     pub async fn graph_extractor(
         &self,
         kind: Option<&str>,
         spec: &serde_json::Value,
     ) -> Result<Option<Arc<dyn cognee_cognify::graph_backend::ChunkGraphExtractor>>, ComponentError>
     {
-        let ctx = self.build_context().await?;
-        let kind = match kind {
-            Some(k) => k.to_string(),
-            None => {
-                ctx.section::<cognee_components::GraphExtractionConfig>()
-                    .backend
-            }
-        };
-        let kind = kind.trim().to_lowercase();
-        if kind.is_empty() || kind == cognee_components::LLM_GRAPH_EXTRACTOR {
+        let choice = self.resolve_graph_extractor(kind, &|_| false);
+        if choice.is_llm() {
             return Ok(None);
         }
-        match self.registry.build_graph_extractor(&ctx, &kind, spec).await {
+        let spec = choice.spec_for(spec);
+        let ctx = self.build_context().await?;
+        match self
+            .registry
+            .build_graph_extractor(&ctx, &choice.kind, &spec)
+            .await
+        {
             Some(built) => built.map(Some),
+            None if choice.from_auto => Err(ComponentError::GraphExtractor(
+                cognee_components::keyless_extractor_unavailable(
+                    &self.registry.graph_extractor_kinds(),
+                ),
+            )),
             None => Err(ComponentError::GraphExtractor(format!(
-                "no graph extractor is registered for kind {kind:?}; registered: {}",
+                "no graph extractor is registered for kind {:?}; registered: {}",
+                choice.kind,
                 self.registry.graph_extractor_kinds().join(", ")
             ))),
         }
     }
 
-    /// The configured `graph_extraction.backend`, built — what a cognify run
-    /// uses when the caller made no per-call selection.
+    /// The configured `graph_extraction.backend`, resolved and built — what a
+    /// cognify run uses when the caller made no per-call selection.
     ///
-    /// The configured kind is passed to the factory as its spec (a bare
+    /// The resolved kind is passed to the factory as its spec (a bare
     /// string), the same shape the bindings use for the configured default.
     /// `Ok(None)` is cognify's own LLM extractor; every entry point that builds
     /// a [`cognee_cognify::CognifyConfig`] from configuration attaches a
@@ -403,9 +506,8 @@ impl ComponentManager {
         &self,
     ) -> Result<Option<Arc<dyn cognee_cognify::graph_backend::ChunkGraphExtractor>>, ComponentError>
     {
-        let kind = self.settings().graph_extraction().backend;
-        let spec = serde_json::Value::String(kind.clone());
-        self.graph_extractor(Some(&kind), &spec).await
+        self.graph_extractor(None, &serde_json::Value::String(String::new()))
+            .await
     }
 
     /// Return the [`Transcriber`] for the configured LLM provider, if supported.
@@ -731,6 +833,64 @@ impl PipelineContext for ComponentManager {
     }
 }
 
+/// A resolved graph-extractor selection: see
+/// [`ComponentManager::resolve_graph_extractor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphExtractorChoice {
+    /// The kind to build; [`cognee_components::LLM_GRAPH_EXTRACTOR`] is
+    /// cognify's own LLM extractor.
+    pub kind: String,
+    /// Reached through `auto`: a missing backend is then a keyless-setup
+    /// problem (no usable LLM), not an unknown kind the caller named.
+    pub from_auto: bool,
+}
+
+impl GraphExtractorChoice {
+    /// Whether this is cognify's own LLM extractor, the only one that needs
+    /// the LLM to build a graph.
+    #[must_use]
+    pub fn is_llm(&self) -> bool {
+        self.kind == cognee_components::LLM_GRAPH_EXTRACTOR
+    }
+
+    /// `spec` as the factory receives it: a bare string becomes the resolved
+    /// kind, an object gets the resolved kind as its `kind`, so the factory
+    /// never sees `auto` or an alias however the caller spelled it.
+    #[must_use]
+    pub fn spec_for(&self, spec: &serde_json::Value) -> serde_json::Value {
+        match spec {
+            serde_json::Value::Object(map) => {
+                let mut map = map.clone();
+                map.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String(self.kind.clone()),
+                );
+                serde_json::Value::Object(map)
+            }
+            _ => serde_json::Value::String(self.kind.clone()),
+        }
+    }
+}
+
+/// Switch `ctx`'s embedder to the local ONNX model: the embedding half of
+/// cognify's keyless defaults (Python's `resolve_embedding_defaults`), applied
+/// only when no embedding setting was configured.
+fn apply_local_embedding(ctx: &mut cognee_components::BackendBuildContext) {
+    let (provider, model, dimensions) = cognee_components::LOCAL_EMBEDDING;
+    tracing::info!(
+        provider,
+        model,
+        "no usable LLM and no embedding settings are configured: embeddings run on the \
+         local model"
+    );
+    ctx.embedding.provider = provider.to_string();
+    ctx.embedding.model = model.to_string();
+    ctx.embedding.dimensions = dimensions as usize;
+    ctx.embedding.endpoint = None;
+    ctx.embedding.api_key = None;
+    ctx.embedding_dimensions = dimensions as usize;
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -740,6 +900,269 @@ impl PipelineContext for ComponentManager {
 mod tests {
     use super::*;
     use crate::config::{ConfigManager, Settings};
+
+    /// A registry that also serves a stub `gliner` graph extractor.
+    fn registry_with_gliner() -> ComponentRegistry {
+        struct GlinerStub;
+        #[async_trait]
+        impl cognee_components::GraphExtractorFactory for GlinerStub {
+            fn provider(&self) -> &str {
+                cognee_components::GLINER_GRAPH_EXTRACTOR
+            }
+            async fn build(
+                &self,
+                _ctx: &cognee_components::BackendBuildContext,
+                spec: &serde_json::Value,
+            ) -> Result<Arc<dyn cognee_cognify::graph_backend::ChunkGraphExtractor>, ComponentError>
+            {
+                // The factory sees the resolved kind, never `auto` or the alias.
+                assert_eq!(spec, &serde_json::json!("gliner"));
+                Ok(Arc::new(
+                    cognee_cognify::graph_backend::MockChunkGraphExtractor::new(),
+                ))
+            }
+        }
+        let mut registry = ComponentRegistry::with_builtins();
+        registry
+            .register_graph_extractor(Arc::new(GlinerStub))
+            .unwrap();
+        registry
+    }
+
+    /// A manager over stock settings: no LLM key, no embedding setting.
+    fn keyless_cm(registry: ComponentRegistry) -> ComponentManager {
+        ComponentManager::with_registry(ConfigManager::new(Settings::default()), registry)
+    }
+
+    /// Python's `resolve_extractor` cases: `auto` (the default) follows
+    /// whether an LLM is usable, an explicit selection beats
+    /// `GRAPH_EXTRACTOR`, `gliner_demo` is `gliner`, and any other kind is
+    /// passed through for the registry to judge.
+    #[test]
+    fn the_extractor_resolves_like_python() {
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        assert_eq!(cm.settings().graph_extraction().backend, "auto");
+        assert!(cm.keyless_local_defaults_apply());
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "gliner");
+        assert_eq!(
+            cm.resolve_graph_extractor(Some(" AUTO "), &|_| false).kind,
+            "gliner"
+        );
+        assert_eq!(
+            cm.resolve_graph_extractor(Some(""), &|_| false).kind,
+            "gliner"
+        );
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("LLM"), &|_| false).kind,
+            "llm"
+        );
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("gliner_demo"), &|_| false)
+                .kind,
+            "gliner"
+        );
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("custom-kind"), &|_| false)
+                .kind,
+            "custom-kind"
+        );
+
+        cm.config().set_llm_api_key("sk-test");
+        assert!(!cm.keyless_local_defaults_apply());
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "llm");
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("gliner"), &|_| false).kind,
+            "gliner"
+        );
+
+        cm.config()
+            .set("graph_extractor", serde_json::json!("gliner_demo"))
+            .unwrap();
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "gliner");
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("llm"), &|_| false).kind,
+            "llm",
+            "the per-call selection beats GRAPH_EXTRACTOR"
+        );
+    }
+
+    /// The registry stays the authority: a backend registered under
+    /// `gliner_demo` (here, or in the caller's own registry) is not redirected
+    /// to `gliner`; `auto` cannot be registered; the choice records whether
+    /// it came from `auto`, and the factory's spec carries the resolved kind.
+    #[test]
+    fn a_registered_kind_is_never_rewritten() {
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        let served = |kind: &str| kind == "gliner_demo";
+        assert_eq!(
+            cm.resolve_graph_extractor(Some("gliner_demo"), &served)
+                .kind,
+            "gliner_demo"
+        );
+
+        let choice = cm.resolve_graph_extractor(None, &|_| false);
+        assert!(choice.from_auto && !choice.is_llm());
+        let choice = cm.resolve_graph_extractor(Some("gliner_demo"), &|_| false);
+        assert!(!choice.from_auto);
+        assert_eq!(
+            choice.spec_for(&serde_json::json!({ "kind": "gliner_demo", "threshold": 0.4 })),
+            serde_json::json!({ "kind": "gliner", "threshold": 0.4 })
+        );
+        assert_eq!(
+            choice.spec_for(&serde_json::json!("x")),
+            serde_json::json!("gliner")
+        );
+
+        struct AutoNamed;
+        #[async_trait]
+        impl cognee_components::GraphExtractorFactory for AutoNamed {
+            fn provider(&self) -> &str {
+                "Auto"
+            }
+            async fn build(
+                &self,
+                _ctx: &cognee_components::BackendBuildContext,
+                _spec: &serde_json::Value,
+            ) -> Result<Arc<dyn cognee_cognify::graph_backend::ChunkGraphExtractor>, ComponentError>
+            {
+                unreachable!("never registered")
+            }
+        }
+        let mut registry = ComponentRegistry::with_builtins();
+        assert!(
+            registry
+                .register_graph_extractor(Arc::new(AutoNamed))
+                .is_err()
+        );
+    }
+
+    /// An LLM that needs no key keeps `auto` on the LLM: the mock LLM, and
+    /// Bedrock (AWS credentials).
+    #[test]
+    fn a_keyless_llm_provider_counts_as_usable() {
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        cm.config()
+            .set("llm_mock", serde_json::json!(true))
+            .unwrap();
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "llm");
+
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        cm.config()
+            .set("llm_provider", serde_json::json!("bedrock"))
+            .unwrap();
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "llm");
+
+        // A key-requiring provider without its key is not usable.
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        cm.config()
+            .set("llm_provider", serde_json::json!("anthropic"))
+            .unwrap();
+        assert_eq!(cm.resolve_graph_extractor(None, &|_| false).kind, "gliner");
+    }
+
+    /// The preflight-skip switches and a mock embedder keep the given config:
+    /// no rerouting to local models (Python's `_skip_preflight`).
+    #[test]
+    fn the_skip_switches_keep_the_llm_extractor() {
+        for (key, value) in [
+            ("skip_preflight", serde_json::json!(true)),
+            ("skip_connection_test", serde_json::json!(true)),
+            ("mock_embedding", serde_json::json!("true")),
+        ] {
+            let cm = keyless_cm(ComponentRegistry::with_builtins());
+            cm.config().set(key, value).unwrap();
+            assert!(!cm.keyless_local_defaults_apply(), "{key}");
+            assert_eq!(
+                cm.resolve_graph_extractor(None, &|_| false).kind,
+                "llm",
+                "{key}"
+            );
+        }
+    }
+
+    /// With no usable LLM, `auto` builds the registered GLiNER extractor; an
+    /// explicit `llm` still means the built-in one.
+    #[tokio::test]
+    async fn auto_builds_gliner_without_an_llm() {
+        let cm = keyless_cm(registry_with_gliner());
+        assert!(cm.configured_graph_extractor().await.unwrap().is_some());
+        assert!(
+            cm.graph_extractor(Some("gliner_demo"), &serde_json::json!("gliner_demo"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cm.graph_extractor(Some("llm"), &serde_json::json!("llm"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `auto` never falls back to the LLM extractor: with no LLM and no GLiNER
+    /// registered it fails, saying how to fix the setup. A GLiNER selection
+    /// made by name gets the plain unknown-kind error.
+    #[tokio::test]
+    async fn auto_without_gliner_is_a_keyless_setup_error() {
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        let Err(error) = cm.configured_graph_extractor().await else {
+            panic!("auto must not fall back to the LLM extractor");
+        };
+        let message = error.to_string();
+        assert!(message.contains("no usable LLM is configured"), "{message}");
+        assert!(message.contains("LLM_API_KEY"), "{message}");
+
+        let Err(error) = cm
+            .graph_extractor(Some("gliner"), &serde_json::json!("gliner"))
+            .await
+        else {
+            panic!("nothing serves gliner");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("no graph extractor is registered"),
+            "{error}"
+        );
+    }
+
+    /// The embedding half: with no usable LLM and no embedding setting, the
+    /// embedder is the local ONNX model; any embedding setting, a usable LLM
+    /// or a skip switch keeps the configured one.
+    #[tokio::test]
+    async fn keyless_embeddings_use_the_local_model_only_when_unconfigured() {
+        let (local_provider, local_model, local_dims) = cognee_components::LOCAL_EMBEDDING;
+
+        let cm = keyless_cm(ComponentRegistry::with_builtins());
+        let ctx = cm.build_context().await.unwrap();
+        assert_eq!(ctx.embedding.provider, local_provider);
+        assert_eq!(ctx.embedding.model, local_model);
+        assert_eq!(ctx.embedding.dimensions, local_dims as usize);
+        assert_eq!(ctx.embedding_dimensions, local_dims as usize);
+        assert!(ctx.embedding.api_key.is_none());
+
+        let stock = cognee_components::EmbeddingConfig::default();
+        let configured: [(&str, serde_json::Value); 5] = [
+            ("llm_api_key", serde_json::json!("sk-test")),
+            (
+                "embedding_model",
+                serde_json::json!("text-embedding-3-large"),
+            ),
+            (
+                "embedding_endpoint",
+                serde_json::json!("http://localhost:11434"),
+            ),
+            ("embedding_api_key", serde_json::json!("sk-embed")),
+            ("skip_preflight", serde_json::json!(true)),
+        ];
+        for (key, value) in configured {
+            let cm = keyless_cm(ComponentRegistry::with_builtins());
+            cm.config().set(key, value).unwrap();
+            let ctx = cm.build_context().await.unwrap();
+            assert_eq!(ctx.embedding.provider, stock.provider, "{key}");
+        }
+    }
 
     /// The analytics key is the manager's resolved `llm.api_key` (here from
     /// `LLM_API_KEY`, the variable Python hashes, so one key gives one
@@ -836,7 +1259,10 @@ mod tests {
             &cognee_config_core::MapEnv::new()
                 .with("ENABLE_BACKEND_ACCESS_CONTROL", "true")
                 .with("GRAPH_DATABASE_PROVIDER", "mock")
-                .with("VECTOR_DB_PROVIDER", "mock"),
+                .with("VECTOR_DB_PROVIDER", "mock")
+                // Off the keyless defaults, under which an LLM key does
+                // switch the embedder back from the local model.
+                .with("COGNEE_SKIP_PREFLIGHT", "true"),
         );
         let cm = ComponentManager::new(ConfigManager::new(settings));
         cm.config()

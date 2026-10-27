@@ -45,7 +45,7 @@ use cognee::cognify::cognify as cognee_cognify;
 use cognee::models::{Data, Dataset};
 
 use crate::graph_backend::{
-    check_graph_backend_registered, graph_backend_from_opts, selects_graph_backend,
+    check_graph_backend_registered, graph_backend_from_opts, selected_graph_backend,
 };
 use crate::wire::{cognify_result_json, marshal_inputs};
 use crate::{CogneeServices, HandleState, SdkError};
@@ -90,6 +90,7 @@ pub const COGNIFY_OPT_KEYS: &[&str] = &[
     "temporalCognify",
     "triplet",
     "graphBackend",
+    "extractor",
     "graphSchema",
     "graphModel",
     "graphSpec",
@@ -278,12 +279,22 @@ fn validate_cognify_config(cfg: &cognee::cognify::CognifyConfig) -> Result<(), S
 pub fn check_cognify_opts(svc: &CogneeServices, opts: &serde_json::Value) -> Result<(), SdkError> {
     let cfg = apply_cognify_opts(svc.cognify_config.clone(), opts)?;
     warn_unknown_cognify_opts(opts);
-    if cfg.graph_schema.is_some() && selects_graph_backend(&svc.component_manager, opts)? {
-        return Err(SdkError::Validation(
+    if cfg.graph_schema.is_some()
+        && let Some(choice) = selected_graph_backend(&svc.component_manager, opts)?
+    {
+        let message = if choice.from_auto {
+            format!(
+                "invalid cognify options: graph_schema is only supported by the LLM extractor, \
+                 and no usable LLM is configured, so the `auto` extractor selected `{}`. Set \
+                 LLM_API_KEY, or drop the graph schema",
+                choice.kind
+            )
+        } else {
             "invalid cognify options: graph_schema is only supported by the LLM extractor; \
              unset graph_backend"
-                .to_string(),
-        ));
+                .to_string()
+        };
+        return Err(SdkError::Validation(message));
     }
     validate_cognify_config(&cfg)
 }

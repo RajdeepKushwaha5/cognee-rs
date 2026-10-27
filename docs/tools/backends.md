@@ -15,7 +15,7 @@ swapped via configuration. Pick providers with the env vars / config keys in
 | **File storage** | `StorageTrait` ([`cognee-storage`](../../crates/storage/)) | `LocalStorage` (`file://`), `MockStorage` | `STORAGE_BACKEND` (`storage.backend`; `register_storage`) |
 | **Session store** | `SessionStore` ([`cognee-session`](../../crates/session/)) | `RelationalSessionStore` (the relational DB's `SessionQaDb`; default), `FsSessionStore` (feature `session-fs`), `RedisSessionStore` (feature `session-redis`) | `COGNEE_SESSION_STORE` (`session.store`; `register_session_store`) |
 | **Ontology** | `OntologyResolver` ([`cognee-ontology`](../../crates/ontology/)) | `RdfLibOntologyResolver`, `NoOpOntologyResolver` | `ONTOLOGY_RESOLVER` (`ontology.resolver`; `register_ontology_resolver`) |
-| **Graph extraction** (cognify) | `ChunkGraphExtractor` ([`cognee-cognify`](../../crates/cognify/)) | built-in LLM extractor; external backends (GLiNER, …) | `GRAPH_EXTRACTOR` (`graph_extraction.backend`; `register_graph_extractor`), per-call `graphBackend` |
+| **Graph extraction** (cognify) | `ChunkGraphExtractor` ([`cognee-cognify`](../../crates/cognify/)) | built-in LLM extractor; external backends (GLiNER, …) | `GRAPH_EXTRACTOR` (`graph_extraction.backend`, default `auto`; `register_graph_extractor`), per-call `extractor` / `graphBackend` |
 | **Tokenizer** (chunking) | `TokenCounter` ([`cognee-chunking`](../../crates/chunking/)) | `WordCounter`, `HuggingFaceTokenCounter` (feature), `TikTokenCounter` (feature) | `COGNEE_TOKEN_COUNTER` |
 
 Notes:

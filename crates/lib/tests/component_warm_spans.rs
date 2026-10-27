@@ -53,6 +53,9 @@ fn cm() -> (ComponentManager, TempDir) {
         .into(),
         system_root_directory: root.join("system").to_string_lossy().into_owned(),
         data_root_directory: root.join("data").to_string_lossy().into_owned(),
+        // Off the keyless defaults, which would switch the embedder to the
+        // local ONNX model (downloading it on first use).
+        skip_preflight: true,
         ..Settings::default()
     };
     (ComponentManager::new(ConfigManager::new(settings)), dir)
