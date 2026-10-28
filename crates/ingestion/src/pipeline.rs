@@ -108,7 +108,14 @@ pub struct ProcessedInput {
     pub node_set: Option<Vec<String>>,
     /// Importance weight for ranking (0.0 to 1.0).
     pub importance_weight: Option<f64>,
+    /// The data row already exists but its stored text was gone, so it was
+    /// extracted and stored again: [`persist_data`] points the row at it.
+    pub replaces_stored_text: bool,
 }
+
+/// Doc types whose loader calls a model at add time. Running it again costs a
+/// paid request and can change the text, so a re-add reuses what is stored.
+const REUSES_STORED_TEXT: &[&str] = &["audio"];
 
 // ---------------------------------------------------------------------------
 // Task 1 implementation: DataInput → ProcessedInput
@@ -140,8 +147,8 @@ pub async fn process_input(
 /// [`process_input`] with the loaders of `registry` instead of
 /// [`LoaderRegistry::default_registry`].
 ///
-/// With `database`, content whose data row already holds that loader's stored
-/// text is not extracted again (see [`reusable_stored_text`]).
+/// With `database`, audio whose data row already holds its transcript is not
+/// transcribed again (see [`stored_text`]).
 #[instrument(
     name = "ingestion.process_input",
     skip(input, storage, registry, database)
@@ -216,6 +223,7 @@ async fn process_input_with_registry(
     let mut loader_engine = loader_engine;
     // Set when a re-add reuses the stored text, whose row already has its URI.
     let mut reused_data_uri = None;
+    let mut replaces_stored_text = false;
 
     // Buffer the (effective) input bytes. For URL inputs `effective_input` is
     // the already-extracted text; for everything else it is the raw original
@@ -294,21 +302,32 @@ async fn process_input_with_registry(
             // (content-only) `content_hash` of those same bytes.
             (location, content_hash.clone())
         } else {
-            let loader = registry.get(&doc_type).ok_or_else(|| {
-                Box::new(IngestionError::UnsupportedDocumentType {
-                    document_type: doc_type.clone(),
-                }) as Box<dyn std::error::Error>
-            })?;
-
-            if let Some(stored) =
-                reusable_stored_text(database, storage, data_id, loader.engine_name()).await?
-            {
-                stored_extension = stored.extension;
-                stored_mime_type = stored.mime_type;
-                loader_engine = loader.engine_name().to_string();
-                reused_data_uri = Some(stored.uri.clone());
-                (stored.uri, stored.raw_content_hash)
+            // Checked before a loader is needed: audio transcribed before is
+            // reused even when no transcriber is attached now.
+            let stored = if REUSES_STORED_TEXT.contains(&doc_type.as_str()) {
+                stored_text(database, storage, data_id, &loader_engine).await?
             } else {
+                StoredText::Absent
+            };
+            if let StoredText::Reusable {
+                uri,
+                raw_content_hash,
+                extension,
+                mime_type,
+            } = stored
+            {
+                stored_extension = extension;
+                stored_mime_type = mime_type;
+                reused_data_uri = Some(uri.clone());
+                (uri, raw_content_hash)
+            } else {
+                replaces_stored_text = matches!(stored, StoredText::Lost);
+                let loader = registry.get(&doc_type).ok_or_else(|| {
+                    Box::new(IngestionError::UnsupportedDocumentType {
+                        document_type: doc_type.clone(),
+                    }) as Box<dyn std::error::Error>
+                })?;
+
                 // Minimal Document descriptor for the loader (only metadata fields
                 // the loaders read; the bytes are passed separately).
                 let descriptor = build_loader_descriptor(
@@ -378,48 +397,58 @@ async fn process_input_with_registry(
         external_metadata,
         node_set: None,
         importance_weight: None,
+        replaces_stored_text,
     })
 }
 
-/// The stored text of an existing data row, reused on re-add.
-struct StoredText {
-    uri: String,
-    raw_content_hash: String,
-    extension: String,
-    mime_type: String,
+/// What a re-add finds of the data row's stored text.
+enum StoredText {
+    /// No data row yet, or no database to look in.
+    Absent,
+    /// The row's text, written by the same loader and still in storage.
+    Reusable {
+        uri: String,
+        raw_content_hash: String,
+        extension: String,
+        mime_type: String,
+    },
+    /// The row exists, but its text is gone from storage or was not written by
+    /// this loader: it is extracted again and the row pointed at the new file.
+    Lost,
 }
 
-/// The stored text of the data row `data_id`, when `loader_engine` wrote it
-/// and the file is still in storage.
+/// The stored text of the data row `data_id`, as `loader_engine` wrote it.
 ///
 /// Re-adding content keeps its row as it is (see
-/// [`persist_data_with_acl_and_locks`]), so extracting again would only cost
-/// another loader run (a paid transcription for audio, whose text can differ)
-/// and leave a second stored file no row points at.
-async fn reusable_stored_text(
+/// [`persist_data_with_acl_and_locks`]), so transcribing again would only cost
+/// another paid request, whose text can differ, and leave a second stored file
+/// no row points at. Re-adds in one `add` and in sequence see the row; two
+/// concurrent adds of the same new file can both transcribe it, since the
+/// per-`data_id` lock is taken in persist.
+async fn stored_text(
     database: Option<&dyn IngestDb>,
     storage: &dyn StorageTrait,
     data_id: Uuid,
     loader_engine: &str,
-) -> Result<Option<StoredText>, Box<dyn std::error::Error>> {
+) -> Result<StoredText, Box<dyn std::error::Error>> {
     let Some(database) = database else {
-        return Ok(None);
+        return Ok(StoredText::Absent);
     };
     let Some(row) = database.get_data(data_id).await? else {
-        return Ok(None);
+        return Ok(StoredText::Absent);
     };
     let (Some(engine), Some(raw_content_hash)) = (row.loader_engine, row.raw_content_hash) else {
-        return Ok(None);
+        return Ok(StoredText::Lost);
     };
     if engine != loader_engine || !storage.exists(&row.raw_data_location).await? {
-        return Ok(None);
+        return Ok(StoredText::Lost);
     }
-    Ok(Some(StoredText {
+    Ok(StoredText::Reusable {
         uri: row.raw_data_location,
         raw_content_hash,
         extension: row.extension,
         mime_type: row.mime_type,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +729,29 @@ pub async fn persist_data_with_acl_and_locks(
         // pinned row; Rust adds the replacement first, then deletes the old
         // item — or, when the replacement is this same content-addressed row,
         // drops only its memory and completion marker).
+        if processed.replaces_stored_text {
+            // The row's stored text was gone and has been extracted again. Point
+            // the row at the new file so it stops referring to a missing one. The
+            // cognify marker stays, as above: the graph keeps what it was built
+            // from, and `update()` re-cognifies.
+            let updated_at = database
+                .update_data_stored_text(
+                    data_id,
+                    &processed.raw_data_uri,
+                    &processed.raw_content_hash,
+                    &processed.stored_extension,
+                    &processed.stored_mime_type,
+                    &processed.loader_engine,
+                )
+                .await?;
+            info!(data_id = %data_id, "stored text replaced on re-add");
+            existing_data.raw_data_location = processed.raw_data_uri.clone();
+            existing_data.raw_content_hash = Some(processed.raw_content_hash.clone());
+            existing_data.extension = processed.stored_extension.clone();
+            existing_data.mime_type = processed.stored_mime_type.clone();
+            existing_data.loader_engine = Some(processed.loader_engine.clone());
+            existing_data.updated_at = Some(updated_at);
+        }
         if let Some(names) = node_set {
             let external_metadata = with_node_set_in_external_metadata(
                 existing_data.external_metadata.as_deref(),
@@ -3670,6 +3722,26 @@ mod tests {
                 in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
             written
+        }
+        async fn update_data_stored_text(
+            &self,
+            data_id: Uuid,
+            raw_data_location: &str,
+            raw_content_hash: &str,
+            extension: &str,
+            mime_type: &str,
+            loader_engine: &str,
+        ) -> Result<chrono::DateTime<chrono::Utc>, cognee_database::DatabaseError> {
+            IngestDb::update_data_stored_text(
+                &*self.inner,
+                data_id,
+                raw_data_location,
+                raw_content_hash,
+                extension,
+                mime_type,
+                loader_engine,
+            )
+            .await
         }
         async fn attach_data_to_dataset(
             &self,

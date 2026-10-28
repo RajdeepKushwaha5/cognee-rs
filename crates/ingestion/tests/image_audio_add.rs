@@ -260,15 +260,195 @@ async fn impl_re_adding_audio_transcribes_it_once(db_url: &str) {
         storage.retrieve(&again.raw_data_location).await.unwrap(),
         b"first take"
     );
-    let next = cognee_llm::Transcriber::transcribe_audio(&*whisper, b"", "mp3", None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        next.text, "second take",
-        "the re-add must not transcribe again"
-    );
+    assert_eq!(whisper.calls(), 1, "the re-add must not transcribe again");
     let stored_files = walkdir(&dir.path().join("storage"));
     assert_eq!(stored_files.len(), 1, "stored files: {stored_files:?}");
+}
+
+#[cfg(feature = "audio-loader")]
+fn queued(texts: &[&str]) -> Arc<cognee_test_utils::MockTranscriber> {
+    Arc::new(cognee_test_utils::MockTranscriber::new(
+        "mock-whisper",
+        texts
+            .iter()
+            .map(|text| cognee_llm::TranscriptionOutput {
+                text: text.to_string(),
+                language: None,
+                duration: None,
+            })
+            .collect(),
+    ))
+}
+
+#[cfg(feature = "audio-loader")]
+fn speech() -> Vec<DataInput> {
+    vec![DataInput::Binary {
+        data: b"ID3\x04\x00\x00\x00fake-mp3-payload".to_vec(),
+        name: "speech.mp3".to_string(),
+    }]
+}
+
+#[cfg(feature = "audio-loader")]
+fn stored_path(location: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(location))
+}
+
+/// Audio transcribed before is reused even when no transcriber is attached now,
+/// as when the first add had an API key and a later one does not.
+#[cfg(feature = "audio-loader")]
+async fn impl_re_adding_audio_without_a_transcriber_reuses_it(db_url: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let (pipeline, _db, storage) = make_pipeline(&dir, db_url).await;
+    let whisper = queued(&["Hello from the meeting."]);
+    let owner = Uuid::new_v4();
+    let first = pipeline
+        .with_transcriber(whisper.clone())
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect("first add")
+        .remove(0);
+
+    let (keyless, _db, _storage) = make_pipeline(&dir, db_url).await;
+    let again = keyless
+        .add(speech(), "other", owner, None)
+        .await
+        .expect("a re-add needs no transcriber")
+        .remove(0);
+
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.raw_data_location, first.raw_data_location);
+    assert_eq!(
+        storage.retrieve(&again.raw_data_location).await.unwrap(),
+        b"Hello from the meeting."
+    );
+    assert_eq!(whisper.calls(), 1);
+}
+
+/// When the stored transcript is gone, a re-add transcribes once more and points
+/// the row at the new file; the next re-add reuses it.
+#[cfg(feature = "audio-loader")]
+async fn impl_re_adding_audio_whose_text_is_gone_repairs_the_row(db_url: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let (pipeline, db, storage) = make_pipeline(&dir, db_url).await;
+    let whisper = queued(&["first take", "second take", "third take"]);
+    let pipeline = pipeline.with_transcriber(whisper.clone());
+    let owner = Uuid::new_v4();
+    let first = pipeline
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect("first add")
+        .remove(0);
+    std::fs::remove_file(stored_path(&first.raw_data_location)).expect("remove the transcript");
+
+    let repaired = pipeline
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect("re-add")
+        .remove(0);
+    assert_eq!(whisper.calls(), 2);
+    assert_ne!(repaired.raw_data_location, first.raw_data_location);
+    assert_eq!(
+        storage.retrieve(&repaired.raw_data_location).await.unwrap(),
+        b"second take"
+    );
+    let row = IngestDb::get_data(&*db, first.id)
+        .await
+        .unwrap()
+        .expect("the row");
+    assert_eq!(row.raw_data_location, repaired.raw_data_location);
+    assert_eq!(
+        row.raw_content_hash.as_deref(),
+        Some(
+            cognee_ingestion::ContentHasher::hash_content(b"second take", HashAlgorithm::Md5)
+                .as_str()
+        )
+    );
+    assert_eq!(row.extension, "txt");
+    assert_eq!(row.loader_engine.as_deref(), Some("audio_loader"));
+
+    pipeline
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect("third add");
+    assert_eq!(whisper.calls(), 2, "the repaired row is reused");
+    let stored_files = walkdir(&dir.path().join("storage"));
+    assert_eq!(stored_files.len(), 1, "stored files: {stored_files:?}");
+}
+
+/// With the transcript gone and no transcriber there is nothing to reuse or
+/// repair, so the re-add fails as a first add would.
+#[cfg(feature = "audio-loader")]
+async fn impl_re_adding_lost_audio_without_a_transcriber_fails(db_url: &str) {
+    let dir = TempDir::new().expect("tempdir");
+    let (pipeline, _db, _storage) = make_pipeline(&dir, db_url).await;
+    let owner = Uuid::new_v4();
+    let first = pipeline
+        .with_transcriber(queued(&["take"]))
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect("first add")
+        .remove(0);
+    std::fs::remove_file(stored_path(&first.raw_data_location)).expect("remove the transcript");
+
+    let (keyless, _db, _storage) = make_pipeline(&dir, db_url).await;
+    let error = keyless
+        .add(speech(), "audio", owner, None)
+        .await
+        .expect_err("nothing to reuse");
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported document type at ingest: audio"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_without_a_transcriber_reuses_it_sqlite() {
+    let dir = TempDir::new().expect("tempdir");
+    impl_re_adding_audio_without_a_transcriber_reuses_it(&sqlite_db_url(&dir)).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_without_a_transcriber_reuses_it_pg() {
+    let Some(url) = cognee_test_utils::pg_test_url() else {
+        return;
+    };
+    impl_re_adding_audio_without_a_transcriber_reuses_it(&url).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_whose_text_is_gone_repairs_the_row_sqlite() {
+    let dir = TempDir::new().expect("tempdir");
+    impl_re_adding_audio_whose_text_is_gone_repairs_the_row(&sqlite_db_url(&dir)).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_audio_whose_text_is_gone_repairs_the_row_pg() {
+    let Some(url) = cognee_test_utils::pg_test_url() else {
+        return;
+    };
+    impl_re_adding_audio_whose_text_is_gone_repairs_the_row(&url).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_lost_audio_without_a_transcriber_fails_sqlite() {
+    let dir = TempDir::new().expect("tempdir");
+    impl_re_adding_lost_audio_without_a_transcriber_fails(&sqlite_db_url(&dir)).await;
+}
+
+#[cfg(feature = "audio-loader")]
+#[tokio::test]
+async fn re_adding_lost_audio_without_a_transcriber_fails_pg() {
+    let Some(url) = cognee_test_utils::pg_test_url() else {
+        return;
+    };
+    impl_re_adding_lost_audio_without_a_transcriber_fails(&url).await;
 }
 
 #[cfg(feature = "audio-loader")]

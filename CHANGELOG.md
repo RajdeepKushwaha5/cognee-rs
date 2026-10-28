@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+- **`IngestDb::update_data_stored_text` and `ProcessedInput::replaces_stored_text`.**
+  A re-add of audio whose stored transcript is gone transcribes it again and
+  points the existing data row at the new file, so the trait gains
+  `update_data_stored_text` (it sets `raw_data_location`, `raw_content_hash`,
+  `extension`, `mime_type` and `loader_engine`, and nothing else) and
+  `ProcessedInput` gains the flag that asks for it. Implementors of `IngestDb`
+  and code that builds a `ProcessedInput` by hand must add them.
+
 - **`cognee-search`: recall routes with Python's ordered rule router, and an
   unmatched query runs `HYBRID_COMPLETION`.** `route_query` checks three rules
   in order — a quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording →
@@ -543,11 +551,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `add-and-cognify`, `remember`, `improve`, `bench`) and the bindings services
   use it. The transcript is stored as the item's text, as in Python. Only
   providers with a Whisper-style route (`openai`, `custom` /
-  `openai_compatible`) transcribe; with any other provider, or when no
-  transcriber can be built (no API key, say, logged at `warn`), `add` keeps the
-  old error for audio and text adds are unaffected. Re-adding content whose
-  data row already holds the loader's stored text reuses it instead of running
-  the loader again, so the same audio file is transcribed once.
+  `openai_compatible`) transcribe; with any other provider `add` keeps the old
+  error for audio. When the transcriber cannot be built (no API key, say), text
+  adds are unaffected and quiet, and an audio input fails with an error naming
+  why. Re-adding audio whose data row already holds its transcript reuses it,
+  even without a transcriber, so sequential re-adds transcribe the file once;
+  two concurrent adds of the same new file can still both transcribe it. When
+  the stored transcript is gone, a re-add transcribes it again and points the
+  row at the new file.
   `LoaderRegistry::with_audio` registers the audio loader for both add and
   cognify.
 
