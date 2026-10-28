@@ -570,13 +570,34 @@ impl SearchRetriever for GraphReportRetriever {
             Some(existing_context) => existing_context,
             None => self.get_context(query, params).await?,
         };
-        let report = context
-            .iter()
-            .find_map(|item| item.payload.get(REPORT_PAYLOAD_KEY)?.as_str())
-            .unwrap_or_default();
+        let report = report_text(&context);
         let questions = self.suggest_questions(report).await;
         Ok(SearchOutput::Text(format!("{report}\n{questions}")))
     }
+
+    /// The bare report, without suggestions: Python's context for this type
+    /// is the Markdown string, and its `only_context` result is that string.
+    /// A context carrying no report keeps the default (its items).
+    async fn only_context_output(
+        &self,
+        _query: &str,
+        context: &SearchContext,
+        _params: &SearchParams,
+    ) -> Result<Option<SearchOutput>, SearchError> {
+        Ok(find_report(context).map(|report| SearchOutput::Text(report.to_string())))
+    }
+}
+
+/// The report Markdown carried by a [`GraphReportRetriever`] context.
+fn find_report(context: &SearchContext) -> Option<&str> {
+    context
+        .iter()
+        .find_map(|item| item.payload.get(REPORT_PAYLOAD_KEY)?.as_str())
+}
+
+/// [`find_report`], or `""` when the context carries none.
+fn report_text(context: &SearchContext) -> &str {
+    find_report(context).unwrap_or_default()
 }
 
 #[cfg(test)]
