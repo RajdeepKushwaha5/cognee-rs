@@ -138,6 +138,7 @@ pub async fn recall(
         { COGNEE_SESSION_ID } = session_id.unwrap_or(""),
         "cognee.recall.top_k" = top_k,
         { cognee_search::observability::COGNEE_SEARCH_TYPE } = field::Empty,
+        { cognee_search::observability::COGNEE_RECALL_ROUTE_RULE } = field::Empty,
         { COGNEE_RECALL_SOURCE } = field::Empty,
         { COGNEE_RESULT_COUNT } = field::Empty,
         { COGNEE_SESSION_ENTRY_COUNT } = field::Empty,

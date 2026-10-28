@@ -36,7 +36,11 @@ Stores input as memory: it runs **add + cognify** and then, by default, the
 ### recall
 
 Queries memory with **auto-routing**: when no query type is given, `recall`
-picks an appropriate retrieval strategy automatically. It is session-aware (reads
+picks the retrieval strategy by the first matching rule, as Python does: a
+quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording → `CODING_RULES`, a time
+preposition before an absolute date → `TEMPORAL`, anything else →
+`HYBRID_COMPLETION`. A routed type that the backend rejects, or a lexical or
+rules search that finds nothing, is retried as `HYBRID_COMPLETION`. It is session-aware (reads
 session history when given a `--session-id`) and graph-backed. Results are
 returned to the caller (printed to stdout by the CLI).
 
@@ -203,10 +207,10 @@ indexes them into the `Triplet`/`text` vector collection for
 
 ### search (retrieval)
 
-Unified orchestration across 16 retrieval strategies selected by `SearchType`
+Unified orchestration across 18 retrieval strategies selected by `SearchType`
 ([`crates/search/src/types/search_type.rs`](../crates/search/src/types/search_type.rs)):
 `GraphCompletion`, `GraphCompletionCot`, `GraphCompletionContextExtension`,
-`GraphSummaryCompletion`, `TripletCompletion`, `RagCompletion`, `Chunks`,
+`GraphCompletionDecomposition`, `GraphSummaryCompletion`, `GraphReport`, `TripletCompletion`, `RagCompletion`, `Chunks`,
 `Summaries`, `Temporal`, `Cypher`, `NaturalLanguage`, `FeelingLucky`, `Feedback`,
 `CodingRules`, `ChunksLexical`, `HybridCompletion` (default; combines vector search over
 chunks/summaries/entities/edge-facts and
@@ -245,6 +249,31 @@ bound it, and `wide_search_top_k`, `node_name` (in the vector search) and
 `neighborhood_depth` do not apply. Unlike Python it skips `Triplet_text`, whose
 ids are never graph nodes. `GraphRetrieverCore::search_batch` sends a lone
 query to the single-query search instead, as `get_triplets_batch` does.
+
+`GraphCompletionDecomposition` (`GraphCompletionDecompositionRetriever`, Python's
+retriever of the same name) is its main caller. One structured LLM call splits the
+question into at most five sub-questions (falling back to the question itself when
+the call fails), one batch search fetches their triplets, and the batches are merged
+without duplicates. With `retriever_specific_config.decomposition_mode`
+`"answer_per_subquery"` (the default) each sub-question is answered over its own
+triplets, concurrently, and the question is answered over those answers;
+`"combined_triplets_context"` answers once over the merged triplets. Each context
+item carries a `decomposition` entry (the sub-questions and the triplet's rank in
+each) so the completion can rebuild the per-sub-question contexts. An empty graph is
+`NotFound`, and a batch of queries is rejected.
+
+`GraphReport` (`GraphReportRetriever`, Python's retriever of the same name) ignores
+the query and reports on the whole graph from `get_graph_data`: the top-`top_k`
+hubs (default 10) by normalised degree plus normalised PageRank (networkx's
+defaults, computed here), entity-to-entity edges across different node sets, and
+EXTRACTED vs DERIVED edge counts, followed by LLM-suggested questions. `NodeSet`
+containers and `belongs_to_set` edges are left out and parallel edges count once,
+as in Python's `nx.DiGraph`. Its context is one item holding the Markdown report and
+the structured hubs, connections and counts; an `only_context` search answers the bare
+report text, as Python's does. An empty graph gets a fixed report, not
+`NotFound`. Python computes PageRank only when `scipy` is installed (it is not a
+cognee dependency) and otherwise ranks by degree alone, so its PageRank column reads
+`0.0000` on a default install; Rust always computes it.
 
 `Temporal` is `HybridCompletion` reranked by the time window the question asks
 about (`TemporalHybridRetriever`, Python's retriever of the same name). The hybrid

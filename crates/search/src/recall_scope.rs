@@ -14,13 +14,14 @@ use std::collections::HashSet;
 
 use cognee_session::{SessionManager, SessionStore};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::observability::COGNEE_SEARCH_TYPE;
+use crate::observability::{COGNEE_RECALL_ROUTE_RULE, COGNEE_SEARCH_TYPE};
 use crate::types::SearchError;
 use crate::{
-    SearchOrchestrator, SearchRequest, SearchResponse, SearchType, record_override, route_query,
+    ROUTER_FALLBACK_TYPE, SearchOrchestrator, SearchRequest, SearchResponse, SearchType,
+    route_query,
 };
 
 /// Advanced tuning options forwarded from `cognee::api::recall::RecallOptions`.
@@ -475,28 +476,22 @@ pub async fn run_graph(
         },
     };
 
-    // Python recall.py:458-472: still run the router on explicit query_type
-    // + auto_route=true so the override gets recorded.
-    let (search_type, auto_routed) = match (query_type, auto_route) {
-        (Some(qt), true) => {
-            let routed = route_query(query_text);
-            record_override(routed.search_type, qt);
-            (qt, false)
-        }
-        (Some(qt), false) => (qt, false),
+    // `routed_rule` is set only when the router chose the type, so the retry
+    // below never second-guesses an explicit type.
+    let (mut search_type, routed_rule) = match (query_type, auto_route) {
+        (Some(qt), _) => (qt, None),
         (None, true) => {
-            let routed = route_query(query_text);
-            debug!(
-                search_type = ?routed.search_type,
-                confidence = routed.confidence,
-                "recall: auto-routed query"
-            );
-            (routed.search_type, true)
+            let decision = route_query(query_text);
+            (decision.search_type, Some(decision.rule))
         }
-        (None, false) => (SearchType::GraphCompletion, false),
+        (None, false) => (ROUTER_FALLBACK_TYPE, None),
     };
+    let auto_routed = routed_rule.is_some();
 
     span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
+    if let Some(rule) = routed_rule {
+        span.record(COGNEE_RECALL_ROUTE_RULE, rule);
+    }
 
     // Under per-dataset storage an unfiltered graph search covers the datasets
     // the caller may read, which needs a caller. With none (or one that is not
@@ -520,7 +515,7 @@ pub async fn run_graph(
         return Ok((Vec::new(), search_type, auto_routed, response));
     }
 
-    let request = SearchRequest {
+    let mut request = SearchRequest {
         query_text: query_text.to_string(),
         search_type,
         top_k: Some(top_k),
@@ -549,7 +544,27 @@ pub async fn run_graph(
         summarize_context: None,
     };
 
-    let response = search_orchestrator.search(&request).await?;
+    // The router picked something other than the fallback, so the fallback is
+    // still untried and may replace this result.
+    let routed_guess = routed_rule.is_some() && search_type != ROUTER_FALLBACK_TYPE;
+    let mut response = match search_orchestrator.search(&request).await {
+        Err(SearchError::UnsupportedSearchType(rejected)) if routed_guess => {
+            info!(
+                ?rejected,
+                "recall: routed search type is not supported; retrying as the fallback"
+            );
+            request.search_type = ROUTER_FALLBACK_TYPE;
+            search_orchestrator.search(&request).await?
+        }
+        result => result?,
+    };
+    if routed_guess && RETRY_ON_EMPTY.contains(&request.search_type) && is_empty(&response.result) {
+        info!(search_type = ?request.search_type, "recall: routed search found nothing; retrying as the fallback");
+        request.search_type = ROUTER_FALLBACK_TYPE;
+        response = search_orchestrator.search(&request).await?;
+    }
+    search_type = request.search_type;
+    span.record(COGNEE_SEARCH_TYPE, format!("{search_type:?}").as_str());
 
     let items: Vec<RecallItem> = match &response.result {
         crate::SearchOutput::Items(search_items) => search_items
@@ -585,6 +600,18 @@ pub async fn run_graph(
     };
 
     Ok((items, search_type, auto_routed, response))
+}
+
+/// Routed types whose empty result is retried as [`ROUTER_FALLBACK_TYPE`]: a
+/// lexical or rules search that finds nothing says nothing about the question.
+const RETRY_ON_EMPTY: [SearchType; 2] = [SearchType::ChunksLexical, SearchType::CodingRules];
+
+fn is_empty(output: &crate::SearchOutput) -> bool {
+    match output {
+        crate::SearchOutput::Items(items) => items.is_empty(),
+        crate::SearchOutput::Rules(rules) => rules.is_empty(),
+        _ => false,
+    }
 }
 
 /// Tokenize text into lowercase words of length >= 2.
