@@ -36,7 +36,11 @@ Stores input as memory: it runs **add + cognify** and then, by default, the
 ### recall
 
 Queries memory with **auto-routing**: when no query type is given, `recall`
-picks an appropriate retrieval strategy automatically. It is session-aware (reads
+picks the retrieval strategy by the first matching rule, as Python does: a
+quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording → `CODING_RULES`, a time
+preposition before an absolute date → `TEMPORAL`, anything else →
+`HYBRID_COMPLETION`. A routed type that the backend rejects, or a lexical or
+rules search that finds nothing, is retried as `HYBRID_COMPLETION`. It is session-aware (reads
 session history when given a `--session-id`) and graph-backed. Results are
 returned to the caller (printed to stdout by the CLI).
 

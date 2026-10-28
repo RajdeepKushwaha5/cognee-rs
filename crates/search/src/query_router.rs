@@ -1,775 +1,378 @@
-//! Rule-based query type classifier for auto-routing search queries.
+//! Rule-based query router for recall.
 //!
-//! Ports the Python weighted-scoring heuristic from
-//! `cognee/api/v1/recall/query_router.py` verbatim — same rules, same
-//! weights, same negation window, same scoring semantics. Each detection
-//! rule adds its weight to a [`SearchType`]; the highest total wins.
-//!
-//! Every rule is a `(matcher, search_type, weight)` tuple. Matchers are
-//! either a list of keyword phrases (with word-boundary checks) or a
-//! compiled [`regex::Regex`]. Matches suppressed by a nearby negation word
-//! do not contribute to the score — see [`is_negated`].
+//! Picks a [`SearchType`] for a query without calling an LLM. Rules are
+//! checked in order and the first match wins; a query no rule matches goes
+//! to [`ROUTER_FALLBACK_TYPE`].
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
+use tracing::debug;
 
 use crate::types::SearchType;
 
-/// Result of query routing.
-#[derive(Debug, Clone)]
-pub struct RouteResult {
-    /// The recommended search type.
+/// The search type for a query no rule matched.
+pub const ROUTER_FALLBACK_TYPE: SearchType = SearchType::HybridCompletion;
+
+/// A routing decision: the chosen search type and the rule that picked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteDecision {
     pub search_type: SearchType,
-    /// Confidence score (sum of matching rule weights).
-    pub confidence: f32,
-    /// Second-best search type.
-    pub runner_up: SearchType,
-    /// Runner-up confidence score.
-    pub runner_up_score: f32,
-    /// All aggregated scores sorted by weight descending. Parity with
-    /// Python's `RouteResult.all_scores` (which is a dict, but Rust keeps
-    /// deterministic ordering as a `Vec`).
-    pub all_scores: Vec<(SearchType, f32)>,
+    /// The matched rule's name, or `"default"` when no rule matched.
+    pub rule: &'static str,
 }
 
-impl RouteResult {
-    /// Parity with Python's `RouteResult.is_confident`: the winning score
-    /// is at least 2x the runner-up (with a floor of 1.0 so every match
-    /// clears the bar when nothing else fires).
-    pub fn is_confident(&self) -> bool {
-        self.confidence >= 2.0 * self.runner_up_score.max(1.0)
-    }
-}
-
-// --- Defaults, negation window ---------------------------------------------
-
-const DEFAULT_TYPE: SearchType = SearchType::GraphCompletion;
-const DEFAULT_BASE_SCORE: f32 = 2.0;
-/// Parity with Python `_NEGATION_WINDOW = 20`.
-const NEGATION_WINDOW: usize = 20;
-/// Matches Python's `_NEGATION = re.compile(r"\b(not|n't|no|never|without|lack)\b")`.
-const NEGATION_WORDS: &[&str] = &["not", "n't", "no", "never", "without", "lack"];
-
-/// Check whether the char before `idx` and the char at `idx + keyword_len`
-/// are both non-alphanumeric (i.e. the match is a standalone word,
-/// mirroring Python's `\b...\b`).
-fn is_word_boundary(text: &str, idx: usize, len: usize) -> bool {
-    let before_ok = if idx == 0 {
-        true
-    } else {
-        text[..idx]
-            .chars()
-            .next_back()
-            .map(|c| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(true)
-    };
-    let after_idx = idx + len;
-    let after_ok = if after_idx >= text.len() {
-        true
-    } else {
-        text[after_idx..]
-            .chars()
-            .next()
-            .map(|c| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(true)
-    };
-    before_ok && after_ok
-}
-
-/// Find the first occurrence of `kw` in `text` at a word boundary
-/// (both sides non-alphanumeric). Returns the byte offset of the match
-/// if any. `text` and `kw` are both assumed to be lowercase when called
-/// on `lower`.
-fn contains_word(text: &str, kw: &str) -> Option<usize> {
-    if kw.is_empty() {
-        return None;
-    }
-    let mut cursor = 0usize;
-    while let Some(rel) = text[cursor..].find(kw) {
-        let pos = cursor + rel;
-        if is_word_boundary(text, pos, kw.len()) {
-            return Some(pos);
-        }
-        // Advance by at least one byte to continue scanning. If we are
-        // mid-codepoint for some reason, walk to the next char boundary.
-        let mut step = pos + 1;
-        while step < text.len() && !text.is_char_boundary(step) {
-            step += 1;
-        }
-        cursor = step;
-    }
-    None
-}
-
-/// Is the character range `[match_start, match_start]` preceded by a
-/// negation word within the 20-char window? Parity with Python's
-/// `_is_negated(query, match)`.
-fn is_negated(lower: &str, match_start: usize) -> bool {
-    let mut window_start = match_start.saturating_sub(NEGATION_WINDOW);
-    while window_start > 0 && !lower.is_char_boundary(window_start) {
-        window_start -= 1;
-    }
-    let prefix = &lower[window_start..match_start];
-    for neg in NEGATION_WORDS {
-        // Word-boundary search inside the prefix.
-        if contains_word(prefix, neg).is_some() {
-            return true;
-        }
-    }
-    false
-}
-
-// --- Rule tables ----------------------------------------------------------
-
-/// How a rule probes the query. Keyword lists use word-boundary matching;
-/// regex matchers use a compiled `regex::Regex`.
-enum Matcher {
-    /// Lowercased keywords/phrases; match if any of them is found in the
-    /// lowercased query at a word boundary.
-    Keywords(&'static [&'static str]),
-    /// Compiled regex applied to the original (trimmed) query. The regex
-    /// is built lazily on first use via `OnceLock`.
-    Regex {
-        cell: &'static OnceLock<Regex>,
-        pattern: &'static str,
-        case_insensitive: bool,
-    },
+/// Route `query` by the first rule whose pattern matches it.
+pub fn route_query(query: &str) -> RouteDecision {
+    let query = query.trim();
+    let decision = RULES
+        .iter()
+        .find(|rule| rule.pattern.is_match(query))
+        .map_or(
+            RouteDecision {
+                search_type: ROUTER_FALLBACK_TYPE,
+                rule: "default",
+            },
+            |rule| RouteDecision {
+                search_type: rule.search_type,
+                rule: rule.name,
+            },
+        );
+    debug!(rule = decision.rule, search_type = ?decision.search_type, "query_router: routed");
+    decision
 }
 
 struct Rule {
-    matcher: Matcher,
-    target: SearchType,
-    weight: f32,
-    /// Whether to suppress the match if preceded by a negation word.
-    respects_negation: bool,
+    name: &'static str,
+    pattern: Regex,
+    search_type: SearchType,
 }
 
-// --- Regex cells (one per rule that uses regex) ---------------------------
-// Kept as module-level `OnceLock`s so compilation happens once per process.
+/// The rules in match order. A rule on the query's shape comes before one on
+/// its wording, so `"coding rules"` in quotes is a lexical search. CYPHER has
+/// no rule: auto-routing would run any request text as a graph query, which
+/// can mutate the graph.
+static RULES: LazyLock<[Rule; 3]> = LazyLock::new(|| {
+    [
+        Rule {
+            name: "quoted_phrase",
+            pattern: compile(r#"^"[^"]+"$"#),
+            search_type: SearchType::ChunksLexical,
+        },
+        Rule {
+            name: "coding_rules_intent",
+            pattern: compile(concat!(
+                r"(?i)\b(?:coding (?:rules?|standards?|conventions?|guidelines?)",
+                r"|code review (?:guidelines?|rules?|standards?|checklist|conventions?))\b",
+            )),
+            search_type: SearchType::CodingRules,
+        },
+        Rule {
+            name: "time_scoped_question",
+            pattern: compile(&time_scoped_question_pattern()),
+            search_type: SearchType::Temporal,
+        },
+    ]
+});
 
-static RE_CYPHER_PREFIX: OnceLock<Regex> = OnceLock::new();
-static RE_LEXICAL_QUOTED: OnceLock<Regex> = OnceLock::new();
-static RE_CODE_SYNTAX: OnceLock<Regex> = OnceLock::new();
-static RE_RELATIONSHIP_HOW: OnceLock<Regex> = OnceLock::new();
-static RE_RELATIONSHIP_WHAT: OnceLock<Regex> = OnceLock::new();
-static RE_YEAR: OnceLock<Regex> = OnceLock::new();
-static RE_YEAR_RANGE: OnceLock<Regex> = OnceLock::new();
-
-fn rules() -> &'static [Rule] {
-    static RULES: OnceLock<Vec<Rule>> = OnceLock::new();
-    RULES.get_or_init(|| {
-        vec![
-            // --- Cypher: raw query syntax (highest priority) ---
-            Rule {
-                matcher: Matcher::Regex {
-                    cell: &RE_CYPHER_PREFIX,
-                    // Python: `(^MATCH\s|^RETURN\s|^CREATE\s|^MERGE\s|--\(|\)--)`
-                    pattern: r"(^MATCH\s|^RETURN\s|^CREATE\s|^MERGE\s|--\(|\)--)",
-                    case_insensitive: false,
-                },
-                target: SearchType::Cypher,
-                weight: 10.0,
-                // Cypher syntax is structural — negation prefixes are not
-                // meaningful for it. Python does not skip negation check
-                // either, but the anchored `^MATCH` etc. cannot ever sit
-                // inside a negation window.
-                respects_negation: true,
-            },
-            // --- Coding rules: programming context keywords ---
-            Rule {
-                // Python: \b(coding rules?|code review|best practice|lint(ing|er)?|refactor(ing)?)\b
-                matcher: Matcher::Keywords(&[
-                    "coding rule",
-                    "coding rules",
-                    "code review",
-                    "best practice",
-                    "lint",
-                    "linting",
-                    "linter",
-                    "refactor",
-                    "refactoring",
-                ]),
-                target: SearchType::CodingRules,
-                weight: 5.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(def |return |async |await |import |class \w+\(|\.py\b|function\s+\w+\()
-                matcher: Matcher::Regex {
-                    cell: &RE_CODE_SYNTAX,
-                    pattern: r"\b(def |return |async |await |import |class \w+\(|\.py\b|function\s+\w+\()",
-                    case_insensitive: true,
-                },
-                target: SearchType::CodingRules,
-                weight: 3.0,
-                respects_negation: true,
-            },
-            // --- Lexical: fully quoted phrase ---
-            Rule {
-                // Python: ^"[^"]+"$  (applies to the full trimmed query)
-                matcher: Matcher::Regex {
-                    cell: &RE_LEXICAL_QUOTED,
-                    pattern: r#"^"[^"]+"$"#,
-                    case_insensitive: false,
-                },
-                target: SearchType::ChunksLexical,
-                weight: 8.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(exact|verbatim|literal|word.for.word)\b
-                // NOTE: Python's `.` in `word.for.word` matches any char;
-                // in practice that covers "word-for-word", "word_for_word",
-                // "word for word".
-                matcher: Matcher::Keywords(&[
-                    "exact",
-                    "verbatim",
-                    "literal",
-                    "word for word",
-                    "word-for-word",
-                    "word.for.word",
-                    "word_for_word",
-                ]),
-                target: SearchType::ChunksLexical,
-                weight: 4.0,
-                respects_negation: true,
-            },
-            // --- Summary ---
-            Rule {
-                // Python: \b(summarize|summary|overview|outline|tl;?dr|gist|main points?|key takeaways?|high.?level)\b
-                matcher: Matcher::Keywords(&[
-                    "summarize",
-                    "summary",
-                    "overview",
-                    "outline",
-                    "tldr",
-                    "tl;dr",
-                    "gist",
-                    "main point",
-                    "main points",
-                    "key takeaway",
-                    "key takeaways",
-                    "high level",
-                    "high-level",
-                    "highlevel",
-                ]),
-                target: SearchType::GraphSummaryCompletion,
-                weight: 5.0,
-                respects_negation: true,
-            },
-            // --- Reasoning / chain-of-thought ---
-            Rule {
-                // Python: \b(why|explain|reasoning|step.by.step|chain of thought)\b
-                matcher: Matcher::Keywords(&[
-                    "why",
-                    "explain",
-                    "reasoning",
-                    "step by step",
-                    "step-by-step",
-                    "step.by.step",
-                    "chain of thought",
-                ]),
-                target: SearchType::GraphCompletionCot,
-                weight: 4.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(because|therefore|consequently)\b
-                matcher: Matcher::Keywords(&["because", "therefore", "consequently"]),
-                target: SearchType::GraphCompletionCot,
-                weight: 2.0,
-                respects_negation: true,
-            },
-            // --- Relationship / graph traversal ---
-            Rule {
-                // Python: \b(how (is|are|does|do)\s+\w+\s+(related|connected|linked))\b
-                matcher: Matcher::Regex {
-                    cell: &RE_RELATIONSHIP_HOW,
-                    pattern: r"\b(how (is|are|does|do)\s+\w+\s+(related|connected|linked))\b",
-                    case_insensitive: true,
-                },
-                target: SearchType::GraphCompletionContextExtension,
-                weight: 5.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(what (connects|links|ties)|path between|degree of separation)\b
-                matcher: Matcher::Regex {
-                    cell: &RE_RELATIONSHIP_WHAT,
-                    pattern: r"\b(what (connects|links|ties)|path between|degree of separation)\b",
-                    case_insensitive: true,
-                },
-                target: SearchType::GraphCompletionContextExtension,
-                weight: 5.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(connection|relationship|related to|linked to)\b
-                matcher: Matcher::Keywords(&[
-                    "connection",
-                    "relationship",
-                    "related to",
-                    "linked to",
-                ]),
-                target: SearchType::GraphCompletionContextExtension,
-                weight: 3.0,
-                respects_negation: true,
-            },
-            // --- Temporal ---
-            Rule {
-                // Python: \b(when|before|after|during|since|until)\b
-                matcher: Matcher::Keywords(&[
-                    "when", "before", "after", "during", "since", "until",
-                ]),
-                target: SearchType::Temporal,
-                weight: 3.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b(timeline|chronolog|era|decade|century)\b
-                matcher: Matcher::Keywords(&[
-                    "timeline",
-                    "chronolog",
-                    "chronology",
-                    "chronological",
-                    "era",
-                    "decade",
-                    "century",
-                ]),
-                target: SearchType::Temporal,
-                weight: 4.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \b\d{4}s?\b
-                matcher: Matcher::Regex {
-                    cell: &RE_YEAR,
-                    pattern: r"\b\d{4}s?\b",
-                    case_insensitive: false,
-                },
-                target: SearchType::Temporal,
-                weight: 3.0,
-                respects_negation: true,
-            },
-            Rule {
-                // Python: \bbetween\s+\d{4}\s+and\s+\d{4}\b
-                matcher: Matcher::Regex {
-                    cell: &RE_YEAR_RANGE,
-                    pattern: r"\bbetween\s+\d{4}\s+and\s+\d{4}\b",
-                    case_insensitive: true,
-                },
-                target: SearchType::Temporal,
-                weight: 6.0,
-                respects_negation: true,
-            },
-        ]
-    })
+#[allow(clippy::expect_used, reason = "the patterns are fixed and unit-tested")]
+fn compile(pattern: &str) -> Regex {
+    Regex::new(pattern)
+        .expect("a router pattern should compile, as the unit tests compile all of them")
 }
 
-fn compile(
-    cell: &'static OnceLock<Regex>,
-    pattern: &str,
-    case_insensitive: bool,
-) -> &'static Regex {
-    cell.get_or_init(|| {
-        let mut builder = regex::RegexBuilder::new(pattern);
-        builder.case_insensitive(case_insensitive);
-        builder
-            .build()
-            .unwrap_or_else(|e| panic!("query_router: failed to compile regex {pattern:?}: {e}"))
-    })
+/// A time preposition followed directly by an absolute date: `in 2019`,
+/// `between 1910 and 1920`, `on 7 November 1867`, `in the 1990s`,
+/// `scheduled for 2031`. `the 2019 report`, `Q4 2024` or `since monday` do not
+/// match: the temporal retriever would spend an LLM call to find no window.
+fn time_scoped_question_pattern() -> String {
+    format!(
+        r"(?i)(?:\b{TIME_PREPOSITION}\s+(?:{absolute_date}|the\s+{YEAR}s)\b|{for_date})",
+        absolute_date = absolute_date(),
+        for_date = for_date(),
+    )
 }
 
-/// Try to match a rule against a query. Returns the match start index
-/// (in bytes, within the appropriate view) if the rule fires.
-fn rule_match(rule: &Rule, trimmed: &str, lower: &str) -> Option<usize> {
-    match &rule.matcher {
-        Matcher::Keywords(kws) => {
-            // Walk keywords and return the earliest-matching start index so
-            // negation windows operate on the real position. Order across
-            // keywords is not meaningful for scoring (one rule contributes
-            // at most once per query).
-            let mut earliest: Option<usize> = None;
-            for kw in *kws {
-                if let Some(pos) = contains_word(lower, kw) {
-                    earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
-                }
-            }
-            earliest
-        }
-        Matcher::Regex {
-            cell,
-            pattern,
-            case_insensitive,
-        } => {
-            let re = compile(cell, pattern, *case_insensitive);
-            re.find(trimmed).map(|m| m.start())
-        }
-    }
+const TIME_PREPOSITION: &str = concat!(
+    r"(?:in|during|before|after|since|until|till|between|from|by|on|around|circa",
+    r"|as of|prior to|through|throughout)",
+);
+const YEAR: &str = r"(?:1[0-9]{3}|20[0-9]{2})";
+const DAY: &str = r"\d{1,2}(?:st|nd|rd|th)?";
+const MONTH: &str = concat!(
+    r"(?:january|february|march|april|may|june|july|august|september|october|november",
+    r"|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.?",
+);
+
+/// `2024-03-01`, `7 November 1867`, `July 1969`, `March 1, 2024`, `1915`,
+/// `early 2024`, `1990s`.
+fn absolute_date() -> String {
+    format!(
+        r"(?:{YEAR}-\d{{2}}-\d{{2}}|{day_month_year}|(?:(?:early|late|mid)[-\s]+)?{YEAR}s?)",
+        day_month_year = day_month_year(),
+    )
 }
 
-/// Route a natural-language query to the most appropriate [`SearchType`].
+/// `7 November 1867`, `July 1969`, `March 1, 2024`.
+fn day_month_year() -> String {
+    format!(r"(?:{DAY}\s+)?{MONTH}\s+(?:{DAY},?\s+)?{YEAR}")
+}
+
+/// `for` followed by a date. `for` takes a quantity as readily as a date
+/// (`for 2000 users`), so after it a bare year must end the phrase.
+fn for_date() -> String {
+    format!(
+        r"\bfor\s+(?:(?:{YEAR}-\d{{2}}-\d{{2}}|{day_month_year})\b|(?:(?:early|late|mid)[-\s]+)?{year_as_object}|the\s+{year_as_object})",
+        day_month_year = day_month_year(),
+        year_as_object = year_as_object(),
+    )
+}
+
+/// A year that ends its phrase: followed by nothing, punctuation, a non-letter
+/// or a conjunction joining another date, never by a noun.
 ///
-/// Uses a rule-based weighted-scoring classifier (no LLM call). Each rule's
-/// weight is added to its target `SearchType` when its pattern matches
-/// (and is not negated within a 20-char window). The `SearchType` with the
-/// highest total score wins.
-///
-/// Falls back to [`SearchType::GraphCompletion`] (with base score 2.0) when
-/// no rule fires. When a rule fires but the best score is still below the
-/// base threshold (2.0), returns `GraphCompletion` with the original best
-/// as `runner_up` for diagnostics.
-pub fn route_query(query: &str) -> RouteResult {
-    let trimmed = query.trim();
-    let lower = trimmed.to_lowercase();
-
-    // Track aggregated scores per SearchType. Vec keeps insertion order
-    // for deterministic tie-breaking, matching Python dict iteration.
-    let mut scores: Vec<(SearchType, f32)> = Vec::new();
-
-    for rule in rules() {
-        let Some(m_start) = rule_match(rule, trimmed, &lower) else {
-            continue;
-        };
-        // Negation is evaluated on the lowercase view; the match start is
-        // a byte offset that is valid for either view because lower/upper
-        // ASCII mapping in the matched keyword preserves byte length.
-        // For regex rules we compute the lowercased start by mapping the
-        // same byte offset (ASCII-safe for our patterns).
-        if rule.respects_negation && is_negated(&lower, m_start) {
-            continue;
-        }
-        if let Some(entry) = scores.iter_mut().find(|(s, _)| *s == rule.target) {
-            entry.1 += rule.weight;
-        } else {
-            scores.push((rule.target, rule.weight));
-        }
-    }
-
-    if scores.is_empty() {
-        return RouteResult {
-            search_type: DEFAULT_TYPE,
-            confidence: DEFAULT_BASE_SCORE,
-            runner_up: DEFAULT_TYPE,
-            runner_up_score: 0.0,
-            all_scores: Vec::new(),
-        };
-    }
-
-    // Sort descending by score.
-    scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-    let (best_type, best_score) = scores[0];
-    let (ru_type, ru_score) = scores.get(1).copied().unwrap_or((DEFAULT_TYPE, 0.0));
-
-    if best_score < DEFAULT_BASE_SCORE {
-        // Below threshold: fall back to default but keep the best-matched
-        // rule in `runner_up` for diagnostics.
-        return RouteResult {
-            search_type: DEFAULT_TYPE,
-            confidence: best_score,
-            runner_up: best_type,
-            runner_up_score: best_score,
-            all_scores: scores,
-        };
-    }
-
-    RouteResult {
-        search_type: best_type,
-        confidence: best_score,
-        runner_up: ru_type,
-        runner_up_score: ru_score,
-        all_scores: scores,
-    }
+/// Python writes the follow-up as a negative lookahead, which the `regex`
+/// crate does not support; these alternatives match the same queries.
+fn year_as_object() -> String {
+    format!(r"{YEAR}s?\b(?:$|[^\s]|\s+(?:$|[^\sa-z]|(?:and|or|to|through|until|till)\b))")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- Factual queries ---------------------------------------------------
+    use SearchType::{ChunksLexical, CodingRules, HybridCompletion, Temporal};
 
-    mod factual_queries {
-        use super::*;
+    /// Python's golden table (`test_query_router.py`).
+    const GOLDEN: &[(&str, SearchType)] = &[
+        // quoted_phrase
+        ("\"polonium and radium\"", ChunksLexical),
+        // coding_rules_intent
+        ("What coding rules apply to error handling?", CodingRules),
+        ("Show me the code review guidelines", CodingRules),
+        ("What coding rules apply to gate.py?", CodingRules),
+        // default
+        ("Who won Nobel Prizes?", HybridCompletion),
+        ("What did Einstein discover?", HybridCompletion),
+        ("List all scientists", HybridCompletion),
+        ("Tell me something interesting", HybridCompletion),
+        ("What is the return policy?", HybridCompletion),
+        ("How do I reset my password?", HybridCompletion),
+        // a bare Cypher expression looks like an all-caps heading
+        ("RETURN 1", HybridCompletion),
+        // "exact"/"verbatim" wording is not a lexical-search signal
+        ("Find the exact phrase in the documents", HybridCompletion),
+        (
+            "Find the exact error message from the logs",
+            HybridCompletion,
+        ),
+        ("Quote the paragraph verbatim", HybridCompletion),
+        // summary intent stays on the default
+        ("Summarize everything about Marie Curie", HybridCompletion),
+        ("Give me an overview of the project", HybridCompletion),
+        ("tldr of the report", HybridCompletion),
+        ("Give me the main points of the meeting", HybridCompletion),
+        (
+            "Summarize the timeline of Einstein's work",
+            HybridCompletion,
+        ),
+        ("Summarize why the migration stalled", HybridCompletion),
+        // time_scoped_question: a time preposition right before an absolute date
+        ("what happened in 2019", Temporal),
+        ("What happened between 1910 and 1920?", Temporal),
+        ("What was discovered in 1915?", Temporal),
+        ("What did we decide in 2024?", Temporal),
+        ("Incidents from 2019 to 2021", Temporal),
+        ("What shipped on 2024-03-01?", Temporal),
+        ("What happened in July 1969?", Temporal),
+        ("Who was born on 7 November 1867?", Temporal),
+        ("What happened on March 1, 2024?", Temporal),
+        ("What did Marie Curie do before 1900?", Temporal),
+        ("What changed after 2010?", Temporal),
+        ("What happened in the 1990s?", Temporal),
+        ("What happened in early 2024?", Temporal),
+        ("What was the plan as of Jan 2025?", Temporal),
+        ("What did Pierre say about Napoleon in 1805?", Temporal),
+        // `for` only when the year is the object of the phrase, never a quantity
+        ("What is scheduled for 2031?", Temporal),
+        ("What is planned for March 2026?", Temporal),
+        ("What are the goals for 2027 and 2028?", Temporal),
+        ("What was the plan for the 1990s?", Temporal),
+        // a year naming a thing, or a bare temporal word, stays on the default
+        ("Summarise the 2019 report", HybridCompletion),
+        ("Who wrote the 2019 annual report?", HybridCompletion),
+        ("What's in the 2019 report?", HybridCompletion),
+        (
+            "What was the 1990s policy on remote work?",
+            HybridCompletion,
+        ),
+        ("Open ticket 2048", HybridCompletion),
+        ("Error 1045 in the logs", HybridCompletion),
+        ("How many rows are in table 2024_sales?", HybridCompletion),
+        ("Which version shipped in Q4 2024?", HybridCompletion),
+        ("What did Alice say in 2 meetings?", HybridCompletion),
+        ("What is the budget for 2000 users?", HybridCompletion),
+        ("Order chairs for 1500 guests", HybridCompletion),
+        ("Reserve the hall for 2024_sales", HybridCompletion),
+        ("What is the plan for 2000 new hires?", HybridCompletion),
+        ("Show the timeline of discoveries", HybridCompletion),
+        ("When was the company founded?", HybridCompletion),
+        ("What happened after the merger?", HybridCompletion),
+        ("Since when has Alice been on the team?", HybridCompletion),
+        ("list the open tickets since monday", HybridCompletion),
+        ("When did Einstein publish?", HybridCompletion),
+        ("What happened last year?", HybridCompletion),
+        // reasoning / relationship intent stays on the default
+        ("Why did Curie win two Nobel Prizes?", HybridCompletion),
+        ("Explain how the auth module works", HybridCompletion),
+        ("Why is the deploy failing?", HybridCompletion),
+        (
+            "How is Einstein connected to the Sorbonne?",
+            HybridCompletion,
+        ),
+        (
+            "What is the relationship between supply and demand?",
+            HybridCompletion,
+        ),
+        ("What entities are related to physics?", HybridCompletion),
+        // incidental code / engineering words are not coding-rules intent
+        ("Refactor plan for the billing service", HybridCompletion),
+        (
+            "What are the best practices for onboarding new hires?",
+            HybridCompletion,
+        ),
+        ("Who did the code review for PR 12?", HybridCompletion),
+    ];
 
-        #[test]
-        fn simple_who() {
-            assert_eq!(
-                route_query("Who won Nobel Prizes?").search_type,
-                SearchType::GraphCompletion
-            );
+    #[test]
+    fn golden_routes() {
+        for &(query, expected) in GOLDEN {
+            assert_eq!(route_query(query).search_type, expected, "{query:?}");
         }
+    }
 
-        #[test]
-        fn simple_what() {
-            assert_eq!(
-                route_query("What did Einstein discover?").search_type,
-                SearchType::GraphCompletion
-            );
+    #[test]
+    fn no_golden_query_matches_two_rules() {
+        for &(query, _) in GOLDEN {
+            let matched: Vec<_> = RULES
+                .iter()
+                .filter(|rule| rule.pattern.is_match(query.trim()))
+                .map(|rule| rule.name)
+                .collect();
+            assert!(matched.len() <= 1, "{query:?} matches {matched:?}");
         }
+    }
 
-        #[test]
-        fn short_list() {
-            assert_eq!(
-                route_query("List all scientists").search_type,
-                SearchType::GraphCompletion
+    #[test]
+    fn shape_rules_win_over_intent_rules() {
+        assert_eq!(route_query("\"coding rules\"").rule, "quoted_phrase");
+    }
+
+    #[test]
+    fn rules_only_target_routable_types() {
+        let routable = [HybridCompletion, ChunksLexical, CodingRules, Temporal];
+        let targets = RULES.iter().map(|rule| rule.search_type);
+        for target in targets.chain([ROUTER_FALLBACK_TYPE]) {
+            assert!(routable.contains(&target), "{target:?} is not routable");
+        }
+    }
+
+    #[test]
+    fn a_year_after_for_routes_only_when_it_ends_the_phrase() {
+        let cases = [
+            ("What is planned for 2031", Temporal),
+            ("What is planned for 2031, and why?", Temporal),
+            ("What is planned for 2031 or later?", Temporal),
+            ("What is planned for 2031 - draft", Temporal),
+            ("What was the budget for 1990s users?", HybridCompletion),
+            ("What is the budget for 2000 Users?", HybridCompletion),
+            ("What is the plan for 2000 andrew?", HybridCompletion),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(route_query(query).search_type, expected, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn an_unmatched_query_gets_the_default_decision() {
+        let expected = RouteDecision {
+            search_type: ROUTER_FALLBACK_TYPE,
+            rule: "default",
+        };
+        assert_eq!(route_query("Tell me something"), expected);
+    }
+
+    #[test]
+    fn a_matched_query_names_its_rule() {
+        assert_eq!(route_query("\"polonium and radium\"").rule, "quoted_phrase");
+        assert_eq!(
+            route_query("Show me the coding rules").rule,
+            "coding_rules_intent"
+        );
+        assert_eq!(
+            route_query("What happened in 1898?").rule,
+            "time_scoped_question"
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        let decision = route_query("   \"polonium and radium\"  ");
+        assert_eq!(decision.search_type, ChunksLexical);
+    }
+
+    #[test]
+    fn no_coding_rules_without_an_explicit_phrase() {
+        let queries = [
+            "hook PreToolUse gate.py emergency exit",
+            "Where is def recover() mentioned in the incident notes?",
+            "Describe the import process for customer records",
+            "What does the return policy say?",
+            "Find the async workflow in the operations guide",
+            "Find the await keyword mentioned in the incident notes",
+            "Which runbook mentions class Parser(",
+            "Which runbook mentions function restore_state(",
+            "What class of animal is a dolphin?",
+            "What is the function of the liver?",
+            "Run the linter on the billing module",
+            "Refactor the payment flow",
+        ];
+        for query in queries {
+            assert_ne!(route_query(query).search_type, CodingRules, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn cypher_is_never_auto_routed() {
+        let queries = [
+            // Valid Cypher, including statements that mutate or destroy.
+            "MATCH (n) DETACH DELETE n",
+            "MATCH (n:Person) RETURN n.name",
+            "CREATE (x:Note {t: 1}) RETURN x",
+            "MERGE (a:Tag {name: 'x'}) RETURN a",
+            "MATCH (n:User) SET n.admin = true RETURN n",
+            "MATCH (n:Doc) REMOVE n.secret RETURN n",
+            "OPTIONAL MATCH (n:Person) RETURN n",
+            "UNWIND [1, 2, 3] AS x RETURN x",
+            "MATCH (a)--(b) RETURN a",
+            // Prose that merely looks Cypher-ish.
+            "RETURN POLICY FOR DAMAGED GOODS",
+            "MERGE CONFLICT in the deploy branch",
+            "Run diff --( format on the file",
+        ];
+        for query in queries {
+            assert_ne!(
+                route_query(query).search_type,
+                SearchType::Cypher,
+                "{query:?}"
             );
         }
     }
 
-    // --- Cypher queries ----------------------------------------------------
-
-    mod cypher {
-        use super::*;
-
-        #[test]
-        fn match_statement() {
-            assert_eq!(
-                route_query("MATCH (n:Person) RETURN n.name").search_type,
-                SearchType::Cypher
-            );
-        }
-
-        #[test]
-        fn return_statement() {
-            assert_eq!(route_query("RETURN 1").search_type, SearchType::Cypher);
-        }
-    }
-
-    // --- Coding rules (incl. 2 negatives) ---------------------------------
-
-    mod coding_rules {
-        use super::*;
-
-        #[test]
-        fn coding_rules_phrase() {
-            let r = route_query("What coding rules apply to error handling?");
-            assert_eq!(r.search_type, SearchType::CodingRules);
-        }
-
-        #[test]
-        fn code_review() {
-            assert_eq!(
-                route_query("Show me the code review guidelines").search_type,
-                SearchType::CodingRules
-            );
-        }
-
-        #[test]
-        fn bare_class_is_not_code() {
-            let result = route_query("What class of animal is a dolphin?");
-            assert_ne!(result.search_type, SearchType::CodingRules);
-        }
-
-        #[test]
-        fn bare_function_is_not_code() {
-            let result = route_query("What is the function of the liver?");
-            assert_ne!(result.search_type, SearchType::CodingRules);
-        }
-    }
-
-    // --- Lexical ----------------------------------------------------------
-
-    mod lexical {
-        use super::*;
-
-        #[test]
-        fn quoted_phrase() {
-            assert_eq!(
-                route_query("\"polonium and radium\"").search_type,
-                SearchType::ChunksLexical
-            );
-        }
-
-        #[test]
-        fn exact_keyword() {
-            let r = route_query("Find the exact phrase in the documents");
-            assert_eq!(r.search_type, SearchType::ChunksLexical);
-        }
-    }
-
-    // --- Summary ---------------------------------------------------------
-
-    mod summary {
-        use super::*;
-
-        #[test]
-        fn summarize() {
-            let r = route_query("Summarize everything about Marie Curie");
-            assert_eq!(r.search_type, SearchType::GraphSummaryCompletion);
-        }
-
-        #[test]
-        fn overview() {
-            let r = route_query("Give me an overview of the project");
-            assert_eq!(r.search_type, SearchType::GraphSummaryCompletion);
-        }
-
-        #[test]
-        fn tldr() {
-            assert_eq!(
-                route_query("tldr of the report").search_type,
-                SearchType::GraphSummaryCompletion
-            );
-        }
-    }
-
-    // --- Reasoning -------------------------------------------------------
-
-    mod reasoning {
-        use super::*;
-
-        #[test]
-        fn why_question() {
-            let r = route_query("Why did Curie win two Nobel Prizes?");
-            assert_eq!(r.search_type, SearchType::GraphCompletionCot);
-        }
-
-        #[test]
-        fn explain() {
-            let r = route_query("Explain the theory of relativity");
-            assert_eq!(r.search_type, SearchType::GraphCompletionCot);
-        }
-    }
-
-    // --- Relationship ----------------------------------------------------
-
-    mod relationship {
-        use super::*;
-
-        #[test]
-        fn connection_between() {
-            let r = route_query("How is Einstein connected to the Sorbonne?");
-            assert_eq!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-
-        #[test]
-        fn related_to() {
-            let r = route_query("What entities are related to physics?");
-            assert_eq!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-
-        #[test]
-        fn between_not_temporal() {
-            let r = route_query("What is the relationship between supply and demand?");
-            assert_eq!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-    }
-
-    // --- Temporal --------------------------------------------------------
-
-    mod temporal {
-        use super::*;
-
-        #[test]
-        fn when_question() {
-            assert_eq!(
-                route_query("When did Einstein publish?").search_type,
-                SearchType::Temporal
-            );
-        }
-
-        #[test]
-        fn year_range() {
-            let r = route_query("What happened between 1910 and 1920?");
-            assert_eq!(r.search_type, SearchType::Temporal);
-        }
-
-        #[test]
-        fn timeline() {
-            assert_eq!(
-                route_query("Show the timeline of discoveries").search_type,
-                SearchType::Temporal
-            );
-        }
-
-        #[test]
-        fn specific_year() {
-            assert_eq!(
-                route_query("What was discovered in 1915?").search_type,
-                SearchType::Temporal
-            );
-        }
-    }
-
-    // --- Negation --------------------------------------------------------
-
-    mod negation {
-        use super::*;
-
-        #[test]
-        fn not_related_suppresses_graph() {
-            let r = route_query("What is not related to physics?");
-            assert_ne!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-
-        #[test]
-        fn no_connection_suppresses_graph() {
-            let r = route_query("There is no connection between these topics");
-            assert_ne!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-
-        #[test]
-        fn negation_does_not_affect_distant_match() {
-            let r = route_query(
-                "This is not about food at all, however I want to know how is X connected to Y?",
-            );
-            assert_eq!(r.search_type, SearchType::GraphCompletionContextExtension);
-        }
-    }
-
-    // --- Confidence ------------------------------------------------------
-
-    mod confidence {
-        use super::*;
-
-        #[test]
-        fn high_confidence_for_cypher() {
-            let r = route_query("MATCH (n) RETURN n");
-            assert!(r.confidence >= 10.0);
-            assert!(r.is_confident());
-        }
-
-        #[test]
-        fn runner_up_populated() {
-            let r = route_query("Summarize the timeline of discoveries");
-            // The winner should be Summary; runner-up should be Temporal.
-            assert_eq!(r.search_type, SearchType::GraphSummaryCompletion);
-            assert!(!r.all_scores.is_empty());
-        }
-
-        #[test]
-        fn default_has_base_confidence() {
-            let r = route_query("Tell me something interesting");
-            assert_eq!(r.search_type, SearchType::GraphCompletion);
-            assert!(r.confidence >= 0.0);
-        }
-    }
-
-    // --- Ambiguous queries -----------------------------------------------
-
-    mod ambiguous {
-        use super::*;
-
-        #[test]
-        fn temporal_beats_graph_for_years() {
-            let r = route_query("What happened between 1910 and 1920?");
-            assert_eq!(r.search_type, SearchType::Temporal);
-        }
-
-        #[test]
-        fn summary_with_temporal_word() {
-            let r = route_query("Summarize the timeline of Einstein's work");
-            assert_eq!(r.search_type, SearchType::GraphSummaryCompletion);
-        }
-
-        #[test]
-        fn default_for_vague_query() {
-            assert_eq!(
-                route_query("Tell me something").search_type,
-                SearchType::GraphCompletion
-            );
-        }
+    /// A known limitation: a preposition before a four-digit count reads as a
+    /// year. TEMPORAL then finds no time window and answers as plain hybrid.
+    #[test]
+    fn a_four_digit_quantity_after_a_preposition_reads_as_a_year() {
+        assert_eq!(route_query("What is in 2048 bytes?").search_type, Temporal);
     }
 }

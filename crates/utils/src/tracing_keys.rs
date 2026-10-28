@@ -35,6 +35,9 @@ pub const COGNEE_OPERATION_MODE: &str = "cognee.operation.mode";
 /// `recall()` query routing scope.
 pub const COGNEE_RECALL_SCOPE: &str = "cognee.recall.scope";
 
+/// The query-router rule that picked `recall()`'s search type.
+pub const COGNEE_RECALL_ROUTE_RULE: &str = "cognee.recall.route_rule";
+
 /// `forget()` target.
 pub const COGNEE_FORGET_TARGET: &str = "cognee.forget.target";
 

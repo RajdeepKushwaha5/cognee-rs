@@ -62,12 +62,10 @@ fn build_orchestrator() -> SearchOrchestrator {
     // Register every search type that recall() may route to so that any
     // auto-routed test still finds a retriever.
     for st in [
-        SearchType::GraphCompletion,
-        SearchType::GraphSummaryCompletion,
+        SearchType::HybridCompletion,
+        SearchType::ChunksLexical,
+        SearchType::CodingRules,
         SearchType::Temporal,
-        SearchType::RagCompletion,
-        SearchType::Chunks,
-        SearchType::Summaries,
     ] {
         registry.register(Arc::new(StubRetriever(st)));
     }
