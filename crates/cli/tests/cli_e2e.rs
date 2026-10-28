@@ -652,9 +652,9 @@ fn make_cmd_without_llm_env(config_home: &TempDir, workdir: &Path) -> Command {
 }
 
 /// `add` of an audio file transcribes it through the configured provider and
-/// stores the transcript; adding it again reuses that transcript. Without an
-/// API key there is no transcriber, so the same file fails as an unsupported
-/// type while text still adds.
+/// stores the transcript; adding it again reuses that transcript, also once the
+/// key is gone. Without an API key a new audio file fails with an error naming
+/// the missing key, while text still adds.
 #[test]
 fn add_audio_file_stores_the_transcript() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -700,8 +700,9 @@ fn add_audio_file_stores_the_transcript() {
         .assert()
         .failure()
         .stdout(predicate::str::contains(
-            "Unsupported document type at ingest: audio",
-        ));
+            "audio needs a transcriber, which could not be built",
+        ))
+        .stdout(predicate::str::contains("llm_api_key must be configured"));
     make_cmd_without_llm_env(&config_home, workdir.path())
         .args(["add", "text needs no key", "--dataset-name", "no_key"])
         .assert()
@@ -720,6 +721,13 @@ fn add_audio_file_stores_the_transcript() {
             .assert()
             .success();
     }
+    // Without the key again, the transcribed file is still added from its
+    // stored transcript.
+    config_set(&config_home, workdir.path(), "llm_api_key", "\"\"");
+    make_cmd_without_llm_env(&config_home, workdir.path())
+        .args(["add", &audio_arg, "--dataset-name", "again"])
+        .assert()
+        .success();
     rt.block_on(whisper.assert_async());
 
     let conn = Connection::open(&db_file_path).expect("open sqlite database");
