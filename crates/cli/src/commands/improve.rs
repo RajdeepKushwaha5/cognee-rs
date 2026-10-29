@@ -106,6 +106,7 @@ pub fn run(args: ImproveArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
 
         let result = improve(ImproveParams {
             dataset_name: dataset_name.clone(),
+            dataset_id: None,
             session_ids,
             node_name,
             owner_id,
@@ -130,19 +131,40 @@ pub fn run(args: ImproveArgs, cm: Arc<ComponentManager>) -> Result<(), CliError>
             checkpoint_store: Some(checkpoint_store),
             cognify_config: &cognify_config,
         })
-        .await
-        .map_err(|error| CliError::Runtime(format!("Improve failed: {error}")))?;
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            // A fatal-stage abort still reports what ran before it, as
+            // Python's raised error carries `improve_result`.
+            Err(cognee::api::ApiError::ImproveAborted { result, .. }) => {
+                log_stages(&result);
+                let error = result.error.as_deref().unwrap_or("a fatal stage errored");
+                return Err(CliError::Runtime(format!(
+                    "Improve failed: {error} (status {})",
+                    result.status().as_str()
+                )));
+            }
+            Err(error) => return Err(CliError::Runtime(format!("Improve failed: {error}"))),
+        };
 
-        info!(
-            stages_run = ?result.stages_run,
-            feedback_processed = result.feedback_entries_processed,
-            feedback_applied = result.feedback_entries_applied,
-            sessions_persisted = result.sessions_persisted,
-            edges_synced = result.edges_synced,
-            triplets = result.memify_result.as_ref().map(|m| m.triplet_count).unwrap_or(0),
-            "improve completed"
-        );
+        log_stages(&result);
+        info!(status = result.status().as_str(), "improve completed");
 
         Ok(())
     })
+}
+
+/// One log line per stage of an improve run, in registry order.
+fn log_stages(result: &cognee::api::ImproveResult) {
+    for stage in &result.stages {
+        info!(
+            stage = %stage.stage,
+            status = stage.status.as_str(),
+            reason = stage.reason.as_deref().unwrap_or(""),
+            error = stage.error.as_deref().unwrap_or(""),
+            counts = ?stage.counts,
+            duration_ms = stage.duration_ms,
+            "improve stage"
+        );
+    }
 }

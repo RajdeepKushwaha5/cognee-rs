@@ -123,7 +123,9 @@ uint32_t cg_api_version(void);
  *   CG_ERR_COMPONENT            ↔ "COMPONENT_ERROR"
  *   CG_ERR_SERVICE_BUILD        ↔ "SERVICE_BUILD_ERROR"
  *   CG_ERR_USER_BOOTSTRAP       ↔ "USER_BOOTSTRAP_ERROR"
- *   (CG_ERR_RUNTIME = 3)        ↔ "RUNTIME_ERROR"
+ *   (CG_ERR_RUNTIME = 3)        ↔ "RUNTIME_ERROR", and "IMPROVE_ABORTED"
+ *                                 (the message then ends with
+ *                                 "improve_result: <partial result JSON>")
  *   CG_ERR_SDK_VALIDATION       ↔ "VALIDATION_ERROR"
  *   CG_ERR_UNSUPPORTED          ↔ "UNSUPPORTED"
  *   CG_ERR_FEATURE_NOT_BUILT    ↔ "FEATURE_NOT_BUILT"
@@ -588,9 +590,11 @@ void cg_sdk_recall(const CgSdk*        sdk,
  *   MemifyResult — {"tripletCount":N,"indexedCount":N,"batchCount":N,
  *                    "alreadyCompleted":bool,"priorPipelineRunId":null|"<uuid>"}
  *
- *   ImproveResult — {"stagesRun":[…],"stages":[ImproveStage…],"memifyResult":…,
- *                    "feedbackEntriesProcessed":N,"feedbackEntriesApplied":N,
- *                    "sessionsPersisted":N,"edgesSynced":N}
+ *   ImproveResult — {"datasetId":null|"<uuid>","datasetName":"…",
+ *                    "sessionIds":[…],"stages":[ImproveStage…],
+ *                    "background":bool,"finished":bool,"error":null|"…",
+ *                    "status":"completed"|"errored"|"skipped"|"running"}
+ *                    One stage per improve stage, in registry order.
  *
  *   ImproveStage  — {"stage":"…","status":"completed"|"already_completed"|
  *                    "skipped"|"errored","reason":null|"…","error":null|"…",
