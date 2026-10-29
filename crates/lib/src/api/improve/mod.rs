@@ -19,22 +19,31 @@
 //! - an exhausted LLM budget in a non-fatal stage: every later stage would
 //!   fail the same way, so they are skipped with `budget_exhausted` and the
 //!   run ends there, without an error.
+//!
+//! A run holds its dataset's lock ([`DatasetLocks::hold`]) and then a claim on
+//! every session it targets ([`acquire_improve_lock_many`]) for its whole
+//! length, released once when it ends. Both **wait**: improves that share a
+//! dataset or a session queue one after the other, as pipeline runs on one
+//! dataset do, instead of the later one skipping. The stages' own `add` calls
+//! re-enter the dataset lock the run holds.
 
 mod config;
 mod result;
 mod stages;
+mod watermark;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use cognee_cognify::CognifyConfig;
+use cognee_core::DatasetLocks;
 use cognee_database::{CheckpointStore, RelationalDb};
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
 use cognee_ingestion::AddPipeline;
 use cognee_llm::Llm;
 use cognee_ontology::OntologyResolver;
-use cognee_session::{ImproveLockGuard, SessionManager, SessionStore};
+use cognee_session::{SessionManager, SessionStore, acquire_improve_lock_many, improve_lock_keys};
 use cognee_storage::StorageTrait;
 use cognee_vector::VectorDB;
 use tracing::{Instrument, info, warn};
@@ -42,6 +51,7 @@ use uuid::Uuid;
 
 use super::error::ApiError;
 use stages::{GraphCapabilities, ImproveStages, StageExecutor, StageRun};
+use watermark::{StageStamp, save_stamps};
 
 pub use config::{
     DEFAULT_FEEDBACK_ALPHA, ImproveConfig, ImproveConfigError, parse_stages_disabled,
@@ -56,6 +66,10 @@ pub use stages::{
     DEFAULT_STAGES, REASON_NO_LLM_CONFIGURED, REASON_NO_NEW_TRACE_STEPS, REASON_NOT_PORTED,
     REASON_OPT_IN_DISABLED, REASON_PERSONALIZATION_DISABLED, REASON_SESSION_MANAGER_UNAVAILABLE,
     REMOVED_STAGE_NAMES, StageKind, TRUTH_SUBSPACE_STAGE, truth_subspace_stage_result,
+};
+pub use watermark::{
+    IMPROVE_PIPELINE_NAME, IMPROVE_WRITE_PIPELINE_NAME, REASON_NO_WRITES_SINCE_LAST_IMPROVE,
+    stage_watermark_key,
 };
 
 /// Parameters for [`improve`].
@@ -136,9 +150,17 @@ pub struct ImproveParams<'a> {
     pub session_manager: Option<Arc<SessionManager>>,
     /// Add pipeline (borrowed). Required by the cognify-backed stages.
     pub add_pipeline: Option<&'a AddPipeline>,
-    /// Checkpoint store. Unused since the graph-to-session sync stage was
-    /// removed; reserved for the stage watermarks (SDK-1044 step 4).
+    /// Checkpoint store of the stage watermarks
+    /// (`improve_stage:{stage}:{dataset_id}`). Without one a watermarked stage
+    /// always runs.
     pub checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// The dataset lock registry the run holds its dataset in, for its whole
+    /// length. `None` uses the add pipeline's registry
+    /// ([`AddPipeline::dataset_locks`]) and, without one, the process-wide
+    /// [`DatasetLocks::global`] (the default of `add`, delete, `cognify` and
+    /// `memify`). A host with a registry of its own passes it, so its
+    /// `add`/`delete` paths queue behind the run.
+    pub dataset_locks: Option<Arc<DatasetLocks>>,
 
     /// Borrowed cognify configuration of the cognify-backed stages.
     pub cognify_config: &'a CognifyConfig,
@@ -199,6 +221,40 @@ fn skip_stages(result: &mut ImproveResult, stages: &[StageKind], reason: &str) {
     );
 }
 
+/// Counts that say how much a stage wrote: when a stage reports any of them,
+/// it wrote iff one is positive.
+const WRITE_COUNTS: [&str; 6] = [
+    "entries_applied",
+    "sessions_persisted",
+    "windows",
+    "documents",
+    "anchors",
+    "nodes_scored",
+];
+
+/// Whether `stage` may have written to the dataset's graph — what makes the
+/// run a change for the watermarked stages (Python counts every non-noop
+/// improve). Conservative: an errored stage may have written part of its
+/// data, and a completed one without a write count is assumed to have
+/// written. `global_context_index` is the watermark's own writer, and a
+/// skipped or `already_completed` stage wrote nothing.
+fn stage_may_have_written(stage: StageKind, result: &StageResult) -> bool {
+    if stage == StageKind::GlobalContextIndex {
+        return false;
+    }
+    match result.status {
+        StageStatus::Errored => true,
+        StageStatus::Completed => {
+            let mut counts = WRITE_COUNTS
+                .iter()
+                .filter_map(|key| result.counts.get(*key))
+                .peekable();
+            counts.peek().is_none() || counts.any(|n| *n > 0)
+        }
+        StageStatus::AlreadyCompleted | StageStatus::Skipped => false,
+    }
+}
+
 /// One [`StageResult`] per stage, in order — Python's `execute_stages`
 /// (`cognee/api/v1/improve/improve.py:242-280`).
 ///
@@ -209,13 +265,18 @@ fn skip_stages(result: &mut ImproveResult, stages: &[StageKind], reason: &str) {
 /// [`LoopEnd::Aborted`]. A non-fatal stage that errored on an exhausted LLM
 /// budget skips the rest with `budget_exhausted` and ends it as
 /// [`LoopEnd::Finished`].
+///
+/// The watermarks the stages ask for are pushed onto `stamps`, to save once
+/// the run is known not to have errored.
 async fn execute_stages<E: StageExecutor>(
     stages: &[StageKind],
     has_sessions: bool,
     stages_disabled: &[String],
     executor: &mut E,
     result: &mut ImproveResult,
+    stamps: &mut Vec<StageStamp>,
 ) -> LoopEnd {
+    let mut graph_write_recorded = false;
     for (index, &stage) in stages.iter().enumerate() {
         let run = match gate_reason(stage, has_sessions, stages_disabled, executor) {
             Some(reason) => StageRun::from(StageResult::skipped(stage.name(), reason)),
@@ -246,7 +307,12 @@ async fn execute_stages<E: StageExecutor>(
                 "improve: stage errored"
             );
         }
+        if !graph_write_recorded && stage_may_have_written(stage, &run.result) {
+            executor.record_graph_write().await;
+            graph_write_recorded = true;
+        }
         let error = run.result.error.clone();
+        stamps.extend(run.stamp);
         result.stages.push(run.result);
         let remaining = &stages[index + 1..];
 
@@ -316,7 +382,8 @@ async fn run_improve(
         extraction_tasks: _,
         enrichment_tasks: _,
         data: _,
-        checkpoint_store: _,
+        checkpoint_store,
+        dataset_locks,
         owner_id,
         tenant_id,
         feedback_alpha,
@@ -350,20 +417,6 @@ async fn run_improve(
     let mut result = ImproveResult::new(dataset_name.clone(), session_ids.clone());
     result.background = run_in_background;
 
-    // Single-session improve lock (Python `session_lock.py`, before its
-    // waiting rework, which lands in SDK-1044 step 4): a concurrent improve of
-    // the same session returns without running any stage.
-    let _improve_guard = match session_ids.as_slice() {
-        [sid] => match ImproveLockGuard::acquire(sid) {
-            Some(guard) => Some(guard),
-            None => {
-                info!(session_id = %sid, "improve: session already being improved, skipping");
-                return Ok(result);
-            }
-        },
-        _ => None,
-    };
-
     // Mirrors Python `send_telemetry("cognee.improve", ...)`.
     #[cfg(feature = "telemetry")]
     cognee_telemetry::send_telemetry(
@@ -386,55 +439,91 @@ async fn run_improve(
         Some(id) => Some(id),
         None => dataset_id_by_name(db.as_ref(), &dataset_name, owner_id, tenant_id).await?,
     };
-    let capabilities = GraphCapabilities::probe(&*graph_db, dataset_id).await;
 
-    let has_sessions = !session_ids.is_empty();
-    let mut stages = ImproveStages {
-        dataset_name,
-        owner_id,
-        tenant_id,
-        session_ids,
-        feedback_alpha,
-        build_truth_subspace,
-        build_global_context_index,
-        // `improve.review_conflicts` (IMPROVE_REVIEW_CONFLICTS) opts in; Rust has
-        // no per-call `review_conflicts` argument yet.
-        review_conflicts: config.review_conflicts,
-        personalization_enabled,
-        capabilities,
-        dataset_id,
-        llm,
-        storage,
-        graph_db,
-        vector_db,
-        embedding_engine,
-        ontology_resolver,
-        db,
-        session_store,
-        session_manager,
-        add_pipeline,
-        cognify_config,
-    };
-    let end = execute_stages(
-        &DEFAULT_STAGES,
-        has_sessions,
-        &config.stages_disabled,
-        &mut stages,
-        &mut result,
-    )
-    .await;
-    result.dataset_id = match stages.dataset_id {
-        Some(id) => Some(id),
-        // A stage may have created the dataset without looking it up.
-        None => dataset_id_by_name(
-            stages.db.as_ref(),
-            &stages.dataset_name,
-            owner_id,
-            tenant_id,
-        )
-        .await
-        .unwrap_or(None),
-    };
+    // The whole run holds the dataset's lock, like a pipeline run, so
+    // improve, add, delete... on one dataset queue one after another. A
+    // dataset that does not exist yet is held by the identity an `add` of it
+    // would create and lock. Held in the add pipeline's registry unless the
+    // caller names one, so the stages' adds ride on this hold.
+    let dataset_locks = dataset_locks
+        .or_else(|| add_pipeline.and_then(|p| p.dataset_locks().cloned()))
+        .unwrap_or_else(DatasetLocks::global);
+    let lock_id = dataset_id.unwrap_or_else(|| {
+        cognee_ingestion::generate_dataset_id(&dataset_name, owner_id, tenant_id)
+    });
+    let lock_keys = improve_lock_keys(&session_ids, &owner_id.to_string());
+
+    let end = dataset_locks
+        .hold([lock_id], async {
+            // Sessions are claimed on top: two improves bridging one session
+            // into different datasets queue too. Released once, when this
+            // scope ends, whatever happens in between.
+            let _claim = acquire_improve_lock_many(&lock_keys).await;
+            // Probed only once both are held: a queued run must not hold the
+            // graph engine while it waits.
+            let capabilities = GraphCapabilities::probe(&*graph_db, dataset_id).await;
+
+            let has_sessions = !session_ids.is_empty();
+            let mut stages = ImproveStages {
+                dataset_name,
+                owner_id,
+                tenant_id,
+                session_ids,
+                feedback_alpha,
+                build_truth_subspace,
+                build_global_context_index,
+                // `improve.review_conflicts` (IMPROVE_REVIEW_CONFLICTS) opts in;
+                // Rust has no per-call `review_conflicts` argument yet.
+                review_conflicts: config.review_conflicts,
+                personalization_enabled,
+                capabilities,
+                dataset_id,
+                llm,
+                storage,
+                graph_db,
+                vector_db,
+                embedding_engine,
+                ontology_resolver,
+                db,
+                session_store,
+                session_manager,
+                add_pipeline,
+                checkpoint_store,
+                cognify_config,
+            };
+            let mut stamps = Vec::new();
+            let end = execute_stages(
+                &DEFAULT_STAGES,
+                has_sessions,
+                &config.stages_disabled,
+                &mut stages,
+                &mut result,
+                &mut stamps,
+            )
+            .await;
+            // An errored run invalidates its stamps (Python marks its row
+            // `failed`): a stage after the stamping one may have half-written.
+            save_stamps(
+                stages.checkpoint_store.as_deref(),
+                result.status() == ImproveStatus::Errored,
+                &stamps,
+            )
+            .await;
+            result.dataset_id = match stages.dataset_id {
+                Some(id) => Some(id),
+                // A stage may have created the dataset without looking it up.
+                None => dataset_id_by_name(
+                    stages.db.as_ref(),
+                    &stages.dataset_name,
+                    owner_id,
+                    tenant_id,
+                )
+                .await
+                .unwrap_or(None),
+            };
+            end
+        })
+        .await;
     info!(
         status = result.status().as_str(),
         stages = %result.stage_summary(),
@@ -475,6 +564,7 @@ mod tests {
     struct Scripted {
         scripts: HashMap<StageKind, Script>,
         calls: Vec<&'static str>,
+        graph_writes: usize,
     }
 
     impl Scripted {
@@ -499,15 +589,20 @@ mod tests {
             }
         }
 
+        fn record_graph_write(&mut self) -> impl Future<Output = ()> + Send {
+            self.graph_writes += 1;
+            std::future::ready(())
+        }
+
         fn run(&mut self, stage: StageKind) -> impl Future<Output = StageRun> + Send {
             self.calls.push(stage.name());
             let run = match self.script(stage) {
                 Script::Complete | Script::Gate(_) => StageResult::completed(stage.name()).into(),
                 Script::Error(error) => StageResult::errored(stage.name(), error).into(),
-                Script::BudgetError => StageRun {
-                    result: StageResult::errored(stage.name(), "LLM payment required: 402"),
-                    budget_exhausted: true,
-                },
+                Script::BudgetError => StageRun::with_budget(
+                    StageResult::errored(stage.name(), "LLM payment required: 402"),
+                    true,
+                ),
             };
             std::future::ready(run)
         }
@@ -526,6 +621,7 @@ mod tests {
             &disabled,
             executor,
             &mut result,
+            &mut Vec::new(),
         )
         .await;
         (result, end)
@@ -749,6 +845,49 @@ mod tests {
         );
     }
 
+    // Python counts every non-noop improve as a change to the dataset. A run
+    // records its graph write once, after the first stage that may have
+    // written; a run in which only the index ran records none.
+    #[tokio::test]
+    async fn a_run_records_one_graph_write_after_its_first_writing_stage() {
+        let mut executor = Scripted::default();
+        run_loop(&mut executor, true, &[]).await;
+        assert_eq!(executor.graph_writes, 1);
+
+        // Without sessions only the graph stages run; with review_conflicts
+        // off, that is the index, which is not a write.
+        let mut executor = Scripted::default();
+        run_loop(&mut executor, false, &["review_conflicts"]).await;
+        assert_eq!(executor.graph_writes, 0);
+    }
+
+    #[test]
+    fn a_stage_wrote_when_its_write_counts_say_so() {
+        let fw = StageKind::FeedbackWeights;
+        let completed = || StageResult::completed("feedback_weights");
+        assert!(stage_may_have_written(fw, &completed()));
+        assert!(!stage_may_have_written(
+            fw,
+            &completed().with_counts([("sessions", 1), ("entries_applied", 0)])
+        ));
+        assert!(stage_may_have_written(
+            fw,
+            &completed().with_counts([("entries_applied", 2)])
+        ));
+        assert!(stage_may_have_written(
+            fw,
+            &StageResult::errored("feedback_weights", "boom")
+        ));
+        assert!(!stage_may_have_written(
+            fw,
+            &StageResult::skipped("feedback_weights", "no_session_ids")
+        ));
+        assert!(!stage_may_have_written(
+            StageKind::GlobalContextIndex,
+            &StageResult::completed("global_context_index")
+        ));
+    }
+
     // A budget signal on a stage that did not error is not an exhaustion.
     #[tokio::test]
     async fn a_budget_flag_without_an_error_is_ignored() {
@@ -758,10 +897,10 @@ mod tests {
                 None
             }
             fn run(&mut self, stage: StageKind) -> impl Future<Output = StageRun> + Send {
-                std::future::ready(StageRun {
-                    result: StageResult::completed(stage.name()),
-                    budget_exhausted: true,
-                })
+                std::future::ready(StageRun::with_budget(
+                    StageResult::completed(stage.name()),
+                    true,
+                ))
             }
         }
         let mut result = ImproveResult::new("docs", vec![]);
@@ -771,6 +910,7 @@ mod tests {
             &[],
             &mut FlaggedButCompleted,
             &mut result,
+            &mut Vec::new(),
         )
         .await;
         assert_eq!(end, LoopEnd::Finished);

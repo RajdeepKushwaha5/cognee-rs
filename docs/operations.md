@@ -82,7 +82,33 @@ result, and an exhausted LLM budget skips every later stage with
 `no_llm_configured` when none is configured. `extract_agent_context`,
 `update_user_preferences` (gated by `personalization_enabled`) and
 `review_conflicts` (opt-in via `improve.review_conflicts`) are not
-ported yet and always report a skip reason. rustdoc: `api::improve`.
+ported yet and always report a skip reason.
+
+A run holds its dataset's lock for its whole length, then a claim on every
+session it targets (`session:{user_id}:{session_id}`), and releases both once
+it ends. Both wait, with no timeout: improves that share a dataset or a session
+run one after the other, as pipeline runs on one dataset do, instead of the
+later one skipping; runs on different datasets and sessions do not wait. The
+dataset lock is Python's one `dataset_lock` registry: `cognee_core::DatasetLocks::global()`
+is the default of `add` (`AddPipeline`), dataset-scoped deletes
+(`DeleteService`) and `improve` (`ImproveParams::dataset_locks`, else the add
+pipeline's registry, else the global one), and `cognify` and `memify` always
+hold it for their run, so in one process those writers queue per dataset. A
+host with its own registry wires it into the add pipeline, the delete service
+and `improve`; the HTTP server shares the global one. The stages' own adds and
+cognifies re-enter the improve's hold. A dataset that does not exist yet is
+held by the id an `add` of it would create.
+
+`global_context_index` reports `already_completed` (`no_writes_since_last_improve`)
+when no `pipeline_runs` row other than a `search`, a `recall` or a host's
+`improve_pipeline` record was written since it last ran. A delete records a
+`forget` row on every dataset it touched, and an improve run whose stage may
+have written to the graph (anything but the index itself, unless its write
+counts say it wrote nothing) records one `improve` row, so both count as
+changes, as in Python. A run that did not end `errored` stamps the stage's start in the
+checkpoint store (`improve_stage:{stage}:{dataset_id}`); without a checkpoint
+store or a relational database, or on any error reading them, the stage runs.
+rustdoc: `api::improve`.
 
 ### forget
 
