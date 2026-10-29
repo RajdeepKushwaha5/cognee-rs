@@ -96,3 +96,36 @@ pub mod graph_context {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// Entity for the `session_context_entries` table — session-scoped context
+/// rows (guidance entries and internal state rows); mirrors Python's
+/// `cache_session_context`.
+pub mod context_entry {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "session_context_entries")]
+    pub struct Model {
+        /// Store-generated row id (UUID4).
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub session_id: String,
+        /// The owning user; `"default"` for a session without one.
+        pub user_id: String,
+        /// The payload's `"id"`, promoted so updates target one row.
+        pub entry_id: String,
+        /// Per-session insertion sequence; reads are ordered by it.
+        pub seq: i64,
+        /// JSON-encoded row object.
+        #[sea_orm(column_type = "Text")]
+        pub payload: String,
+        pub created_at: DateTimeUtc,
+        pub updated_at: DateTimeUtc,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
