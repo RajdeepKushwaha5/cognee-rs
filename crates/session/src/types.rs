@@ -47,13 +47,6 @@ pub struct SessionContext {
     pub session_id: Option<String>,
     pub history: Vec<Message>,
     pub formatted_history: String,
-    /// Stored knowledge-graph snapshot to prepend to history.
-    ///
-    /// Set by `improve()` stage 4 (`sync_graph_to_session`) and loaded by the
-    /// search orchestrator before retrieval, so follow-up questions benefit from
-    /// prior graph knowledge. Matches Python's `get_graph_context` / prepend
-    /// logic in `session_manager.py:435-450`.
-    pub graph_context: Option<String>,
 }
 
 /// One agent-trace step persisted in a session — mirrors Python's
@@ -93,7 +86,9 @@ fn empty_object() -> serde_json::Value {
 /// `updates` overlaid on a stored `memify_metadata` value, as Python's cache
 /// adapters merge it (`{**existing, **updates}`): every stage writes only its
 /// own keys, so a write never drops another stage's flag. A missing or
-/// non-object stored value is replaced.
+/// non-object stored value is replaced. Used by the file and Redis stores (the
+/// relational store merges in `cognee_database`).
+#[cfg(any(feature = "fs", feature = "redis"))]
 pub(crate) fn merge_memify_metadata(
     existing: Option<serde_json::Value>,
     updates: &HashMap<String, bool>,
