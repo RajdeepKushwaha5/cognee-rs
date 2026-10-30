@@ -13,7 +13,7 @@ use cognee::api::{RecallResult, recall};
 use cognee_search::orchestration::SearchTypeRegistry;
 use cognee_search::retrievers::SearchRetriever;
 use cognee_search::types::{SearchContext, SearchError, SearchOutput, SearchParams};
-use cognee_search::{SearchOrchestrator, SearchType};
+use cognee_search::{RoutingConstraints, SearchOrchestrator, SearchType};
 use cognee_session::SessionContext;
 
 /// Answers its search type with a fixed output, without real backends.
@@ -85,6 +85,79 @@ async fn recall_graph(
 
 fn answer() -> SearchOutput {
     SearchOutput::Text("answer".to_string())
+}
+
+fn without_an_llm(orchestrator: SearchOrchestrator) -> SearchOrchestrator {
+    orchestrator.with_routing_constraints(RoutingConstraints {
+        llm_available: false,
+        cypher_allowed: true,
+    })
+}
+
+fn ran_as_only_context(result: &RecallResult) -> bool {
+    result
+        .search_response
+        .as_ref()
+        .expect("recall should return the graph search's response")
+        .only_context
+}
+
+#[tokio::test]
+async fn with_no_llm_an_unmatched_query_runs_the_fallback_as_only_context() {
+    let orchestrator = without_an_llm(orchestrator(vec![(SearchType::HybridCompletion, answer())]));
+    let query = "Where was Marie Curie born?";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
+    assert!(ran_as_only_context(&result));
+}
+
+#[tokio::test]
+async fn with_no_llm_an_llm_free_route_runs_as_it_is() {
+    let orchestrator = without_an_llm(orchestrator(vec![(SearchType::ChunksLexical, answer())]));
+    let query = "\"polonium and radium\"";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::ChunksLexical));
+    assert!(!ran_as_only_context(&result));
+}
+
+#[tokio::test]
+async fn with_no_llm_a_dated_question_runs_the_fallback_as_only_context() {
+    let orchestrator = without_an_llm(orchestrator(vec![(SearchType::HybridCompletion, answer())]));
+    let query = "What happened in 2019?";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
+    assert!(ran_as_only_context(&result));
+}
+
+#[tokio::test]
+async fn with_no_llm_a_pinned_completion_type_runs_as_only_context() {
+    let orchestrator = without_an_llm(orchestrator(vec![(SearchType::GraphCompletion, answer())]));
+    let pinned = Some(SearchType::GraphCompletion);
+    let result = recall_graph(&orchestrator, "Who won?", pinned, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::GraphCompletion));
+    assert!(ran_as_only_context(&result));
+}
+
+#[tokio::test]
+async fn with_no_llm_a_pinned_triplet_completion_runs_as_only_context() {
+    let stub = (SearchType::TripletCompletion, answer());
+    let orchestrator = without_an_llm(orchestrator(vec![stub]));
+    let pinned = Some(SearchType::TripletCompletion);
+    let result = recall_graph(&orchestrator, "Who won?", pinned, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::TripletCompletion));
+    assert!(ran_as_only_context(&result));
+}
+
+#[tokio::test]
+async fn with_no_llm_a_retry_runs_the_fallback_as_only_context() {
+    let orchestrator = without_an_llm(orchestrator(vec![
+        (SearchType::CodingRules, SearchOutput::Rules(Vec::new())),
+        (SearchType::HybridCompletion, answer()),
+    ]));
+    let query = "What are the coding rules mentioned?";
+    let result = recall_graph(&orchestrator, query, None, true).await;
+    assert_eq!(result.search_type_used, Some(SearchType::HybridCompletion));
+    assert!(ran_as_only_context(&result));
 }
 
 #[tokio::test]

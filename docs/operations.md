@@ -51,7 +51,14 @@ picks the retrieval strategy by the first matching rule, as Python does: a
 quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording → `CODING_RULES`, a time
 preposition before an absolute date → `TEMPORAL`, anything else →
 `HYBRID_COMPLETION`. A routed type that the backend rejects, or a lexical or
-rules search that finds nothing, is retried as `HYBRID_COMPLETION`. It is session-aware (reads
+rules search that finds nothing, is retried as `HYBRID_COMPLETION`. With no
+LLM API key, recall still routes: `CHUNKS_LEXICAL` and `CODING_RULES` run as
+they are, and any other routed type falls back to `HYBRID_COMPLETION`; it and an
+explicit `HYBRID_COMPLETION`, `GRAPH_COMPLETION`, `RAG_COMPLETION` or
+`TRIPLET_COMPLETION` return
+their context instead of an answer (`only_context`). No rule routes to
+`CYPHER` or `NATURAL_LANGUAGE`; requested explicitly with
+`ALLOW_CYPHER_QUERY=false`, they are refused. It is session-aware (reads
 session history when given a `--session-id`) and graph-backed. Results are
 returned to the caller (printed to stdout by the CLI).
 
