@@ -123,7 +123,9 @@ uint32_t cg_api_version(void);
  *   CG_ERR_COMPONENT            ↔ "COMPONENT_ERROR"
  *   CG_ERR_SERVICE_BUILD        ↔ "SERVICE_BUILD_ERROR"
  *   CG_ERR_USER_BOOTSTRAP       ↔ "USER_BOOTSTRAP_ERROR"
- *   (CG_ERR_RUNTIME = 3)        ↔ "RUNTIME_ERROR"
+ *   (CG_ERR_RUNTIME = 3)        ↔ "RUNTIME_ERROR", and "IMPROVE_ABORTED"
+ *                                 (the message then ends with
+ *                                 "improve_result: <partial result JSON>")
  *   CG_ERR_SDK_VALIDATION       ↔ "VALIDATION_ERROR"
  *   CG_ERR_UNSUPPORTED          ↔ "UNSUPPORTED"
  *   CG_ERR_FEATURE_NOT_BUILT    ↔ "FEATURE_NOT_BUILT"
@@ -495,6 +497,7 @@ void cg_sdk_add_and_cognify(const CgSdk*        sdk,
  *
  * RecallScope strings (5 valid values):
  *   "auto" | "graph" | "session" | "trace" | "graph_context"
+ *   "graph_context" is a deprecated alias of "graph" (logged as a warning).
  *   Absent/null scope → "auto" default applied internally.
  */
 
@@ -554,7 +557,8 @@ void cg_sdk_search(const CgSdk*        sdk,
  *   "autoRoute"  — boolean (default false)
  *   "sessionId"  — string
  *   "scope"      — string or string array of RecallScope values:
- *                  "auto" | "graph" | "session" | "trace" | "graph_context"
+ *                  "auto" | "graph" | "session" | "trace"
+ *                  ("graph_context" is a deprecated alias of "graph")
  *                  Absent or null → "auto" default applied by recall().
  *   "neighborhoodDepth", "neighborhoodSeedTopK" — as for cg_sdk_search
  *
@@ -588,9 +592,11 @@ void cg_sdk_recall(const CgSdk*        sdk,
  *   MemifyResult — {"tripletCount":N,"indexedCount":N,"batchCount":N,
  *                    "alreadyCompleted":bool,"priorPipelineRunId":null|"<uuid>"}
  *
- *   ImproveResult — {"stagesRun":[…],"stages":[ImproveStage…],"memifyResult":…,
- *                    "feedbackEntriesProcessed":N,"feedbackEntriesApplied":N,
- *                    "sessionsPersisted":N,"edgesSynced":N}
+ *   ImproveResult — {"datasetId":null|"<uuid>","datasetName":"…",
+ *                    "sessionIds":[…],"stages":[ImproveStage…],
+ *                    "background":bool,"finished":bool,"error":null|"…",
+ *                    "status":"completed"|"errored"|"skipped"|"running"}
+ *                    One stage per improve stage, in registry order.
  *
  *   ImproveStage  — {"stage":"…","status":"completed"|"already_completed"|
  *                    "skipped"|"errored","reason":null|"…","error":null|"…",
@@ -683,7 +689,7 @@ void cg_sdk_memify(const CgSdk*        sdk,
  *   "datasetName" (string, required),
  *   "sessionIds"  (string array, optional),
  *   "nodeName"    (string array, optional),
- *   "feedbackAlpha" (float, default 0.1),
+ *   "feedbackAlpha" (float in (0, 1], default the improve.feedback_alpha setting, 0.1),
  *   "tenant"      (UUID string, optional).
  *
  * result_json on success: ImproveResult JSON object (see wire shape above).
@@ -903,7 +909,6 @@ void cg_sdk_delete_all_datasets(const CgSdk*        sdk,
  *   Notebook       — JSON object with notebook fields.
  *   bool results   → "true" | "false" (D9 strict JSON bool).
  *   void results   → "null" (D9).
- *   get_graph_context → quoted JSON string "\"<ctx>\"" (D9) or "null" (D9).
  */
 
 /**
@@ -951,35 +956,6 @@ void cg_sdk_delete_feedback(const CgSdk*        sdk,
                               const char*         qa_id,
                               CgSdkResultCallback callback,
                               void*               user_data);
-
-/**
- * Get the graph context stored in a session.
- *
- * session_id — session identifier.
- * (No opts_json — mirrors neon which also has no opts for this op.)
- *
- * result_json on success: quoted JSON string "\"<ctx>\"" (D9) when present,
- * or "null" (D9) when absent.
- */
-void cg_sdk_get_graph_context(const CgSdk*        sdk,
-                               const char*         session_id,
-                               CgSdkResultCallback callback,
-                               void*               user_data);
-
-/**
- * Set the graph context stored in a session.
- *
- * session_id — session identifier.
- * context    — context string to store.
- * (No opts_json — mirrors neon.)
- *
- * result_json on success: "null" (D9 — void op).
- */
-void cg_sdk_set_graph_context(const CgSdk*        sdk,
-                               const char*         session_id,
-                               const char*         context,
-                               CgSdkResultCallback callback,
-                               void*               user_data);
 
 /**
  * Reset the pipeline run status for a specific pipeline within a dataset.

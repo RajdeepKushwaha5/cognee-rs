@@ -202,6 +202,28 @@ pub struct Settings {
     /// while `session.caching` is on, as in Python.
     pub auto_feedback: bool,
 
+    // -- Feedback & personalization ----------------------------------------------
+    // Python's `BaseConfig` knobs (`cognee/base_config.py`). Each is range-checked
+    // when set: a value out of range is an error from `ConfigManager::set` and is
+    // ignored with a warning from env.
+    /// Default blend weight of the learned feedback signal in graph search,
+    /// in [0, 1] (`DEFAULT_FEEDBACK_INFLUENCE`): the `feedback_influence` of
+    /// a search request that leaves it unset.
+    pub default_feedback_influence: f64,
+    /// How far one rating pulls a personal `prefers` edge weight toward its
+    /// target, in (0, 1] (`PREFERENCE_ALPHA`).
+    pub preference_alpha: f64,
+    /// How much an untouched `prefers` edge weight fades per turn, in [0, 1)
+    /// (`PREFERENCE_BETA`).
+    pub preference_beta: f64,
+    /// Master switch of per-user preference personalization
+    /// (`PERSONALIZATION_ENABLED`): gates improve's `update_user_preferences`
+    /// and the retrievers' preference read.
+    pub personalization_enabled: bool,
+    /// The most personalization may move a ranking score, in [0, 1]
+    /// (`PERSONALIZATION_INFLUENCE`).
+    pub personalization_influence: f64,
+
     // -- Authentication / ACL ----------------------------------------------------
     pub default_user_email: String,
     pub default_user_password: String,
@@ -554,16 +576,64 @@ impl Settings {
             },
             access_tracking: self.enable_last_accessed,
             // Python's `is_auto_feedback_enabled`: `caching and auto_feedback`.
-            auto_feedback: self.auto_feedback
-                && self.section::<cognee_components::SessionConfig>().caching,
+            auto_feedback: self.auto_feedback_enabled(),
             // The built-in prompt's file name selects the retrievers' own
             // defaults: the Rust SDK compiles its prompts in.
+            personalization: self.preference_config(),
+            default_feedback_influence: self.default_feedback_influence as f32,
             default_system_prompt_path: (!is_builtin_prompt_path(
                 &self.default_system_prompt_path,
                 DEFAULT_SYSTEM_PROMPT_PATH,
             ))
             .then(|| self.default_system_prompt_path.trim().to_string()),
         }
+    }
+
+    /// The personalization settings (`personalization_enabled`,
+    /// `preference_alpha`, `preference_beta`, `personalization_influence`):
+    /// read by the search retrievers and by improve's
+    /// `update_user_preferences` stage.
+    pub fn preference_config(&self) -> cognee_search::PreferenceConfig {
+        cognee_search::PreferenceConfig {
+            enabled: self.personalization_enabled,
+            alpha: self.preference_alpha,
+            beta: self.preference_beta,
+            influence: self.personalization_influence,
+        }
+    }
+
+    /// Python's `is_auto_feedback_enabled`: `auto_feedback` while session
+    /// caching is on. Gates improve's `extract_agent_context` stage.
+    pub fn auto_feedback_enabled(&self) -> bool {
+        self.auto_feedback && self.section::<cognee_components::SessionConfig>().caching
+    }
+
+    /// The improve settings (the `improve` section), validated — Python's
+    /// `get_improve_config()`. An error names the bad value; `improve()`
+    /// callers surface it, the automatic improve after a session `remember()`
+    /// is skipped on it (see [`Self::auto_improve_config`]).
+    pub fn improve_config(
+        &self,
+    ) -> Result<crate::api::ImproveConfig, crate::api::ImproveConfigError> {
+        crate::api::ImproveConfig::from_settings(
+            &self.section::<cognee_components::ImproveSettings>(),
+        )
+    }
+
+    /// [`Self::improve_config`] for the automatic improve after a session
+    /// `remember()`: an invalid improve setting must never block ingestion,
+    /// so it is logged and `None` skips the automatic improve (Python's
+    /// `remember()` fail-open on a bad `IMPROVE_*` value).
+    pub fn auto_improve_config(&self) -> Option<crate::api::ImproveConfig> {
+        self.improve_config()
+            .inspect_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "remember: invalid IMPROVE_* configuration, skipping automatic improve \
+                     (ingestion continues)"
+                );
+            })
+            .ok()
     }
 
     /// How long a session manager's trace-step feedback LLM call may take
@@ -1066,6 +1136,11 @@ impl Default for Settings {
 
             // Session / cache
             auto_feedback: false,
+            default_feedback_influence: 0.0,
+            preference_alpha: 0.3,
+            preference_beta: 0.02,
+            personalization_enabled: false,
+            personalization_influence: 0.3,
 
             // Authentication / ACL
             default_user_email: "default_user@example.com".to_string(),

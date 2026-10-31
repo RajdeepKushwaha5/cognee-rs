@@ -3,23 +3,29 @@
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-//! Tests verifying that `improve()` is sync-only (no `run_in_background`).
+//! Tests verifying that `improve()` runs synchronously to completion and
+//! records every registry stage.
 //!
-//! (a) Signature has no `run_in_background`.
-//! (b) When sessions are supplied, all four stages run (or gracefully skip
-//!     when backends are missing).
-//! (c) When sessions are not supplied, only Stage 3 (memify) runs.
+//! (b) With sessions supplied, every stage is recorded in registry order.
+//! (c) Without sessions, every stage is recorded as skipped.
+//! (d) An improve of a session another run holds waits, then runs every stage.
 
 use std::sync::Arc;
 
-use cognee::api::improve::{ImproveParams, improve};
+use cognee::api::ApiError;
+use cognee::api::improve::{
+    DEFAULT_STAGES, ImproveParams, ImproveStatus, REASON_ABORTED_BY_FATAL_STAGE,
+    REASON_NO_SESSION_IDS, StageStatus, improve,
+};
 use cognee_cognify::CognifyConfig;
 use cognee_database::{DatabaseConnection, IngestDb, SeaOrmCheckpointStore, connect, initialize};
 use cognee_embedding::MockEmbeddingEngine;
 use cognee_graph::MockGraphDB;
 use cognee_ingestion::AddPipeline;
 use cognee_ontology::{NoOpOntologyResolver, OntologyResolver};
-use cognee_session::{FsSessionStore, ImproveLockGuard, SessionManager, SessionStore};
+use cognee_session::{
+    FsSessionStore, SessionManager, SessionStore, acquire_improve_lock_many, improve_lock_keys,
+};
 use cognee_storage::{LocalStorage, StorageTrait};
 use cognee_test_utils::MockLlm;
 use cognee_vector::MockVectorDB;
@@ -84,21 +90,11 @@ async fn make_harness() -> Harness {
 }
 
 // ---------------------------------------------------------------------------
-// (a) Compile-time check: ImproveParams exhaustive construction
-//
-// `ImproveParams` now has 23 fields (18 from LIB-04, three v2 fields from E-05:
-// extraction_tasks, enrichment_tasks, data; and two new parity fields:
-// build_global_context_index, run_in_background). The struct literal below must
-// list every field so the compiler catches future additions.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// (b) With sessions supplied, stage 3 (memify) always runs; stage 1/2/4 may
-//     skip gracefully when the dataset does not yet exist in the graph.
+// (b) With sessions supplied, every registry stage is recorded, in order.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn improve_with_sessions_runs_at_least_memify() {
+async fn improve_with_sessions_records_every_stage_in_order() {
     let h = make_harness().await;
     let owner = Uuid::new_v4();
     let llm: Arc<dyn cognee_llm::Llm> = Arc::new(MockLlm::empty());
@@ -115,11 +111,15 @@ async fn improve_with_sessions_runs_at_least_memify() {
 
     let r = improve(ImproveParams {
         dataset_name: "ds_with_sessions".to_string(),
+        dataset_id: None,
         session_ids: Some(vec![session_id.to_string()]),
         node_name: None,
         owner_id: owner,
         tenant_id: None,
-        feedback_alpha: 0.1,
+        feedback_alpha: None,
+        config: cognee::api::ImproveConfig::default(),
+        personalization: cognee::search::PreferenceConfig::default(),
+        auto_feedback: false,
         llm,
         storage: Arc::clone(&h.storage),
         graph_db: h.graph_db.clone() as Arc<_>,
@@ -131,6 +131,7 @@ async fn improve_with_sessions_runs_at_least_memify() {
         session_manager: Some(Arc::clone(&h.session_manager)),
         add_pipeline: Some(&h.add_pipeline),
         checkpoint_store: Some(h.checkpoint_store.clone() as Arc<_>),
+        dataset_locks: None,
         cognify_config: &config,
         extraction_tasks: None,
         enrichment_tasks: None,
@@ -139,23 +140,36 @@ async fn improve_with_sessions_runs_at_least_memify() {
         build_truth_subspace: false,
         run_in_background: false,
     })
-    .await
-    .unwrap();
+    .await;
 
-    // Stage 3 (memify) always runs.
+    // The queue-less mock LLM cannot answer cognify's summary call, so the
+    // fatal persist_session_qa stage errors and aborts the run; the partial
+    // result still records every stage, in order.
+    let Err(ApiError::ImproveAborted { result: r, .. }) = r else {
+        panic!("expected the fatal stage to abort the run, got {r:?}");
+    };
+
+    let names: Vec<&str> = r.stages.iter().map(|s| s.stage.as_str()).collect();
+    let expected: Vec<&str> = DEFAULT_STAGES.iter().map(|s| s.name()).collect();
+    assert_eq!(names, expected);
+    assert!(r.finished && !r.background);
+    assert_eq!(r.session_ids, [session_id]);
+    // Stage 1 ran over the seeded Q&A entry; stage 2 failed and stopped it.
+    assert_eq!(r.stages[0].status, StageStatus::Completed);
+    assert_eq!(r.stages[1].status, StageStatus::Errored);
     assert!(
-        r.stages_run.contains(&"memify".to_string()),
-        "expected memify stage; got {:?}",
-        r.stages_run
+        r.stages[2..]
+            .iter()
+            .all(|s| s.reason.as_deref() == Some(REASON_ABORTED_BY_FATAL_STAGE))
     );
 }
 
 // ---------------------------------------------------------------------------
-// (c) Without sessions, only Stage 3 runs
+// (c) Without sessions, every stage is skipped
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn improve_without_sessions_runs_only_memify() {
+async fn improve_without_sessions_skips_every_stage() {
     let h = make_harness().await;
     let owner = Uuid::new_v4();
     let llm: Arc<dyn cognee_llm::Llm> = Arc::new(MockLlm::empty());
@@ -163,11 +177,15 @@ async fn improve_without_sessions_runs_only_memify() {
 
     let r = improve(ImproveParams {
         dataset_name: "ds_no_sess".to_string(),
+        dataset_id: None,
         session_ids: None,
         node_name: None,
         owner_id: owner,
         tenant_id: None,
-        feedback_alpha: 0.1,
+        feedback_alpha: None,
+        config: cognee::api::ImproveConfig::default(),
+        personalization: cognee::search::PreferenceConfig::default(),
+        auto_feedback: false,
         llm,
         storage: Arc::clone(&h.storage),
         graph_db: h.graph_db.clone() as Arc<_>,
@@ -179,6 +197,7 @@ async fn improve_without_sessions_runs_only_memify() {
         session_manager: Some(Arc::clone(&h.session_manager)),
         add_pipeline: Some(&h.add_pipeline),
         checkpoint_store: Some(h.checkpoint_store.clone() as Arc<_>),
+        dataset_locks: None,
         cognify_config: &config,
         extraction_tasks: None,
         enrichment_tasks: None,
@@ -190,21 +209,23 @@ async fn improve_without_sessions_runs_only_memify() {
     .await
     .unwrap();
 
-    assert_eq!(
-        r.stages_run,
-        vec!["memify".to_string()],
-        "without sessions only stage 3 should run"
-    );
-    assert!(r.memify_result.is_some());
+    assert_eq!(r.stages.len(), DEFAULT_STAGES.len());
+    for (stage, kind) in r.stages.iter().zip(DEFAULT_STAGES) {
+        assert_eq!(stage.status, StageStatus::Skipped, "{}", stage.stage);
+        if kind.needs_sessions() {
+            assert_eq!(stage.reason.as_deref(), Some(REASON_NO_SESSION_IDS));
+        }
+    }
+    assert_eq!(r.status(), ImproveStatus::Skipped);
 }
 
 // ---------------------------------------------------------------------------
-// (d) improve() returns an empty/default result when the single target
-//     session is already being improved (lock held by another caller).
+// (d) improve() waits while another run holds its session, then runs every
+//     stage (Python `test_improve_queue.py`).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn improve_skips_when_locked() {
+async fn improve_waits_for_a_held_session_then_runs_every_stage() {
     let h = make_harness().await;
     let owner = Uuid::new_v4();
     let llm: Arc<dyn cognee_llm::Llm> = Arc::new(MockLlm::empty());
@@ -212,18 +233,20 @@ async fn improve_skips_when_locked() {
 
     let session_id = "locked-session";
 
-    // Simulate another caller already holding the improve lock for this session.
-    let _held_guard = ImproveLockGuard::acquire(session_id)
-        .expect("should be able to acquire lock when no other holder exists");
+    // Another run holds this session's claim.
+    let held = acquire_improve_lock_many(improve_lock_keys([session_id], &owner.to_string())).await;
 
-    // Now try to improve the same session — it should no-op.
-    let r = improve(ImproveParams {
+    let run = improve(ImproveParams {
         dataset_name: "ds_locked".to_string(),
+        dataset_id: None,
         session_ids: Some(vec![session_id.to_string()]),
         node_name: None,
         owner_id: owner,
         tenant_id: None,
-        feedback_alpha: 0.1,
+        feedback_alpha: None,
+        config: cognee::api::ImproveConfig::default(),
+        personalization: cognee::search::PreferenceConfig::default(),
+        auto_feedback: false,
         llm,
         storage: Arc::clone(&h.storage),
         graph_db: h.graph_db.clone() as Arc<_>,
@@ -235,6 +258,7 @@ async fn improve_skips_when_locked() {
         session_manager: Some(Arc::clone(&h.session_manager)),
         add_pipeline: Some(&h.add_pipeline),
         checkpoint_store: Some(h.checkpoint_store.clone() as Arc<_>),
+        dataset_locks: None,
         cognify_config: &config,
         extraction_tasks: None,
         enrichment_tasks: None,
@@ -242,23 +266,19 @@ async fn improve_skips_when_locked() {
         build_global_context_index: false,
         build_truth_subspace: false,
         run_in_background: false,
-    })
-    .await
-    .unwrap();
+    });
+    tokio::pin!(run);
 
-    // When skipped due to lock, improve() returns the default result with no
-    // stages run.
-    assert!(
-        r.stages_run.is_empty(),
-        "improve should run no stages when locked; got {:?}",
-        r.stages_run
-    );
+    // It waits instead of skipping (Python's #5566 queue).
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut run).await;
+    assert!(waited.is_err(), "the run must wait for the held session");
 
-    // After the held guard drops, the same session can be improved again.
-    drop(_held_guard);
-    let guard2 = ImproveLockGuard::acquire(session_id);
-    assert!(
-        guard2.is_some(),
-        "lock should be releaseable and re-acquirable after the held guard drops"
-    );
+    // Released: it runs every stage.
+    drop(held);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("the run proceeds once the session is released")
+        .unwrap();
+    assert_eq!(r.stages.len(), DEFAULT_STAGES.len(), "{:?}", r.stages);
+    assert!(r.finished);
 }

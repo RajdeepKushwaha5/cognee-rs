@@ -1329,7 +1329,7 @@ Three `Settings` fields tune the search orchestrator itself, lowered by the same
 | Env var | `Settings` field | Default | Effect |
 |---|---|---|---|
 | `ENABLE_LAST_ACCESSED` | `enable_last_accessed` | `false` | Update `last_accessed` on the source data records of every search's retrieved context, as Python does on every retrieval (Python's flag, also default off). On a plain completion search the context is then fetched by the search itself and handed to the retriever, so it is still fetched once. `FEEDBACK` searches retrieve no data and are not tracked. |
-| `AUTO_FEEDBACK` | `auto_feedback` | `false` | Detect feedback in a session search's message (one extra LLM call per session turn) when the request leaves `auto_feedback_detection` unset, and only while `session.caching` is on (Python's `caching and auto_feedback`). **Python defaults it to `true`**; Rust keeps it off so a session search makes no extra LLM call unless asked. |
+| `AUTO_FEEDBACK` | `auto_feedback` | `false` | Detect feedback in a session search's message (one extra LLM call per session turn) when the request leaves `auto_feedback_detection` unset, and only while `session.caching` is on (Python's `caching and auto_feedback`). The same switch gates improve's `extract_agent_context` stage (`auto_feedback_disabled` when off). **Python defaults it to `true`**; Rust keeps it off so a session search makes no extra LLM call unless asked. |
 | — | `default_system_prompt_path` | `answer_simple_question.txt` | System prompt file for a search that names neither a system prompt nor a prompt path. The default (Python's file name for the built-in prompt) and an empty value leave each retriever's own compiled-in prompt; any other value is read as a file. Rust-only (Python has no such setting). |
 
 ### Triplet retriever hub cap
@@ -1450,9 +1450,9 @@ reports it as `skipped` / `backend_unsupported`.
 passing `true` must behave identically to the default:
 
 - `include_global_context_index` (default `false`) and
-  `global_context_index_top_k` (default `3`) — the global-context lane depends
-  on a `GlobalContextSummary` node type and global-context utilities not yet
-  ported to Rust.
+  `global_context_index_top_k` (default `3`) — inert for `HYBRID_COMPLETION`
+  until SDK-1045. `GRAPH_COMPLETION` reads them: it prepends the global
+  context index `improve(build_global_context_index=true)` built.
 
 The HTTP-facing degradation notes live with the server's search-router docs,
 which are not part of this repository.
@@ -1465,6 +1465,47 @@ which are not part of this repository.
 
 When on, each search records one query row and one result row. They carry the
 searched dataset's `dataset_id` when exactly one dataset was searched.
+
+## Improve (self-improvement loop)
+
+The `improve` engine section is Python's `ImproveConfig` (`IMPROVE_*`).
+`Settings::improve_config` resolves and checks it: a negative count, a
+`feedback_alpha` outside (0, 1], an unknown stage name or the fatal
+`persist_session_qa` in `stages_disabled` is an error. An explicit `improve()`
+(the CLI verb, the bindings, `POST /api/v1/improve`) fails on it; the automatic
+improve after a session `remember()` is skipped with a warning instead, so the
+entry is still stored. A removed stage name (`triplet_enrichment`) is ignored
+with a warning.
+
+| Env var | Key | Default | Effect |
+|---|---|---|---|
+| `IMPROVE_AUTO_ENABLED` | `improve.auto_enabled` | `true` | Run `improve()` after a session `remember()` (detached), and the self-improvement pass of a permanent `remember()`. `false` is the kill switch on both paths; an explicit `self_improvement` does not override it. |
+| `IMPROVE_DEBOUNCE_ENTRIES` | `improve.debounce_entries` | `1` | Auto-improve fires only once this many new session entries accumulated since the last one; `0` turns the entry trigger off. With `debounce_seconds` set, the default `1` steps aside (set `>= 2` to combine both). |
+| `IMPROVE_DEBOUNCE_SECONDS` | `improve.debounce_seconds` | `0` | ... or once this many seconds passed; `0` turns the time trigger off. Checked only on the next `remember()`: there is no timer. |
+| `IMPROVE_STAGES_DISABLED` | `improve.stages_disabled` | _(empty)_ | Comma-separated stage names skipped with `disabled_by_config`. |
+| `IMPROVE_FEEDBACK_ALPHA` | `improve.feedback_alpha` | `0.1` | `feedback_weights` learning rate, in (0, 1], when a run passes none. |
+| `IMPROVE_REVIEW_CONFLICTS` | `improve.review_conflicts` | `false` | Opt every run into `review_conflicts` (not ported yet: SDK-1038). |
+| `IMPROVE_EFFECTIVE_DATE_KEY` | `improve.effective_date_key` | `effective_date` | Document metadata key of a source's date (read by `review_conflicts`; not ported yet). |
+| `IMPROVE_TRACE_WINDOW_STEPS` | `improve.trace_window_steps` | `0` | Agent trace steps per persisted document; `0` = all pending. Not read yet (SDK-1047). |
+| `IMPROVE_TRACE_WINDOWS_PER_RUN` | `improve.trace_windows_per_run` | `0` | Trace documents one run may cognify; `0` = drain. Not read yet (SDK-1047). |
+| `IMPROVE_DISTILL_MAX_BATCHES_PER_RUN` | `improve.distill_max_batches_per_run` | `0` | Curator batches per distillation run; `0` = uncapped. Not read yet (SDK-1049). |
+
+`IMPROVE_AUTO_ENABLED` and `IMPROVE_REVIEW_CONFLICTS` accept `true|1|yes|on`
+and `false|0|no|off`; any other value is ignored with a warning.
+
+### Feedback & personalization
+
+Python's `BaseConfig` knobs, cognee-wide `Settings` fields. Each is
+range-checked: out of range is an error from `ConfigManager::set` (and every
+binding / `cognee-cli config set`), and is ignored with a warning from env.
+
+| Env var | `Settings` field | Default | Effect |
+|---|---|---|---|
+| `DEFAULT_FEEDBACK_INFLUENCE` | `default_feedback_influence` | `0.0` | Blend weight of the learned feedback signal in graph search, in [0, 1]: the `feedback_influence` of a search request that sets none. |
+| `PREFERENCE_ALPHA` | `preference_alpha` | `0.3` | How far one rating pulls a personal `prefers` weight, in (0, 1]. Read by improve's `update_user_preferences`. |
+| `PREFERENCE_BETA` | `preference_beta` | `0.02` | Per-turn decay of an untouched `prefers` weight, in [0, 1); applied on read, by the preference update and by the retrievers. |
+| `PERSONALIZATION_ENABLED` | `personalization_enabled` | `false` | Master switch of preference personalization: gates improve's `update_user_preferences` stage and the retrievers' preference read (graph and RAG completion). Off, nothing is written or read. |
+| `PERSONALIZATION_INFLUENCE` | `personalization_influence` | `0.3` | The most a personal `prefers` weight may move a ranking score, in [0, 1] (graph triplet ranking, RAG chunk ranking). |
 
 ## Ontology
 
@@ -1827,8 +1868,8 @@ or binding, none of which ship the `fs` or `redis` store. To insist on a store a
 fail when it is missing, set `session.store` (`COGNEE_SESSION_STORE`) instead.
 Both unset, the store is `relational`.
 
-`session.ttl_seconds` expires a session's entries, trace steps and graph-context
-snapshot that long after its last write, as Python does. The `redis` store sets a
+`session.ttl_seconds` expires a session's entries, trace steps and session-context
+rows that long after its last write, as Python does. The `redis` store sets a
 key expiry; the `fs` store deletes an expired file when it is next read. The
 `relational` store does not expire sessions: Python's SQL cache keeps an expiry
 per row, which the Rust session tables have no column for.

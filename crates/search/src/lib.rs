@@ -16,6 +16,9 @@ pub mod retrievers;
 mod test_support;
 /// Core search types: `SearchType`, `SearchParams`, `SearchResult`, etc.
 pub mod types;
+/// Per-user `prefers` weights and preference text: the store `improve()`
+/// writes and the read the retrievers personalize with.
+pub mod user_preferences;
 /// Shared search utilities (completion helpers, etc.).
 pub mod utils;
 
@@ -26,7 +29,10 @@ pub use orchestration::{
     DatasetSearchResult, SearchBuilder, SearchOrchestrator, SearchTuning, SearchTypeRegistry,
     merge_dataset_results,
 };
-pub use query_router::{ROUTER_FALLBACK_TYPE, RouteDecision, route_query};
+pub use query_router::{
+    ROUTER_FALLBACK_TYPE, RouteDecision, RoutingConstraints, constrain, default_route,
+    pinned_route, route_query,
+};
 pub use recall_scope::{RecallItem, RecallScope, RecallSource, ScopeInput, normalize_scope};
 pub use retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,
@@ -42,3 +48,4 @@ pub use types::{
     SearchGraphNode, SearchItem, SearchOutput, SearchParams, SearchRequest, SearchResponse,
     SearchType,
 };
+pub use user_preferences::{ActivePreferences, PreferenceConfig, load_active_preferences};

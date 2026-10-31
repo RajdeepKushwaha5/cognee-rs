@@ -69,30 +69,72 @@ from the docs is correct). The four memory-API CLI verbs (`remember` / `recall` 
 
 ## improve() — deferred stages (partial implementations)
 
-Shipped in task 20 as sanctioned partials for 0.1.0:
+`improve()` runs Python's nine stages in order and reports one `StageResult`
+each. Not yet ported — they report a skip reason instead of running:
 
-- **`build_global_context_index` stage (Stage 3b)** — the `build_global_context_index: bool` flag
-  and the `"global_context_index"` entry in `stages_run` are wired. The current implementation
-  reads all graph edges via `get_graph_data()`, formats them as `"source → relationship → target"`
-  lines, and stores the result in the session's graph-context slot (keyed
-  `"_global_context_index"`). What is **not** yet implemented:
-  - Bucket/root summarization: Python's reference implementation chunks the edge list into buckets
-    and runs an LLM summarization pass to produce a condensed global context rather than a raw edge
-    dump. The Rust version stores the raw edge list, which is token-inefficient for large graphs.
-  - TODO: add `global_context_index_pipeline()` in `cognee-cognify` (mirrors Python
-    `session_manager.py: build_global_context_index`) that does bucket summarization with the LLM
-    before writing to the session store.
+- **`review_conflicts`** — skipped `opt_in_disabled` unless opted in with
+  `improve.review_conflicts` (there is no per-call argument yet), then `no_llm_configured` or
+  `not_ported` (SDK-1038).
 
-- **`persist_trace_steps` stage (Stage 2b)** — trace steps whose `session_feedback` field is
-  non-empty are collected and run through the standard `add → cognify` path (tagged to the
-  `"agent_trace_feedbacks"` node set). This **matches the current Python reference**, not a
-  scoped-down version of it: Python's `persist_agent_trace_feedbacks_in_knowledge_graph` pipeline
-  also cognifies only the feedback text, so the per-step provenance metadata (origin function,
-  status, parameters, return values) is stored as separate graph nodes in *neither* SDK. This entry
-  is therefore a shared future enhancement rather than a Rust↔Python parity gap.
-  - Future enhancement (both SDKs): persist a per-step graph entity preserving the full
-    `SessionTraceStep` fields for audit/replay. In Rust this would be a dedicated
-    `persist_trace_step_metadata()` in `cognee-cognify`.
+Improve settings that exist but are not read by any stage yet: `improve.trace_window_steps`,
+`improve.trace_windows_per_run` (SDK-1047), `improve.distill_max_batches_per_run` (SDK-1049) and
+`improve.effective_date_key` (SDK-1038). Python's host admission check for the automatic improve
+(`register_auto_improve_admission`) is not ported.
+
+Partial stages:
+
+- **`extract_agent_context`** — the improve stage is ported; the trace-write hooks are not.
+  Python also extracts on every trace write while automatic session context is on (a no-LLM
+  `failure_lessons` lesson per errored step, and an LLM batch every 10 traces), inside
+  `SessionManager.add_agent_trace_step`; Rust's `add_agent_trace_step` stores the step only, so
+  lessons appear when `improve()` runs. The passes exist as `cognee_session::
+  extract_live_agent_context` / `extract_pending_agent_context`. The rendered session guidance
+  block that serves the lessons (Python's `build_active_context_block`) is not ported.
+- **`update_user_preferences`** — ported. Differences: the graph trait has no edge delete, so a
+  retired `prefers` edge is always rewritten as neutral (weight 0.5, turn 0) — Python's fallback
+  for backends without `delete_edge_triples` — and the node is always written in full (every
+  adapter's node write is an upsert). The feedback rows that infer ratings
+  (`referenced_qa_rating`) and the `preferences`-section entries that become the preference
+  text are written by Python's session-turn analysis (`prepare_session_turn`), which is not
+  ported (SDK-1045); in Rust an explicit `feedback_score` (`add_feedback`) is the rating source,
+  and stored entries of either kind are honoured. **The preference-text track is inert on
+  Rust-only data until SDK-1045 lands:** nothing in Rust writes a `preferences`-section entry,
+  so the node's preference text stays empty unless Python wrote those entries into a shared
+  session store; only the `prefers` edge weights (from explicit ratings) take effect.
+- **Personalized retrieval** — graph completions (triplet ranking) and RAG completion (chunk
+  re-ranking, preference text as guidance) read the preferences. Not yet: the hybrid search's
+  chunk-lane factor and guidance (SDK-1045), and the session guidance block's `Preferences`
+  section. Rust appends the preference text on session searches too, since it has no session
+  guidance block; Python serves it there through that block. RAG scores are similarities in
+  Rust; the re-rank takes each back to Python's distance space (`1 - score`) and scales that,
+  so the order matches Python's. A RAG completion's turn records its chunks' ids, so ratings
+  can weight chunks.
+
+- **`global_context_index`** — opt-in via `build_global_context_index`; builds Python's
+  default `from_entities` index. Differences: a document's name comes from its data item
+  (`name`, else the basename of `raw_data_location`) because Rust chunks carry no
+  `document_name`; the LLM method ports only the default `bucketing_strategy="vector"`
+  (the experimental graph bucketing is not ported); index edges are not stamped with a
+  dataset source ref (Rust's ownership ledger is relational; the nodes' rows carry the
+  dataset). Its `already_completed` watermark: unlike Python, which narrows the
+  change check to the dataset under backend access control, every dataset's pipeline runs count.
+  A host's `improve_pipeline` rows never count: an improve counts through the `improve` row it
+  records after a stage that may have written, so an index-only improve is not a change (Python
+  counts every non-noop improve). The hybrid retriever's global-context channel is not wired yet
+  (SDK-1045); graph completion's is.
+
+- **`persist_agent_traces`** — trace steps whose `session_feedback` field is non-empty are
+  collected and run through the standard `add → cognify` path (tagged to the
+  `"agent_trace_feedbacks"` node set), all sessions as one document. There is no per-session
+  trace watermark (`windows`, `sessions_stuck`) yet (SDK-1047); a run with no trace feedback reports
+  `already_completed: no_new_trace_steps`. Per-step provenance metadata is stored as graph nodes in
+  *neither* SDK — a shared future enhancement rather than a parity gap.
+
+- **`persist_session_qa` / `distill_sessions`** — no Q&A or distillation watermark yet
+  (SDK-1047 / SDK-1049): the watermark rows exist (`cognee_session::SESSION_PERSIST_WATERMARK`,
+  `distill_watermark`, on the session-context store) but no stage reads or advances them yet, so
+  every run persists and distills the sessions' full Q&A, and
+  `distill_sessions` reports no `entries_uncurated` count.
 
 ## HTTP server
 

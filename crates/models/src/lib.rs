@@ -14,6 +14,7 @@ mod edge_type;
 mod embedding;
 mod entity;
 mod entity_type;
+mod global_context_summary;
 pub mod has_datapoint;
 mod internal_node;
 /// Memory entry types for typed `remember()` dispatch.
@@ -25,6 +26,7 @@ pub mod temporal_event;
 mod timestamp;
 mod triplet;
 mod user;
+mod user_preference;
 
 pub use backend_overrides::{BackendConfig, BackendOverrides};
 pub use data::Data;
@@ -38,6 +40,7 @@ pub use edge_type::EdgeType;
 pub use embedding::Embedding;
 pub use entity::Entity;
 pub use entity_type::EntityType;
+pub use global_context_summary::GlobalContextSummary;
 pub use has_datapoint::HasDataPoint;
 pub use internal_node::{INTERNAL_PROPERTY, is_internal_node, marks_internal};
 pub use memory::{FeedbackEntry, MemoryEntry, QAEntry, TraceEntry};
@@ -49,6 +52,7 @@ pub use timestamp::{
 };
 pub use triplet::Triplet;
 pub use user::User;
+pub use user_preference::UserPreference;
 
 // `Role` and `Tenant` are not part of this crate; a downstream ACL
 // implementation owns them.

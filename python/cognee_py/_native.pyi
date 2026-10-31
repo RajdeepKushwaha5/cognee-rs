@@ -57,6 +57,15 @@ class CogneeRuntimeError(CogneeError):
     """A runtime error occurred in the Rust core."""
     ...
 
+class CogneeImproveAbortedError(CogneeRuntimeError):
+    """``improve()`` stopped at its fatal stage (``persist_session_qa``).
+
+    ``improve_result`` holds the partial result — the stages that ran before
+    the abort and the skipped rest — as Python cognee attaches it to the
+    raised error.
+    """
+    improve_result: dict[str, Any]
+
 class CogneeValidationError(CogneeError):
     """Input validation failed (bad arguments, wrong types, unknown keys)."""
     ...
@@ -476,7 +485,6 @@ class CogneeSessions:
     Accessible as ``cognee.sessions`` on every :class:`Cognee` instance::
 
         entries = await cognee.sessions.get("session-id")
-        await cognee.sessions.set_graph_context("session-id", "ctx")
     """
 
     async def get(
@@ -509,20 +517,6 @@ class CogneeSessions:
         """Remove feedback from a QA entry.
 
         Returns ``True`` if feedback was removed, ``False`` if not found.
-        """
-        ...
-
-    async def get_graph_context(self, session_id: str) -> Optional[str]:
-        """Retrieve the stored graph context for *session_id*.
-
-        Returns ``None`` when no context has been stored, or a ``str``.
-        """
-        ...
-
-    async def set_graph_context(self, session_id: str, context: str) -> None:
-        """Store a graph context snapshot for *session_id*.
-
-        Returns ``None``.
         """
         ...
 
@@ -872,9 +866,9 @@ class Cognee:
         *opts* must contain ``"datasetName"`` (camelCase) or
         ``"dataset_name"`` (normalised).
 
-        Returns a dict with camelCase keys: ``stagesRun``, ``stages``,
-        ``memifyResult``, ``feedbackEntriesProcessed``,
-        ``feedbackEntriesApplied``, ``sessionsPersisted``, ``edgesSynced``.
+        Returns a dict with camelCase keys: ``datasetId``, ``datasetName``,
+        ``sessionIds``, ``stages`` (one per improve stage, in order),
+        ``background``, ``finished``, ``error``, ``status``.
         """
         ...
 

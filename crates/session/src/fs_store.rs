@@ -18,6 +18,7 @@ use chrono::Utc;
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::context_entry::SessionContextRow;
 use crate::error::SessionError;
 use crate::session_store::{SessionQAUpdate, SessionStore};
 use crate::types::{SessionQAEntry, SessionTraceStep, UsedGraphElementIds};
@@ -60,7 +61,8 @@ impl FsSessionStore {
         }
     }
 
-    /// Expire a session's files (Q&A entries, trace steps, graph context)
+    /// Expire a session's files (Q&A entries, trace steps, session-context
+    /// rows)
     /// this many seconds after their last write, as Python's `FSCacheAdapter`
     /// does with `session_ttl_seconds` (its `diskcache` expiry, refreshed on
     /// every write). An expired file is deleted when it is next read. `0`
@@ -173,7 +175,10 @@ fn fs_entry_to_domain(e: &FsQAEntry, session_id: &str) -> SessionQAEntry {
     }
 }
 
-fn graph_context_file(base: &Path, user_id: Option<&str>, session_id: &str) -> PathBuf {
+/// The graph-knowledge snapshot file of the removed graph-to-session sync.
+/// Only `delete_session` still touches it, to clean up files written before
+/// the removal (Python keeps the same one-release cleanup).
+fn legacy_graph_context_file(base: &Path, user_id: Option<&str>, session_id: &str) -> PathBuf {
     let uid = user_id.unwrap_or("default");
     base.join(uid)
         .join(format!("_graph_context_{session_id}.json"))
@@ -183,7 +188,16 @@ fn trace_session_file(base: &Path, user_id: &str, session_id: &str) -> PathBuf {
     base.join(user_id).join(format!("{session_id}.traces.json"))
 }
 
-async fn load_trace_steps(path: &Path) -> Result<Vec<SessionTraceStep>, SessionError> {
+fn context_session_file(base: &Path, user_id: Option<&str>, session_id: &str) -> PathBuf {
+    let uid = user_id.unwrap_or("default");
+    base.join(uid).join(format!("{session_id}.context.json"))
+}
+
+/// Load a JSON array file (trace steps, session-context rows); a missing or
+/// empty file is an empty list.
+async fn load_json_list<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<Vec<T>, SessionError> {
     match fs::read_to_string(path).await {
         Ok(contents) if !contents.is_empty() => serde_json::from_str(&contents)
             .map_err(|e| SessionError::StoreError(format!("json parse error: {e}"))),
@@ -193,18 +207,27 @@ async fn load_trace_steps(path: &Path) -> Result<Vec<SessionTraceStep>, SessionE
     }
 }
 
-async fn save_trace_steps(path: &Path, steps: &[SessionTraceStep]) -> Result<(), SessionError> {
+async fn save_json_list<T: serde::Serialize>(path: &Path, items: &[T]) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .await
             .map_err(|e| SessionError::StoreError(format!("fs mkdir error: {e}")))?;
     }
-    let json = serde_json::to_string_pretty(steps)
+    let json = serde_json::to_string_pretty(items)
         .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
     fs::write(path, json)
         .await
         .map_err(|e| SessionError::StoreError(format!("fs write error: {e}")))?;
     Ok(())
+}
+
+/// Remove `path`; whether it existed.
+async fn remove_if_exists(path: &Path) -> Result<bool, SessionError> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(SessionError::StoreError(format!("fs delete error: {e}"))),
+    }
 }
 
 /// Apply a `SessionQAUpdate` to an `FsQAEntry` in place.
@@ -232,7 +255,7 @@ fn apply_update_to_fs_entry(entry: &mut FsQAEntry, updates: &SessionQAUpdate) {
     if let Some(ref mm) = updates.memify_metadata {
         entry.memify_metadata = mm
             .as_ref()
-            .map(|v| serde_json::to_value(v).unwrap_or_default());
+            .map(|v| crate::types::merge_memify_metadata(entry.memify_metadata.take(), v));
     }
 }
 
@@ -299,17 +322,18 @@ impl SessionStore for FsSessionStore {
         user_id: Option<&str>,
     ) -> Result<bool, SessionError> {
         let path = session_file(&self.base_dir, user_id, session_id);
-        let existed = match fs::remove_file(&path).await {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(SessionError::StoreError(format!("fs delete error: {e}"))),
-        };
+        let existed = remove_if_exists(&path).await?;
 
-        // Also remove the graph context file for this session (best-effort).
-        let gc_path = graph_context_file(&self.base_dir, user_id, session_id);
+        // Also remove a legacy graph-context snapshot (best-effort).
+        let gc_path = legacy_graph_context_file(&self.base_dir, user_id, session_id);
         let _ = fs::remove_file(&gc_path).await; // ignore NotFound
 
-        Ok(existed)
+        // And its session-context rows, which count toward "existed" as in
+        // Python's `delete_session`.
+        let ctx_path = context_session_file(&self.base_dir, user_id, session_id);
+        let context_existed = remove_if_exists(&ctx_path).await?;
+
+        Ok(existed || context_existed)
     }
 
     async fn delete_qa_entry(
@@ -376,46 +400,6 @@ impl SessionStore for FsSessionStore {
         Ok(true)
     }
 
-    async fn get_graph_context(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<Option<String>, SessionError> {
-        let path = graph_context_file(&self.base_dir, user_id, session_id);
-        self.expire(&path).await?;
-        match fs::read_to_string(&path).await {
-            Ok(contents) if !contents.is_empty() => {
-                // Stored as a JSON string
-                let ctx: String = serde_json::from_str(&contents)
-                    .map_err(|e| SessionError::StoreError(format!("json parse error: {e}")))?;
-                Ok(Some(ctx))
-            }
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(SessionError::StoreError(format!("fs read error: {e}"))),
-        }
-    }
-
-    async fn set_graph_context(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-        context: &str,
-    ) -> Result<(), SessionError> {
-        let path = graph_context_file(&self.base_dir, user_id, session_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SessionError::StoreError(format!("fs mkdir error: {e}")))?;
-        }
-        let json = serde_json::to_string_pretty(context)
-            .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
-        fs::write(&path, json)
-            .await
-            .map_err(|e| SessionError::StoreError(format!("fs write error: {e}")))?;
-        Ok(())
-    }
-
     async fn save_trace_step(
         &self,
         user_id: &str,
@@ -424,10 +408,10 @@ impl SessionStore for FsSessionStore {
     ) -> Result<String, SessionError> {
         let path = trace_session_file(&self.base_dir, user_id, session_id);
         self.expire(&path).await?;
-        let mut steps = load_trace_steps(&path).await?;
+        let mut steps = load_json_list(&path).await?;
         let trace_id = step.trace_id.clone();
         steps.push(step);
-        save_trace_steps(&path, &steps).await?;
+        save_json_list(&path, &steps).await?;
         Ok(trace_id)
     }
 
@@ -438,7 +422,51 @@ impl SessionStore for FsSessionStore {
     ) -> Result<Vec<SessionTraceStep>, SessionError> {
         let path = trace_session_file(&self.base_dir, user_id, session_id);
         self.expire(&path).await?;
-        load_trace_steps(&path).await
+        load_json_list(&path).await
+    }
+
+    async fn create_session_context_entry(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        entry: SessionContextRow,
+    ) -> Result<(), SessionError> {
+        let path = context_session_file(&self.base_dir, user_id, session_id);
+        self.expire(&path).await?;
+        let mut rows: Vec<SessionContextRow> = load_json_list(&path).await?;
+        rows.push(entry);
+        save_json_list(&path, &rows).await
+    }
+
+    async fn get_session_context_entries(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<Vec<SessionContextRow>, SessionError> {
+        let path = context_session_file(&self.base_dir, user_id, session_id);
+        self.expire(&path).await?;
+        load_json_list(&path).await
+    }
+
+    async fn update_session_context_entry(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        entry_id: &str,
+        merge: SessionContextRow,
+    ) -> Result<bool, SessionError> {
+        let path = context_session_file(&self.base_dir, user_id, session_id);
+        self.expire(&path).await?;
+        let mut rows: Vec<SessionContextRow> = load_json_list(&path).await?;
+        let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.get("id").and_then(serde_json::Value::as_str) == Some(entry_id))
+        else {
+            return Ok(false);
+        };
+        row.extend(merge);
+        save_json_list(&path, &rows).await?;
+        Ok(true)
     }
 }
 
@@ -468,10 +496,6 @@ mod tests {
             .create_qa_entry("s", Some("u"), "q", "a", None)
             .await
             .unwrap();
-        store
-            .set_graph_context("s", Some("u"), "ctx")
-            .await
-            .unwrap();
         assert_eq!(
             store
                 .get_all_qa_entries("s", Some("u"))
@@ -482,9 +506,7 @@ mod tests {
         );
 
         let qa = session_file(dir.path(), Some("u"), "s");
-        let gc = graph_context_file(dir.path(), Some("u"), "s");
         age_file(&qa, std::time::Duration::from_secs(120));
-        age_file(&gc, std::time::Duration::from_secs(120));
 
         let untimed = FsSessionStore::new(dir.path());
         assert_eq!(
@@ -505,7 +527,6 @@ mod tests {
                 .is_empty()
         );
         assert!(!qa.exists(), "the expired file is deleted");
-        assert_eq!(store.get_graph_context("s", Some("u")).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -634,44 +655,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_context_round_trip() {
-        let dir = tempfile::tempdir().expect("tempdir creation must succeed");
-        let store = FsSessionStore::new(dir.path());
-
-        // Initially no context
-        let ctx = store
-            .get_graph_context("sess1", None)
-            .await
-            .expect("get should succeed");
-        assert!(ctx.is_none());
-
-        // Set context
-        store
-            .set_graph_context("sess1", None, "Some graph knowledge")
-            .await
-            .expect("set should succeed");
-
-        // Read it back
-        let ctx = store
-            .get_graph_context("sess1", None)
-            .await
-            .expect("get should succeed");
-        assert_eq!(ctx.as_deref(), Some("Some graph knowledge"));
-
-        // Overwrite
-        store
-            .set_graph_context("sess1", None, "Updated graph knowledge")
-            .await
-            .expect("set should succeed");
-
-        let ctx = store
-            .get_graph_context("sess1", None)
-            .await
-            .expect("get should succeed");
-        assert_eq!(ctx.as_deref(), Some("Updated graph knowledge"));
-    }
-
-    #[tokio::test]
     async fn update_qa_entry_with_graph_element_ids() {
         let dir = tempfile::tempdir().expect("tempdir creation must succeed");
         let store = FsSessionStore::new(dir.path());
@@ -748,10 +731,36 @@ mod tests {
             .as_ref()
             .expect("should have memify metadata");
         assert_eq!(mm.get("feedback_weights_applied"), Some(&false));
+
+        // A second write overlays its own keys (Python's `update_qa` merge).
+        store
+            .update_qa_entry(
+                "sess1",
+                None,
+                &qa_id,
+                SessionQAUpdate {
+                    memify_metadata: Some(Some(HashMap::from([(
+                        "preference_turn_counted".to_string(),
+                        true,
+                    )]))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update should succeed");
+        let entries = store
+            .get_all_qa_entries("sess1", None)
+            .await
+            .expect("get should succeed");
+        let mm = entries[0].memify_metadata.as_ref().expect("metadata");
+        assert_eq!(mm.get("feedback_weights_applied"), Some(&false));
+        assert_eq!(mm.get("preference_turn_counted"), Some(&true));
     }
 
+    /// A graph-context snapshot left by the removed graph-to-session sync is
+    /// deleted with its session.
     #[tokio::test]
-    async fn delete_session_also_removes_graph_context() {
+    async fn delete_session_also_removes_a_legacy_graph_context_file() {
         let dir = tempfile::tempdir().expect("tempdir creation must succeed");
         let store = FsSessionStore::new(dir.path());
 
@@ -759,22 +768,14 @@ mod tests {
             .create_qa_entry("sess1", None, "q1?", "a1", None)
             .await
             .expect("create should succeed");
-
-        store
-            .set_graph_context("sess1", None, "some context")
-            .await
-            .expect("set should succeed");
+        let legacy = legacy_graph_context_file(dir.path(), None, "sess1");
+        std::fs::write(&legacy, "\"some context\"").expect("write legacy file");
 
         let deleted = store
             .delete_session("sess1", None)
             .await
             .expect("delete should succeed");
         assert!(deleted);
-
-        let ctx = store
-            .get_graph_context("sess1", None)
-            .await
-            .expect("get should succeed");
-        assert!(ctx.is_none());
+        assert!(!legacy.exists(), "the legacy snapshot is removed");
     }
 }

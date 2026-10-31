@@ -1671,7 +1671,9 @@ impl AddPipeline {
             vector_db: None,
             db_connection: None,
             pipeline_run_repo: None,
-            dataset_locks: None,
+            // Python's add takes the process's one dataset lock registry;
+            // `with_dataset_locks` swaps in a host's own.
+            dataset_locks: Some(DatasetLocks::global()),
             #[cfg(feature = "audio-loader")]
             transcriber: None,
         }
@@ -1703,6 +1705,13 @@ impl AddPipeline {
     pub fn with_dataset_locks(mut self, locks: Arc<DatasetLocks>) -> Self {
         self.dataset_locks = Some(locks);
         self
+    }
+
+    /// The dataset lock registry wired with [`Self::with_dataset_locks`], if
+    /// any. An operation that holds a dataset across `add` calls (`improve`)
+    /// must hold it in this registry, so the `add` rides on its hold.
+    pub fn dataset_locks(&self) -> Option<&Arc<DatasetLocks>> {
+        self.dataset_locks.as_ref()
     }
 
     /// Attach the CPU pool used by [`cognee_core::TaskContext`].

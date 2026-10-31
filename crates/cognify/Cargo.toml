@@ -77,6 +77,11 @@ path = "tests/e2e_memify.rs"
 required-features = ["testing"]
 
 [[test]]
+name = "global_context_index"
+path = "tests/global_context_index.rs"
+required-features = ["testing"]
+
+[[test]]
 name = "integration_memify"
 path = "tests/integration_memify.rs"
 required-features = ["testing"]
@@ -94,11 +99,6 @@ required-features = ["testing"]
 [[test]]
 name = "memify_persist_sessions"
 path = "tests/memify_persist_sessions.rs"
-required-features = ["testing"]
-
-[[test]]
-name = "memify_sync_graph_session"
-path = "tests/memify_sync_graph_session.rs"
 required-features = ["testing"]
 
 [dev-dependencies]

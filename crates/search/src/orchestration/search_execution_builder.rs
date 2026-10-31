@@ -9,6 +9,7 @@ use cognee_session::SessionManager;
 use cognee_vector::VectorDB;
 
 use crate::orchestration::{SearchOrchestrator, SearchTypeRegistry};
+use crate::query_router::RoutingConstraints;
 use crate::retrievers::{
     ChunksRetriever, CodingRulesRetriever, CompletionRetriever, CypherSearchRetriever,
     FeedbackRetriever, FeelingLuckyRetriever, GraphCompletionContextExtensionRetriever,
@@ -18,6 +19,7 @@ use crate::retrievers::{
     TemporalHybridRetriever, TripletRetriever,
 };
 use crate::types::SearchType;
+use crate::user_preferences::PreferenceConfig;
 
 /// Tuning the standard retrievers are built with (the `search` and
 /// `search.hybrid` settings).
@@ -43,6 +45,13 @@ pub struct SearchTuning {
     /// nor a prompt path; `None` (the default) leaves each retriever's own
     /// default prompt.
     pub default_system_prompt_path: Option<String>,
+    /// Per-user personalization (`personalization_enabled` and its knobs):
+    /// the requesting user's `prefers` weights re-rank graph and RAG
+    /// retrieval, and their preference text guides the completion.
+    pub personalization: PreferenceConfig,
+    /// Feedback-weight influence of a graph search whose request leaves
+    /// `feedback_influence` unset (`default_feedback_influence`). Default 0.
+    pub default_feedback_influence: f32,
 }
 
 impl Default for SearchTuning {
@@ -54,6 +63,8 @@ impl Default for SearchTuning {
             access_tracking: false,
             auto_feedback: false,
             default_system_prompt_path: None,
+            personalization: PreferenceConfig::default(),
+            default_feedback_influence: 0.0,
         }
     }
 }
@@ -186,16 +197,19 @@ impl SearchBuilder {
 
         retrievers.insert(
             SearchType::RagCompletion,
-            Arc::new(CompletionRetriever::new(
-                Arc::clone(&vector_db),
-                Arc::clone(&embedding_engine),
-                Arc::clone(&llm),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )),
+            Arc::new(
+                CompletionRetriever::new(
+                    Arc::clone(&vector_db),
+                    Arc::clone(&embedding_engine),
+                    Arc::clone(&llm),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .with_graph_db(Arc::clone(&graph_db)),
+            ),
         );
 
         retrievers.insert(
@@ -444,13 +458,20 @@ impl SearchBuilder {
             registry.register(Arc::clone(retriever));
         }
 
+        let routing_constraints = RoutingConstraints {
+            llm_available: llm.is_configured(),
+            cypher_allowed: self.tuning.allow_cypher_query,
+        };
         let mut orchestrator = SearchOrchestrator::new(registry)
             .with_database(self.database)
             .with_llm(llm)
             .with_auto_feedback_default(self.tuning.auto_feedback)
+            .with_personalization(self.tuning.personalization)
+            .with_default_feedback_influence(self.tuning.default_feedback_influence)
             .with_default_system_prompt_path(self.tuning.default_system_prompt_path)
             .with_search_history_logging(self.log_search_history)
-            .with_per_dataset_storage(self.per_dataset_storage);
+            .with_per_dataset_storage(self.per_dataset_storage)
+            .with_routing_constraints(routing_constraints);
         if self.tuning.access_tracking {
             orchestrator = orchestrator.with_access_tracking();
         }
@@ -494,6 +515,7 @@ mod tests {
     use cognee_session::SessionContext;
 
     use super::SearchBuilder;
+    use crate::query_router::RoutingConstraints;
     use crate::retrievers::SearchRetriever;
     use crate::types::{
         SearchContext, SearchError, SearchOutput, SearchParams, SearchRequest, SearchType,
@@ -942,6 +964,33 @@ mod tests {
             })
             .build();
         assert_eq!(tuned.tuning_flags(), (true, true));
+    }
+
+    /// The orchestrator's routing constraints come from the builder's LLM
+    /// and `allow_cypher_query`.
+    #[test]
+    fn routing_constraints_come_from_the_llm_and_the_cypher_setting() {
+        let unconstrained = builder().build().routing_constraints();
+        assert_eq!(unconstrained, RoutingConstraints::default());
+
+        let constrained = SearchBuilder::new(
+            Arc::new(TestVectorDb),
+            Arc::new(TestEmbedding),
+            Arc::new(TestGraphDb),
+            Arc::new(cognee_llm::UnconfiguredLlm::new("openai")),
+            Arc::new(TestDatabase),
+        )
+        .with_tuning(super::SearchTuning {
+            allow_cypher_query: false,
+            ..super::SearchTuning::default()
+        })
+        .build()
+        .routing_constraints();
+        let expected = RoutingConstraints {
+            llm_available: false,
+            cypher_allowed: false,
+        };
+        assert_eq!(constrained, expected);
     }
 
     #[tokio::test]

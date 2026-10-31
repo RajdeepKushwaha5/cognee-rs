@@ -12,7 +12,11 @@ use cognee_session::SessionContext;
 use crate::retrievers::SearchRetriever;
 use crate::retrievers::graph_core::{GraphPrompts, GraphRetrieverCore, complete};
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
-use crate::utils::{render_edges_context, skip_completion_on_empty_context};
+use crate::user_preferences::{append_preference_guidance, load_for_search};
+use crate::utils::{
+    DEFAULT_GLOBAL_CONTEXT_INDEX_TOP_K, build_global_context_prelude, render_edges_context,
+    skip_completion_on_empty_context,
+};
 
 pub struct GraphCompletionRetriever {
     core: GraphRetrieverCore,
@@ -25,14 +29,14 @@ impl GraphCompletionRetriever {
     /// The system + user messages a completion over `context` sends, or
     /// `None` when the rendered context is empty. Shared by `get_completion`
     /// and the `only_context` preview.
-    fn build_completion_messages(
+    async fn build_completion_messages(
         &self,
         query: &str,
         context: &SearchContext,
         session: &SessionContext,
         params: &SearchParams,
     ) -> Result<Option<Vec<Message>>, SearchError> {
-        let graph_context_text = render_edges_context(context);
+        let graph_context_text = self.context_text(query, context, params).await?;
         if graph_context_text.is_empty() {
             return Ok(None);
         }
@@ -40,9 +44,47 @@ impl GraphCompletionRetriever {
             context_items = context.len(),
             "Graph context assembled:\n{graph_context_text}"
         );
-        self.prompts
-            .messages(query, &graph_context_text, session, params)
-            .map(Some)
+        let mut messages = self
+            .prompts
+            .messages(query, &graph_context_text, session, params)?;
+        // Python's sessionless guidance site: the user's stated preferences
+        // follow the question and context (empty without personalization).
+        let preferences = load_for_search(self.core.graph_db.as_ref(), params).await;
+        append_preference_guidance(&mut messages, &preferences.rendered_text());
+        Ok(Some(messages))
+    }
+
+    /// The rendered triplets, behind the global context index prelude when
+    /// `include_global_context_index` is set (Python's
+    /// `GraphCompletionRetriever.get_context_from_objects`).
+    async fn context_text(
+        &self,
+        query: &str,
+        context: &SearchContext,
+        params: &SearchParams,
+    ) -> Result<String, SearchError> {
+        let graph_context = render_edges_context(context);
+        if !params.include_global_context_index.unwrap_or(false) {
+            return Ok(graph_context);
+        }
+        let prelude = build_global_context_prelude(
+            query,
+            params
+                .global_context_index_top_k
+                .unwrap_or(DEFAULT_GLOBAL_CONTEXT_INDEX_TOP_K),
+            // The prelude is a follow-up retrieval: under `Membership`
+            // scoping it applies the search's datasets itself.
+            params.dataset_ids.as_deref(),
+            self.core.graph_db.as_ref(),
+            self.core.vector_db.as_ref(),
+            self.core.embedding_engine.as_ref(),
+        )
+        .await?;
+        Ok(match (prelude.is_empty(), graph_context.is_empty()) {
+            (true, _) => graph_context,
+            (false, true) => prelude,
+            (false, false) => format!("{prelude}\n\n{graph_context}"),
+        })
     }
 
     /// Cap the neighbours expanded per seed node in triplet search
@@ -129,6 +171,14 @@ impl SearchRetriever for GraphCompletionRetriever {
         params: &SearchParams,
     ) -> Result<Option<Vec<Message>>, SearchError> {
         self.build_completion_messages(query, context, session, params)
+            .await
+    }
+
+    /// With the global context index on, no triplets still leave the
+    /// prelude, which Python's `get_context_from_objects` returns as the
+    /// context — so the preview is built from it.
+    fn previews_empty_context(&self, params: &SearchParams) -> bool {
+        params.include_global_context_index.unwrap_or(false)
     }
 
     async fn get_completion(
@@ -143,8 +193,9 @@ impl SearchRetriever for GraphCompletionRetriever {
             None => self.get_context(query, params).await?,
         };
 
-        let Some(messages) =
-            self.build_completion_messages(query, &completion_context, session, params)?
+        let Some(messages) = self
+            .build_completion_messages(query, &completion_context, session, params)
+            .await?
         else {
             return Ok(skip_completion_on_empty_context());
         };
@@ -708,6 +759,164 @@ mod tests {
         assert!(messages[1].content.contains("knowledge graph"));
         // Should NOT use the generic RAG format
         assert!(!messages[1].content.starts_with("Question:\n"));
+    }
+
+    /// A retriever over a graph holding a global context root and a vector
+    /// store holding two bucket summaries.
+    async fn retriever_with_global_context(llm: &Arc<TestLlm>) -> GraphCompletionRetriever {
+        use cognee_graph::GraphDBTraitExt;
+        let graph = cognee_graph::MockGraphDB::new();
+        graph
+            .add_node(&json!({"id": "root", "type": "GlobalContextSummary",
+                              "text": "Topics: Person (2)", "is_root": true}))
+            .await
+            .unwrap();
+        let hit = |text: &str, is_root: bool| SearchResult {
+            id: Uuid::new_v4(),
+            score: 0.9,
+            metadata: HashMap::from([
+                ("text".to_string(), json!(text)),
+                ("is_root".to_string(), json!(is_root)),
+            ]),
+        };
+        let collections = HashMap::from([(
+            TestVectorDb::key("GlobalContextSummary", "text"),
+            vec![
+                hit("Topics: Person (2)", true),
+                hit("alpha.md\nPerson: Alice", false),
+                hit("beta.md\nPerson: Bob", false),
+            ],
+        )]);
+        GraphCompletionRetriever::new(
+            Arc::new(TestVectorDb { collections }),
+            Arc::new(TestEmbeddingEngine),
+            Arc::new(graph),
+            Arc::clone(llm) as Arc<dyn Llm>,
+            Some(2),
+            Some(5),
+            None,
+            Some("system".to_string()),
+            None,
+            Some("Graph={context}".to_string()),
+            None,
+        )
+    }
+
+    fn alice_knows_bob() -> crate::types::SearchContext {
+        vec![crate::types::SearchItem {
+            id: None,
+            score: Some(1.0),
+            payload: json!({"source_name": "Alice", "target_name": "Bob", "relationship": "KNOWS"}),
+        }]
+    }
+
+    /// `include_global_context_index` prepends the root and the nearest
+    /// non-root summaries (Python `GraphCompletionRetriever` :328-353).
+    #[tokio::test]
+    async fn global_context_index_prelude_precedes_the_graph_context() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_with_global_context(&llm).await;
+        let params = SearchParams {
+            include_global_context_index: Some(true),
+            global_context_index_top_k: Some(1),
+            ..Default::default()
+        };
+
+        let messages = retriever
+            .completion_messages(
+                "who?",
+                &alice_knows_bob(),
+                &SessionContext::default(),
+                &params,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let user = &messages[1].content;
+        assert!(
+            user.starts_with(
+                "Graph=World summary:\nTopics: Person (2)\n\nRelevant areas:\nalpha.md\nPerson: Alice\n\n"
+            ),
+            "{user}"
+        );
+        assert!(user.contains("--[KNOWS]-->"));
+        assert!(!user.contains("beta.md"), "top_k caps the areas");
+    }
+
+    #[tokio::test]
+    async fn global_context_index_is_off_by_default_and_alone_is_a_context() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_with_global_context(&llm).await;
+
+        let off = retriever
+            .completion_messages(
+                "who?",
+                &alice_knows_bob(),
+                &SessionContext::default(),
+                &SearchParams::default(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!off[1].content.contains("World summary"));
+
+        // No triplets: the prelude alone is the context.
+        let params = SearchParams {
+            include_global_context_index: Some(true),
+            ..Default::default()
+        };
+        let prelude_only = retriever
+            .completion_messages("who?", &vec![], &SessionContext::default(), &params)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prelude_only[1].content,
+            "Graph=World summary:\nTopics: Person (2)\n\nRelevant areas:\n\
+             alpha.md\nPerson: Alice\n\nbeta.md\nPerson: Bob"
+        );
+    }
+
+    /// Python's `get_context_from_objects` returns the prelude as the context
+    /// when no triplet was found, so the `only_context` preview is asked for
+    /// its prompt then — but only with the index on.
+    #[test]
+    fn an_empty_retrieval_is_previewed_only_with_the_index_on() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_over(
+            TestGraphDb {
+                empty: true,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            &llm,
+        );
+        assert!(!retriever.previews_empty_context(&SearchParams::default()));
+        assert!(retriever.previews_empty_context(&SearchParams {
+            include_global_context_index: Some(true),
+            ..Default::default()
+        }));
+    }
+
+    /// A dataset-scoped search reads only its datasets' index: the fixture's
+    /// summaries carry no `dataset_id`, so a scoped prelude is empty and, with
+    /// no triplets, there is no prompt (a miss stays a miss).
+    #[tokio::test]
+    async fn a_scoped_prelude_reads_only_its_datasets_index() {
+        let llm = Arc::new(TestLlm::default());
+        let retriever = retriever_with_global_context(&llm).await;
+        let params = SearchParams {
+            include_global_context_index: Some(true),
+            dataset_ids: Some(vec![Uuid::new_v4()]),
+            ..Default::default()
+        };
+        let messages = retriever
+            .completion_messages("who?", &vec![], &SessionContext::default(), &params)
+            .await
+            .unwrap();
+        assert!(messages.is_none(), "{messages:?}");
     }
 
     fn retriever_over(

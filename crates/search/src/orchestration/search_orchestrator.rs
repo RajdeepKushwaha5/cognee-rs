@@ -1,6 +1,7 @@
 use crate::orchestration::hybrid_fallback::{passed_graph_only_knob, requested_graph_only_filter};
 use crate::orchestration::search_history::{history_query_type, history_row, log_history_row};
 use crate::orchestration::{SearchTypeRegistry, prepare_search_result};
+use crate::query_router::RoutingConstraints;
 use crate::retrievers::DatasetScoping;
 use crate::types::{
     SearchContext, SearchError, SearchOutput, SearchParams, SearchPrompt, SearchRequest,
@@ -60,33 +61,6 @@ fn emit_search_completed(request: &SearchRequest) {
 #[inline]
 fn emit_search_completed(_request: &SearchRequest) {}
 
-/// Apply the graph-context character limit with the Python-parity precedence:
-/// explicit `max_chars` parameter → (config value, if added) → unlimited.
-///
-/// Currently only the explicit-parameter level is implemented.
-/// TODO(parity): read `max_session_context_chars` from `CacheConfig` when a
-/// config accessor is available in this crate.
-fn apply_context_char_limit(gc: &str, max_chars: Option<usize>) -> &str {
-    match max_chars {
-        Some(limit) => {
-            // `char_indices` gives us a byte boundary safe to split at.
-            if gc.len() <= limit {
-                gc
-            } else {
-                // Find the last char boundary at or before `limit` bytes.
-                let boundary = gc
-                    .char_indices()
-                    .take_while(|(byte_pos, _)| *byte_pos < limit)
-                    .last()
-                    .map(|(byte_pos, c)| byte_pos + c.len_utf8())
-                    .unwrap_or(0);
-                &gc[..boundary]
-            }
-        }
-        None => gc,
-    }
-}
-
 /// Extract node/edge IDs from retrieved context items for the session cache.
 ///
 /// Two orthogonal item shapes are folded in:
@@ -118,11 +92,26 @@ fn split_prompt_messages(messages: Option<Vec<Message>>) -> (Option<String>, Opt
 }
 
 fn build_used_graph_element_ids(
+    search_type: SearchType,
     context: Option<&[crate::types::SearchItem]>,
 ) -> Option<UsedGraphElementIds> {
     let items = context?;
     let mut node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut edge_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // RAG completion's items are scored chunks, not triplets: Python's
+    // `CompletionRetriever.extract_context_object_ids` records each chunk's
+    // `payload["id"]`, else its `id`, so feedback can weight (and preferences
+    // can point at) the chunks an answer used.
+    if search_type == SearchType::RagCompletion {
+        node_ids.extend(items.iter().filter_map(|item| {
+            item.payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| item.id.map(|id| id.to_string()))
+        }));
+    }
 
     for item in items {
         if let Some(src) = item.payload.get("source_id").and_then(|v| v.as_str()) {
@@ -176,6 +165,10 @@ pub struct SearchOrchestrator {
     /// Whether a session search detects feedback when the request leaves
     /// `auto_feedback_detection` unset.
     auto_feedback_default: bool,
+    /// Stamped on every search's params while personalization is enabled.
+    personalization: crate::user_preferences::PreferenceConfig,
+    /// `feedback_influence` of a request that leaves it unset.
+    default_feedback_influence: f32,
     /// System prompt file for requests that name neither a system prompt nor
     /// a prompt path.
     default_system_prompt_path: Option<String>,
@@ -186,6 +179,9 @@ pub struct SearchOrchestrator {
     /// searched in its own databases, one retriever run per dataset. See
     /// [`Self::with_per_dataset_storage`].
     per_dataset_storage: bool,
+    /// What this deployment can run, for recall's routing. See
+    /// [`Self::with_routing_constraints`].
+    routing_constraints: RoutingConstraints,
 }
 
 /// One dataset's answer under per-dataset storage, or the single answer of a
@@ -219,9 +215,12 @@ impl SearchOrchestrator {
             llm: None,
             enable_access_tracking: false,
             auto_feedback_default: false,
+            personalization: crate::user_preferences::PreferenceConfig::default(),
+            default_feedback_influence: 0.0,
             default_system_prompt_path: None,
             log_search_history: true,
             per_dataset_storage: false,
+            routing_constraints: RoutingConstraints::default(),
         }
     }
 
@@ -355,6 +354,25 @@ impl SearchOrchestrator {
         self
     }
 
+    /// Personalize searches for the requesting user (the
+    /// `personalization_*` / `preference_*` settings): with `enabled`, their
+    /// `prefers` weights re-rank graph and RAG retrieval and their preference
+    /// text guides the completion. Off by default.
+    pub fn with_personalization(
+        mut self,
+        personalization: crate::user_preferences::PreferenceConfig,
+    ) -> Self {
+        self.personalization = personalization;
+        self
+    }
+
+    /// The feedback-weight influence of a request that leaves
+    /// `feedback_influence` unset (Python's `default_feedback_influence`).
+    pub fn with_default_feedback_influence(mut self, influence: f32) -> Self {
+        self.default_feedback_influence = influence;
+        self
+    }
+
     /// The system prompt file used when a request names neither
     /// `system_prompt` nor `system_prompt_path` (the
     /// `default_system_prompt_path` setting). `None` leaves each retriever's
@@ -368,6 +386,19 @@ impl SearchOrchestrator {
     pub fn with_search_history_logging(mut self, enabled: bool) -> Self {
         self.log_search_history = enabled;
         self
+    }
+
+    /// Set what this deployment can run: recall resolves its search type
+    /// against it. The default allows everything; [`crate::SearchBuilder`]
+    /// sets it from its LLM and `allow_cypher_query`.
+    pub fn with_routing_constraints(mut self, constraints: RoutingConstraints) -> Self {
+        self.routing_constraints = constraints;
+        self
+    }
+
+    /// What this deployment can run, for recall's routing.
+    pub fn routing_constraints(&self) -> RoutingConstraints {
+        self.routing_constraints
     }
 
     pub async fn get_history(
@@ -582,7 +613,7 @@ impl SearchOrchestrator {
                 "{knob} requires search_type GRAPH_COMPLETION"
             )));
         }
-        let reason = match requested_graph_only_filter(request) {
+        let reason = match requested_graph_only_filter(request, self.default_feedback_influence) {
             Some(filter) => Some(format!("{filter} is set")),
             None => hybrid.unavailable_reason().await,
         };
@@ -1016,12 +1047,18 @@ impl SearchOrchestrator {
         match &merged.result {
             _ if request.only_context() => {}
             SearchOutput::Text(answer) => {
-                self.save_session_turn(request, answer, merged_context(&merged).as_deref())
-                    .await;
+                self.save_session_turn(
+                    request,
+                    search_type,
+                    answer,
+                    merged_context(&merged).as_deref(),
+                )
+                .await;
             }
             SearchOutput::Texts(answers) if !answers.is_empty() => {
                 self.save_session_turn(
                     request,
+                    search_type,
                     &answers.join("\n\n"),
                     merged_context(&merged).as_deref(),
                 )
@@ -1070,7 +1107,11 @@ impl SearchOrchestrator {
         keep_context: bool,
         session_turn: bool,
     ) -> Result<(SearchResponse, bool), crate::types::SearchError> {
-        let params = SearchParams::from(request);
+        let mut params = SearchParams::from(request);
+        params.personalization = Some(self.personalization).filter(|config| config.enabled);
+        if params.feedback_influence.is_none() && self.default_feedback_influence > 0.0 {
+            params.feedback_influence = Some(self.default_feedback_influence);
+        }
         let include_context =
             request.only_context() || request.use_combined_context() || keep_context;
         let context = if include_context {
@@ -1097,7 +1138,7 @@ impl SearchOrchestrator {
             // every dataset's prompt (Python's `SharedSessionHistory`).
             let mut session_context: Option<SessionContext> = None;
             let mut prompt_for = async |context: &SearchContext| {
-                if context.is_empty() {
+                if context.is_empty() && !retriever.previews_empty_context(&params) {
                     return Ok::<_, SearchError>(None);
                 }
                 if session_context.is_none() {
@@ -1214,7 +1255,7 @@ impl SearchOrchestrator {
             .await?;
 
         if session_turn && let SearchOutput::Text(ref answer) = output {
-            self.save_session_turn(request, answer, context.as_deref())
+            self.save_session_turn(request, search_type, answer, context.as_deref())
                 .await;
         }
 
@@ -1335,6 +1376,7 @@ impl SearchOrchestrator {
     async fn save_session_turn(
         &self,
         request: &SearchRequest,
+        search_type: SearchType,
         answer: &str,
         context: Option<&[crate::types::SearchItem]>,
     ) {
@@ -1357,7 +1399,7 @@ impl SearchOrchestrator {
         // pipeline can trace which graph elements produced the answer.
         // Items from graph-traversal retrievers carry `source_id`/`target_id`
         // payload fields; pure-RAG items carry neither.
-        let used_graph_element_ids = build_used_graph_element_ids(context);
+        let used_graph_element_ids = build_used_graph_element_ids(search_type, context);
 
         let _ = sm
             .save_qa(
@@ -1371,8 +1413,8 @@ impl SearchOrchestrator {
             .await;
     }
 
-    /// The session layer a completion carries: the conversation history,
-    /// prefixed by the graph-knowledge snapshot when one exists. Read-only.
+    /// The session layer a completion carries: the conversation history.
+    /// Read-only.
     async fn load_session_context(&self, request: &SearchRequest) -> SessionContext {
         let user_id_str = request.user_id.map(|id| id.to_string());
         if let (Some(session_id), Some(sm)) = (&request.session_id, &self.session_manager) {
@@ -1381,30 +1423,10 @@ impl SearchOrchestrator {
                 .await
                 .unwrap_or_default();
 
-            // Prepend graph knowledge snapshot (from improve() sync) if available.
-            // Matches Python `session_manager.py:435-450`:
-            //   "Background knowledge from the knowledge graph:\n" + gc + "\n\n" + history
-            let graph_context = sm
-                .get_graph_context(Some(session_id), user_id_str.as_deref())
-                .await
-                .ok()
-                .flatten();
-            let formatted_history = if let Some(gc) =
-                graph_context.as_deref().filter(|s| !s.is_empty())
-            {
-                let gc = apply_context_char_limit(gc, None);
-                format!(
-                    "Background knowledge from the knowledge graph:\n{gc}\n\n{formatted_history}"
-                )
-            } else {
-                formatted_history
-            };
-
             SessionContext {
                 session_id: Some(session_id.clone()),
                 history,
                 formatted_history,
-                graph_context,
             }
         } else {
             SessionContext {
@@ -4446,7 +4468,7 @@ mod tests {
         let context = vec![item(
             json!({ "kind": "chunk", "id": "chunk-1", "text": "t" }),
         )];
-        let ids = super::build_used_graph_element_ids(Some(&context))
+        let ids = super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&context))
             .expect("chunk id should yield Some");
         assert_eq!(ids.node_ids, vec!["chunk-1".to_string()]);
         assert!(ids.edge_ids.is_empty(), "hybrid path never emits edge_ids");
@@ -4463,7 +4485,7 @@ mod tests {
                 { "source_id": "entity-1", "target_id": "tennis-id" }
             ]
         }))];
-        let ids = super::build_used_graph_element_ids(Some(&context))
+        let ids = super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&context))
             .expect("entity ids should yield Some");
         // entity id + both endpoints, entity-1 deduped despite three mentions.
         assert_eq!(
@@ -4485,7 +4507,10 @@ mod tests {
             "text": "Acme acquired Initech."
         }))];
         // A fact-only batch yields no node ids and no edge ids -> None.
-        assert!(super::build_used_graph_element_ids(Some(&context)).is_none());
+        assert!(
+            super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&context))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4505,7 +4530,7 @@ mod tests {
                 "edges": [ { "source_id": "entity-1", "target_id": "acme-id" } ]
             })),
         ];
-        let ids = super::build_used_graph_element_ids(Some(&context))
+        let ids = super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&context))
             .expect("mixed batch should yield Some");
         assert_eq!(
             ids.node_ids,
@@ -4520,10 +4545,43 @@ mod tests {
         assert_eq!(ids.edge_ids, vec!["gt-edge".to_string()]);
     }
 
+    /// Python `CompletionRetriever.extract_context_object_ids`: a RAG
+    /// completion records its chunks' ids (`payload["id"]`, else `id`) so
+    /// `prefers` edges and feedback weights can reach chunks; other types
+    /// never take a bare item id.
+    #[test]
+    fn used_ids_record_rag_chunks() {
+        let chunk_id = Uuid::new_v4();
+        let context = vec![
+            crate::types::SearchItem {
+                id: None,
+                score: Some(0.1),
+                payload: json!({"id": "chunk-a", "text": "Alice likes tea."}),
+            },
+            crate::types::SearchItem {
+                id: Some(chunk_id),
+                score: Some(0.2),
+                payload: json!({"text": "Bob likes coffee."}),
+            },
+        ];
+        let ids = super::build_used_graph_element_ids(SearchType::RagCompletion, Some(&context))
+            .expect("chunk ids");
+        let mut expected = vec!["chunk-a".to_string(), chunk_id.to_string()];
+        expected.sort();
+        assert_eq!(ids.node_ids, expected);
+        assert!(ids.edge_ids.is_empty());
+        assert!(
+            super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&context))
+                .is_none()
+        );
+    }
+
     #[test]
     fn used_ids_empty_and_none_return_none() {
-        assert!(super::build_used_graph_element_ids(None).is_none());
-        assert!(super::build_used_graph_element_ids(Some(&[])).is_none());
+        assert!(super::build_used_graph_element_ids(SearchType::GraphCompletion, None).is_none());
+        assert!(
+            super::build_used_graph_element_ids(SearchType::GraphCompletion, Some(&[])).is_none()
+        );
     }
 
     // ── Access tracking on the default completion path ───────────────────

@@ -26,6 +26,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ProcessedInput` gains the flag that asks for it. Implementors of `IngestDb`
   and code that builds a `ProcessedInput` by hand must add them.
 
+- **`cognee-search`: recall routing honours what the deployment can run.** As
+  Python's router does on `dev` (SDK-751, cognee `5ae7523fb`; v1.6.5 still
+  answers keyless recall with `CHUNKS`), `RoutingConstraints { llm_available,
+  cypher_allowed }` is applied after the rules. With Cypher disabled, a routed
+  Cypher type would become the fallback, but no rule routes to one; an explicit
+  one is refused by its retriever. With no LLM, `CHUNKS_LEXICAL` and `CODING_RULES` run as they are,
+  `HYBRID_COMPLETION`, `GRAPH_COMPLETION`, `RAG_COMPLETION` and
+  `TRIPLET_COMPLETION` (in Python a deprecated alias of `GRAPH_COMPLETION`) — routed or
+  explicit — run with `only_context`, and any other routed type becomes the
+  fallback with `only_context`. Recall reads the constraints from the search
+  orchestrator, which `SearchBuilder` sets from its LLM (`Llm::is_configured`)
+  and `search.allow_cypher_query`; an orchestrator built by hand allows
+  everything unless given `with_routing_constraints`.
+
+  **Migration.** `route_query` takes `&RoutingConstraints` (pass
+  `&RoutingConstraints::default()` for the previous behaviour), and
+  `RouteDecision` has an `only_context` field.
+
+- **The session graph-context feature is removed; `graph_context` recall is an
+  alias of `graph` (SDK-1044).** Mirrors Python 3401da38a ("Remove graph
+  session sync").
+
+  | Item | Before | After |
+  |---|---|---|
+  | `cognee_cognify::memify::sync_graph_session` (`sync_graph_to_session`, `checkpoint_key`, `SyncResult`, `SyncError`) | public | **removed** |
+  | `SessionStore` / `SessionManager::{get,set}_graph_context`, `SessionContext.graph_context` | public | **removed**; the fs and Redis stores still delete a legacy snapshot with its session |
+  | `SessionQaDb` graph-context ops, `session_graph_context` table | present | **removed**; migration `m20261029_000001_drop_session_graph_context` drops the table |
+  | `cognee::session::{get,set}_graph_context` | public | **removed** |
+  | Binding graph-context ops (bindings-common `run_{get,set}_graph_context`, C `cg_sdk_{get,set}_graph_context`, Python, TS, Java) | present | **removed** |
+  | `RecallScope::GraphContext`, `RecallSource::GraphContext`, `fetch_graph_context` | present | **removed**; `"graph_context"` normalizes to `"graph"` with a deprecation warning and deserializes as `RecallScope::Graph`; `"all"` is graph, session and trace |
+  | Session history prefix "Background knowledge from the knowledge graph" | prepended | gone |
+
+- **Agent context, user preferences and personalized retrieval (SDK-1044).**
+
+  | Item | Before | After |
+  |---|---|---|
+  | `ImproveParams`, `SessionAutoImprove` | `personalization_enabled: bool` | `personalization: cognee_search::PreferenceConfig`, `auto_feedback: bool` |
+  | `cognee::api::remember` | `…, personalization_enabled: bool` | `…, personalization: PreferenceConfig, auto_feedback: bool` |
+  | Session QA `memify_metadata` updates | replaced the whole map | merge keys (Python's `update_qa`); `feedback_weights` sends only its own key |
+  | `SearchRetriever` | — | `previews_empty_context(&params)` (provided; graph completion with the global context index previews the prelude alone) |
+  | RAG completion turns | recorded no used ids | record the chunks' ids (`used_graph_element_ids.node_ids`) |
+  | RAG personalization | scaled the similarity | scales the distance (`1 - score`), as Python |
+  | Hybrid fallback | read only an explicit `feedback_influence` | a positive `DEFAULT_FEEDBACK_INFLUENCE` also defers hybrid to graph completion |
+  | `AgentLesson` parsing | exact lowercase section, numeric confidence | section trimmed and lowercased, `null` confidence is 0, clamped to [0, 1] |
+
+  The stages `extract_agent_context` and `update_user_preferences` are ported.
+  The preference text is inert on Rust-only data until session-turn
+  preparation lands (SDK-1045).
+
+- **Improve waits on its dataset and sessions; one dataset lock registry;
+  deletes and writing improves are changes (SDK-1044).**
+
+  | Item | Before | After |
+  |---|---|---|
+  | `cognee-session` improve lock | `try_acquire_improve_lock(session_id) -> bool`, `release_improve_lock`, `ImproveLockGuard` (a concurrent improve of the session skipped) | `acquire_improve_lock_many(&keys) -> ImproveClaim` (waits; released on drop) and `improve_lock_keys(sessions, user)` (`session:{user}:{session}`) |
+  | `ImproveParams` | — | `+ dataset_locks`, `+ checkpoint_store` reads the stage watermarks (struct literals must set them) |
+  | `DatasetLocks` | per-host registries only | `DatasetLocks::global()`, the process-wide registry: the default of `AddPipeline::new` and `DeleteService::new` (was none), and of `improve` |
+  | `cognee_cognify::tasks::cognify`, `memify` | took no dataset lock | hold the dataset in `DatasetLocks::global()` for the run (re-entrant for a caller holding it there), as Python's `dataset_lock` |
+  | `DeleteService` | wrote no row for a data-item delete | records a `forget` `pipeline_runs` row on every dataset it touched (`FORGET_PIPELINE_NAME`, `CHANGE_RECORD_PIPELINE_NAMES`; the Initiated resets skip them) when a pipeline-run repo is wired |
+  | `improve()` | wrote no row of its own | records one `improve` row (`IMPROVE_WRITE_PIPELINE_NAME`) after its first stage that may have written to the graph |
+
+  `global_context_index` is `already_completed` (`no_writes_since_last_improve`)
+  when nothing but reads and host `improve_pipeline` rows ran since its stamp.
+
+- **`improve()` is Python's staged orchestrator and returns its
+  `ImproveResult` (SDK-1044).** `cognee::api::improve` runs Python's nine
+  stages in registry order and reports one `StageResult` per stage.
+
+  | Item | Before | After |
+  |---|---|---|
+  | `ImproveResult` | `stages_run`, `memify_result`, `feedback_entries_processed`, `feedback_entries_applied`, `sessions_persisted`, `edges_synced` | Python's shape: `dataset_id`, `dataset_name`, `session_ids`, `stages: Vec<StageResult>`, `background`, `finished`, `error`, `memify_run`, computed `status()`; the old counters are stage `counts` |
+  | `ImproveParams` | — | `+ dataset_id` (struct literals must set it); `node_name` and the custom-task fields are deprecated and ignored |
+  | `ApiError::ImproveAborted { result, budget_exhausted }` | — | new: the fatal `persist_session_qa` stage errored; carries the partial result |
+  | Stages `memify` / `sync_graph_to_session` | ran | removed; `global_context_index` runs last |
+  | Binding / C API improve JSON | `{stagesRun, stages, memifyResult, feedbackEntriesProcessed, …}` | `{datasetId, datasetName, sessionIds, stages, background, finished, error, status}` |
+  | Binding improve errors | a fatal-stage abort was a plain runtime error | `SdkError::ImproveAborted { message, improve_result }` (code `IMPROVE_ABORTED`): Python `CogneeImproveAbortedError.improve_result`, JS `ImproveAbortedError.improveResult`; C (`CG_ERR_RUNTIME`) and Java append `improve_result: <json>` to the message |
+  | CLI `improve --node-name` | scoped the run | deprecated, ignored |
+
+  An exhausted LLM budget is recognised from the typed
+  `LlmError::PaymentRequired` / `CognifyError::PaymentRequired` — including a
+  budget failure inside cognify, now carried by `FailureReport::budget_exhausted`
+  (`record_error`) — and from a stage's rendered error
+  (`cognee_llm::is_budget_exhausted_message`, Python's
+  `is_budget_exhausted_record`). The temporal extractors keep a 402 typed
+  (`CognifyError::PaymentRequired` instead of `FactExtractionError`).
+
 - **`cognee-search`: recall routes with Python's ordered rule router, and an
   unmatched query runs `HYBRID_COMPLETION`.** `route_query` checks three rules
   in order — a quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording →

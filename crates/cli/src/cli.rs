@@ -837,14 +837,15 @@ pub struct ImproveArgs {
     #[arg(long = "session-id")]
     pub session_id: Vec<String>,
 
-    /// Restrict the enrichment (memify) pass to these graph node names.
-    /// Repeatable.
+    /// Deprecated and ignored: it scoped the removed triplet-enrichment
+    /// (memify) stage. Kept so existing invocations still parse. Repeatable.
     #[arg(long = "node-name")]
     pub node_name: Vec<String>,
 
-    /// Mixing factor for feedback weight propagation (Stage 1).
-    #[arg(long = "feedback-alpha", default_value_t = 0.1)]
-    pub feedback_alpha: f64,
+    /// Learning rate of the `feedback_weights` stage, in (0, 1]. Defaults to
+    /// the `improve.feedback_alpha` setting (`IMPROVE_FEEDBACK_ALPHA`, 0.1).
+    #[arg(long = "feedback-alpha")]
+    pub feedback_alpha: Option<f64>,
 
     #[arg(long = "tenant-id")]
     pub tenant_id: Option<String>,

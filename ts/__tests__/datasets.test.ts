@@ -458,23 +458,6 @@ describe("Phase-5 DatasetManager, forget, prune, sessions, notebooks (Tier-A)", 
       );
       expect(typeof ok).toBe("boolean");
     });
-
-    it("getGraphContext returns null for an unknown session", async () => {
-      const ctx = await native.cogneeGetGraphContext(
-        handle,
-        "no-such-session"
-      );
-      expect(ctx).toBeNull();
-    });
-
-    it("setGraphContext + getGraphContext round-trip", async () => {
-      const sessionId = `test-gc-${Date.now()}`;
-      const payload = "test graph context payload";
-
-      await native.cogneeSetGraphContext(handle, sessionId, payload);
-      const retrieved = await native.cogneeGetGraphContext(handle, sessionId);
-      expect(retrieved).toBe(payload);
-    });
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -634,13 +617,14 @@ describe("Phase-5 memory ops (Tier-B — skips without LLM creds)", () => {
     expect(typeof result.alreadyCompleted).toBe("boolean");
   });
 
-  it("cogneeImprove returns ImproveResult with stagesRun array", async () => {
+  it("cogneeImprove returns ImproveResult with one entry per stage", async () => {
     const result = await native.cogneeImprove(handle, {
       datasetName: "tier_b_remember",
     });
-    expect(Array.isArray(result.stagesRun)).toBe(true);
-    expect(typeof result.feedbackEntriesProcessed).toBe("number");
-    expect(typeof result.sessionsPersisted).toBe("number");
+    expect(result.stages.length).toBe(9);
+    expect(result.stages[0].stage).toBe("feedback_weights");
+    // Nothing opted in and no session ids: every stage is skipped.
+    expect(result.status).toBe("skipped");
     // Without session ids the truth stage reports the orchestrator's skip reason.
     const truth = result.stages.find((s) => s.stage === "build_truth_subspace");
     expect(truth?.status).toBe("skipped");

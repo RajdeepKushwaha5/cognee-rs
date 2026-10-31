@@ -27,9 +27,20 @@ Stores input as memory: it runs **add + cognify** and then, by default, the
 **improve** enrichment pass. Accepts inline text and/or file paths.
 
 - **Session memory** — pass a `--session-id` to scope the turn to a session
-  (session-backed QA history).
+  (session-backed QA history). The improve that bridges the session into the
+  graph runs as a detached background task, as in Python: `remember` returns
+  once the entry is stored. It is skipped when `improve.auto_enabled` is off
+  (`IMPROVE_AUTO_ENABLED=false`) or an `improve.*` setting is invalid, and
+  debounced by `improve.debounce_entries` / `improve.debounce_seconds` (state
+  kept in the session as an internal `auto_improve_debounce` row). The CLI
+  waits for it before exiting and a binding's `close()` before closing the
+  handle (`cognee::wait_for_background_tasks`; bindings-common
+  `ops::lifecycle::wait_for_background_tasks`). A detached task that panics is
+  logged at `error`.
 - **Permanent graph memory** — omit `--session-id` and the input is persisted as
-  permanent, graph-backed memory.
+  permanent, graph-backed memory. Its self-improvement pass (memify) follows
+  the same gate: off when `improve.auto_enabled` is off or an `improve.*`
+  setting is invalid, as Python's `self_improvement and auto_improve_enabled()`.
 
 `remember ≈ add + cognify + improve`. rustdoc: `api::remember`.
 
@@ -40,7 +51,14 @@ picks the retrieval strategy by the first matching rule, as Python does: a
 quoted phrase → `CHUNKS_LEXICAL`, coding-rules wording → `CODING_RULES`, a time
 preposition before an absolute date → `TEMPORAL`, anything else →
 `HYBRID_COMPLETION`. A routed type that the backend rejects, or a lexical or
-rules search that finds nothing, is retried as `HYBRID_COMPLETION`. It is session-aware (reads
+rules search that finds nothing, is retried as `HYBRID_COMPLETION`. With no
+LLM API key, recall still routes: `CHUNKS_LEXICAL` and `CODING_RULES` run as
+they are, and any other routed type falls back to `HYBRID_COMPLETION`; it and an
+explicit `HYBRID_COMPLETION`, `GRAPH_COMPLETION`, `RAG_COMPLETION` or
+`TRIPLET_COMPLETION` return
+their context instead of an answer (`only_context`). No rule routes to
+`CYPHER` or `NATURAL_LANGUAGE`; requested explicitly with
+`ALLOW_CYPHER_QUERY=false`, they are refused. It is session-aware (reads
 session history when given a `--session-id`) and graph-backed. Results are
 returned to the caller (printed to stdout by the CLI).
 
@@ -48,12 +66,121 @@ returned to the caller (printed to stdout by the CLI).
 
 ### improve
 
-Enriches memory and bridges sessions: runs the feedback/enrichment improvement
-stages over the graph (memify-style triplet enrichment plus feedback weighting).
-When session IDs are supplied it also distills each session's Q&A into curated,
-entity-anchored "session-learnings" lesson documents (tagged with the
-`session_learnings` node-set) and cognifies them into the permanent graph.
-Can target specific sessions or graph nodes and tune the feedback weight.
+Runs the self-improvement loop over a dataset as nine gated stages, in
+Python's registry order: `feedback_weights`, `persist_session_qa`,
+`persist_agent_traces`, `extract_agent_context`, `distill_sessions`,
+`update_user_preferences`, `build_truth_subspace`, `review_conflicts`,
+`global_context_index`. The first seven read the given sessions and are
+skipped with `no_session_ids` without them; the last two work on the graph
+alone and are opt-in. Each stage reports a `StageResult` (`status`, `reason`,
+`error`, `counts`, `duration_ms`) on the returned `ImproveResult`, whose
+`status` summarises them (`completed`, `errored`, `skipped`, `running`).
+Stages named in `improve.stages_disabled` (`IMPROVE_STAGES_DISABLED`, a
+comma-separated list) are skipped first, with `disabled_by_config`; an unknown
+name, or the fatal `persist_session_qa`, makes the configuration invalid and
+the run fails before any stage. `feedback_alpha` defaults to
+`improve.feedback_alpha` (0.1).
+
+The run fails open — a failed stage is recorded and the next one runs —
+except that a failure in `persist_session_qa` (losing session Q&A would be data
+loss) stops the run with `ApiError::ImproveAborted` carrying the partial
+result, and an exhausted LLM budget skips every later stage with
+`budget_exhausted`. The stages that draft text with an LLM are skipped with
+`no_llm_configured` when none is configured. `review_conflicts` (opt-in via
+`improve.review_conflicts`) is not ported yet and always reports a skip
+reason.
+
+`extract_agent_context` runs while automatic session context is on
+(`auto_feedback` with session caching; otherwise `auto_feedback_disabled`)
+and an LLM is configured. Per session it reads the trace steps newer than the
+session's extraction watermark (plus 3 already-processed ones, at most 40),
+shows the model the session's existing agent lessons with Python's prompt,
+and stores at most 5 new lessons as `agent`-profile session-context entries
+(sections `tool_rules`, `workflow_state`, `success_patterns`,
+`failure_lessons`, `environment_facts`). A lesson is stored only with
+confidence ≥ 0.75 and at most 280 characters; one whose normalized text an
+entry of the same section already has is not stored again. The watermark
+advances only after the session's extraction succeeded. Counts: `lessons`,
+`sessions_failed`; the stage is `errored` when any session failed, and the
+other sessions still run. Error texts shown to the model are redacted
+(tokens, secrets, UUIDs, long numbers).
+
+`update_user_preferences` runs while `personalization_enabled` is on. It folds
+the sessions' turns into one `UserPreference` node per (user, dataset), an
+internal node (never embedded, never returned by a search) in the
+`user_preferences` node set, and weighted `prefers` edges from it to the graph
+nodes the turns' answers used (`used_graph_element_ids.node_ids`). A turn's
+rating is its `feedback_score`, else the rating a feedback row inferred for
+it; a rating `r` pulls each node's weight toward `(r - 1) / 4` by
+`preference_alpha`, from its decayed value
+`0.5 + (w - 0.5) * (1 - preference_beta)^(idle turns)`. Every turn advances
+the node's turn counter once; an edge that decayed to within 0.01 of neutral
+is retired. The node's text collects the usable `preferences`-section
+session-context entries newer than its watermark, newest first, capped at
+2000 characters on line boundaries. Turns are marked in `memify_metadata`
+(`preference_turn_counted`, `preference_weights_applied`), so a re-run
+counts and applies each once. Counts: `turns_applied`, `edges_written`,
+`edges_pruned`, `text_lines_added`; nothing to fold is `completed` with the
+reason `no_changes`.
+
+With personalization on, searches read these back for the requesting user in
+the search's single dataset: the decayed `prefers` weights scale the matched
+nodes' distances in graph triplet ranking (every graph completion type) and
+re-rank RAG completion's chunks (fetching `wide_search_top_k` candidates
+first, then trimming to `top_k`), by at most `personalization_influence`;
+graph and RAG completion also append the preference text (under
+`## What this user prefers`) to the question and context. The hybrid search
+does not use them yet.
+
+A run holds its dataset's lock for its whole length, then a claim on every
+session it targets (`session:{user_id}:{session_id}`), and releases both once
+it ends. Both wait, with no timeout: improves that share a dataset or a session
+run one after the other, as pipeline runs on one dataset do, instead of the
+later one skipping; runs on different datasets and sessions do not wait. The
+dataset lock is Python's one `dataset_lock` registry: `cognee_core::DatasetLocks::global()`
+is the default of `add` (`AddPipeline`), dataset-scoped deletes
+(`DeleteService`) and `improve` (`ImproveParams::dataset_locks`, else the add
+pipeline's registry, else the global one), and `cognify` and `memify` always
+hold it for their run, so in one process those writers queue per dataset. A
+host with its own registry wires it into the add pipeline, the delete service
+and `improve`; the HTTP server shares the global one. The stages' own adds and
+cognifies re-enter the improve's hold. A dataset that does not exist yet is
+held by the id an `add` of it would create.
+
+`global_context_index` (opt-in, `build_global_context_index`) builds the
+dataset's global context index with Python's default `from_entities` method,
+which makes no LLM call: one `GlobalContextSummary` bucket per document
+naming the entities it is distinctively about (tf·idf over the dataset's
+chunks, up to 20) and up to 40 relation lines among them, plus a root of
+three lines (`Topics:`, `Entities:`, `Documents:`). Ids are Python's uuid5
+ids, so the text and ids match Python's byte for byte. Each run computes the
+whole index, writes only the nodes whose text changed (graph node, vector in
+`GlobalContextSummary_text`, `summarized_in` edge to the root and
+`summarizes` edge to the document) and deletes the index nodes it did not
+compute; the nodes' ownership rows name the dataset, so deleting the
+dataset removes them. Its count `nodes_written` is the nodes it wrote. The
+opt-in LLM method (vector-placed buckets of `TextSummary` nodes, levels, LLM
+bucket and root summaries with Python's prompts) is
+`cognee_cognify::build_global_context_index` with
+`GlobalContextIndexMethod::Llm`; `improve()` does not use it, as Python's stage
+does not. A graph completion search with `include_global_context_index`
+prepends the root and the `global_context_index_top_k` (3) nearest bucket
+summaries to its context (`World summary:` / `Relevant areas:`). A
+dataset-scoped search reads only its datasets' root and summaries (their
+`dataset_id`), so datasets sharing one graph and vector store never see each
+other's index. With no triplet found, the prelude alone is the context, and an
+`only_context` search previews the prompt built from it, as Python's
+`get_context_from_objects` does.
+
+`global_context_index` reports `already_completed` (`no_writes_since_last_improve`)
+when no `pipeline_runs` row other than a `search`, a `recall` or a host's
+`improve_pipeline` record was written since it last ran. A delete records a
+`forget` row on every dataset it touched, and an improve run whose stage may
+have written to the graph (anything but the index itself, unless its write
+counts say it wrote nothing) records one `improve` row, so both count as
+changes, as in Python. A run that did not end `errored` stamps the stage's start in the
+checkpoint store (`improve_stage:{stage}:{dataset_id}`); without a checkpoint
+store or a relational database, or on any error reading them, the stage runs.
 rustdoc: `api::improve`.
 
 ### forget
@@ -216,7 +343,8 @@ Unified orchestration across 18 retrieval strategies selected by `SearchType`
 chunks/summaries/entities/edge-facts and
 1-hop graph-neighborhood expansion around matched entities, then answers via
 LLM completion). A hybrid search falls back to `GraphCompletion` when it sets
-`node_type`, `neighborhood_depth` or `feedback_influence`, or when the
+`node_type`, `neighborhood_depth` or a positive `feedback_influence` (an unset
+one takes `DEFAULT_FEEDBACK_INFLUENCE`, so a positive default falls back too), or when the
 `DocumentChunk_text` collection is missing; setting `wide_search_top_k` or
 `triplet_distance_penalty` with hybrid is an error. Entry: [`cognee-search`](../crates/search/)
 (`SearchBuilder` / `SearchOrchestrator`).

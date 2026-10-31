@@ -11,6 +11,7 @@ use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use uuid::Uuid;
 
+use crate::context_entry::SessionContextRow;
 use crate::error::SessionError;
 use crate::session_store::{SessionQAUpdate, SessionStore};
 use crate::types::{SessionQAEntry, SessionTraceStep, UsedGraphElementIds};
@@ -86,7 +87,8 @@ impl RedisSessionStore {
         }
     }
 
-    /// Expire a session's keys (Q&A list, trace list, graph context) this
+    /// Expire a session's keys (Q&A list, trace list, session-context list)
+    /// this
     /// many seconds after their last write, as Python's `RedisAdapter` does
     /// with `session_ttl_seconds` (default 604 800, 7 days). `0` never
     /// expires them, the behaviour of a store built without this call.
@@ -178,13 +180,27 @@ fn redis_entry_to_domain(e: &RedisQAEntry, session_id: &str) -> SessionQAEntry {
     }
 }
 
-fn graph_context_key(user_id: Option<&str>, session_id: &str) -> String {
+/// The graph-knowledge snapshot key of the removed graph-to-session sync.
+/// Only `delete_session` and `prune` still touch it, to clean up keys written
+/// before the removal (Python keeps the same one-release cleanup).
+fn legacy_graph_context_key(user_id: Option<&str>, session_id: &str) -> String {
     let uid = user_id.unwrap_or("default");
     format!("graph_knowledge:{uid}:{session_id}")
 }
 
 fn trace_key(user_id: &str, session_id: &str) -> String {
     format!("cognee:trace:{user_id}:{session_id}")
+}
+
+/// Python's `RedisAdapter._session_context_key`.
+fn session_context_key(user_id: Option<&str>, session_id: &str) -> String {
+    let uid = user_id.unwrap_or("default");
+    format!("session_context:{uid}:{session_id}")
+}
+
+fn parse_context_row(raw: &str) -> Result<SessionContextRow, SessionError> {
+    serde_json::from_str(raw)
+        .map_err(|e| SessionError::StoreError(format!("json parse error: {e}")))
 }
 
 /// Apply a `SessionQAUpdate` to a `RedisQAEntry` in place.
@@ -212,7 +228,7 @@ fn apply_update_to_redis_entry(entry: &mut RedisQAEntry, updates: &SessionQAUpda
     if let Some(ref mm) = updates.memify_metadata {
         entry.memify_metadata = mm
             .as_ref()
-            .map(|v| serde_json::to_value(v).unwrap_or_default());
+            .map(|v| crate::types::merge_memify_metadata(entry.memify_metadata.take(), v));
     }
 }
 
@@ -292,9 +308,20 @@ impl SessionStore for RedisSessionStore {
         session_id: &str,
         user_id: Option<&str>,
     ) -> Result<bool, SessionError> {
-        let key = session_key(user_id, session_id);
+        // The session-context list goes with the session and counts toward
+        // "existed", as in Python's `delete_session`.
+        let keys = [
+            session_key(user_id, session_id),
+            session_context_key(user_id, session_id),
+        ];
         let mut conn = self.conn.clone();
-        let deleted: i64 = conn.del(&key).await.map_err(map_err)?;
+        let deleted: i64 = conn.del(&keys).await.map_err(map_err)?;
+        // A legacy graph-context snapshot goes too, best-effort; it does not
+        // count toward "existed".
+        let legacy = legacy_graph_context_key(user_id, session_id);
+        if let Err(e) = conn.del::<_, ()>(&legacy).await {
+            tracing::debug!(error = %e, "deleting the legacy graph-context key failed");
+        }
         Ok(deleted > 0)
     }
 
@@ -356,15 +383,17 @@ impl SessionStore for RedisSessionStore {
             conn.del::<_, ()>(&keys).await.map_err(map_err)?;
         }
 
-        // Also delete graph_knowledge:* keys
-        let gk_keys: Vec<String> = redis::cmd("KEYS")
-            .arg("graph_knowledge:*")
-            .query_async(&mut conn)
-            .await
-            .map_err(map_err)?;
-
-        if !gk_keys.is_empty() {
-            conn.del::<_, ()>(&gk_keys).await.map_err(map_err)?;
+        // Also delete the session_context:* keys and any legacy
+        // graph_knowledge:* snapshot of the removed graph-to-session sync.
+        for pattern in ["graph_knowledge:*", "session_context:*"] {
+            let keys: Vec<String> = redis::cmd("KEYS")
+                .arg(pattern)
+                .query_async(&mut conn)
+                .await
+                .map_err(map_err)?;
+            if !keys.is_empty() {
+                conn.del::<_, ()>(&keys).await.map_err(map_err)?;
+            }
         }
 
         Ok(())
@@ -416,30 +445,6 @@ impl SessionStore for RedisSessionStore {
         Ok(true)
     }
 
-    async fn get_graph_context(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<Option<String>, SessionError> {
-        let key = graph_context_key(user_id, session_id);
-        let mut conn = self.conn.clone();
-        let result: Option<String> = conn.get(&key).await.map_err(map_err)?;
-        Ok(result)
-    }
-
-    async fn set_graph_context(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-        context: &str,
-    ) -> Result<(), SessionError> {
-        let key = graph_context_key(user_id, session_id);
-        let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(&key, context).await.map_err(map_err)?;
-        self.apply_session_ttl(&mut conn, &key).await?;
-        Ok(())
-    }
-
     async fn save_trace_step(
         &self,
         user_id: &str,
@@ -474,6 +479,61 @@ impl SessionStore for RedisSessionStore {
                     .map_err(|e| SessionError::StoreError(format!("json parse error: {e}")))
             })
             .collect()
+    }
+
+    async fn create_session_context_entry(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        entry: SessionContextRow,
+    ) -> Result<(), SessionError> {
+        let json = serde_json::to_string(&entry)
+            .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
+        let key = session_context_key(user_id, session_id);
+        let mut conn = self.conn.clone();
+        conn.rpush::<_, _, ()>(&key, &json).await.map_err(map_err)?;
+        self.apply_session_ttl(&mut conn, &key).await
+    }
+
+    async fn get_session_context_entries(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<Vec<SessionContextRow>, SessionError> {
+        let key = session_context_key(user_id, session_id);
+        let mut conn = self.conn.clone();
+        let raw: Vec<String> = conn.lrange(&key, 0, -1).await.map_err(map_err)?;
+        raw.iter().map(|s| parse_context_row(s)).collect()
+    }
+
+    async fn update_session_context_entry(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        entry_id: &str,
+        merge: SessionContextRow,
+    ) -> Result<bool, SessionError> {
+        let key = session_context_key(user_id, session_id);
+        let mut conn = self.conn.clone();
+        let raw: Vec<String> = conn.lrange(&key, 0, -1).await.map_err(map_err)?;
+        for (index, s) in raw.iter().enumerate() {
+            let mut row = parse_context_row(s)?;
+            if row.get("id").and_then(serde_json::Value::as_str) != Some(entry_id) {
+                continue;
+            }
+            row.extend(merge);
+            let json = serde_json::to_string(&row)
+                .map_err(|e| SessionError::StoreError(format!("json error: {e}")))?;
+            // Overwrite in place (Python's `_write_entry_at`, an LSET).
+            let index = isize::try_from(index)
+                .map_err(|e| SessionError::StoreError(format!("list index overflow: {e}")))?;
+            conn.lset::<_, _, ()>(&key, index, &json)
+                .await
+                .map_err(map_err)?;
+            self.apply_session_ttl(&mut conn, &key).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -525,7 +585,7 @@ mod tests {
     async fn session_ttl_expires_every_written_key() {
         use redis::AsyncCommands;
 
-        use super::{RedisSessionStore, graph_context_key, session_key, trace_key};
+        use super::{RedisSessionStore, session_key, trace_key};
         use crate::session_store::SessionStore;
         use crate::types::SessionTraceStep;
 
@@ -547,10 +607,6 @@ mod tests {
             .with_session_ttl_seconds(120);
         store
             .create_qa_entry(&session, Some(user), "q", "a", None)
-            .await
-            .unwrap();
-        store
-            .set_graph_context(&session, Some(user), "ctx")
             .await
             .unwrap();
         store
@@ -577,11 +633,7 @@ mod tests {
             .get_multiplexed_async_connection()
             .await
             .unwrap();
-        for key in [
-            session_key(Some(user), &session),
-            graph_context_key(Some(user), &session),
-            trace_key(user, &session),
-        ] {
+        for key in [session_key(Some(user), &session), trace_key(user, &session)] {
             let ttl: i64 = conn.ttl(&key).await.unwrap();
             assert!((1..=120).contains(&ttl), "{key}: ttl {ttl}");
             let _: () = conn.del(&key).await.unwrap();
@@ -597,6 +649,97 @@ mod tests {
         let ttl: i64 = conn.ttl(&key).await.unwrap();
         assert_eq!(ttl, -1);
         let _: () = conn.del(&key).await.unwrap();
+    }
+
+    /// Session-context rows: append, ordered read, in-place merge, TTL on
+    /// the `session_context:` key and removal with the session. Needs a
+    /// Redis server (`REDIS_TEST_URL`); skipped when unset.
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "tests drive configuration through the process env"
+    )]
+    async fn session_context_rows_round_trip() {
+        use redis::AsyncCommands;
+
+        use super::{RedisSessionStore, session_context_key};
+        use crate::context_entry::SessionContextRow;
+        use crate::session_store::SessionStore;
+
+        let Some(url) = std::env::var("REDIS_TEST_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+        else {
+            eprintln!("REDIS_TEST_URL not set — skipping session_context_rows_round_trip");
+            return;
+        };
+        let session = format!("ctx-{}", uuid::Uuid::new_v4());
+        let user = Some("ctx-user");
+        let row =
+            |v: serde_json::Value| -> SessionContextRow { serde_json::from_value(v).unwrap() };
+
+        let store = RedisSessionStore::new(&url)
+            .await
+            .unwrap()
+            .with_session_ttl_seconds(120);
+        store
+            .create_session_context_entry(
+                &session,
+                user,
+                row(serde_json::json!({"id": "a", "kind": "context", "n": 1})),
+            )
+            .await
+            .unwrap();
+        store
+            .create_session_context_entry(
+                &session,
+                user,
+                row(serde_json::json!({"id": "b", "kind": "wm_state"})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_session_context_entry(
+                    &session,
+                    user,
+                    "b",
+                    row(serde_json::json!({"done": 5}))
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_session_context_entry(&session, user, "zzz", SessionContextRow::new())
+                .await
+                .unwrap()
+        );
+        let rows = store
+            .get_session_context_entries(&session, user)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], serde_json::json!("a"));
+        assert_eq!(rows[1]["done"], serde_json::json!(5));
+        assert_eq!(rows[1]["kind"], serde_json::json!("wm_state"));
+
+        let mut conn = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let ttl: i64 = conn.ttl(session_context_key(user, &session)).await.unwrap();
+        assert!((1..=120).contains(&ttl), "ttl {ttl}");
+
+        assert!(store.delete_session(&session, user).await.unwrap());
+        assert!(
+            store
+                .get_session_context_entries(&session, user)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

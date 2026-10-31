@@ -25,6 +25,13 @@ pub enum CognifyError {
     #[error("LLM error: {0}")]
     LlmError(String),
 
+    /// The LLM provider rejected the call because the budget is exhausted
+    /// (HTTP 402, [`cognee_llm::LlmError::PaymentRequired`]). Kept apart from
+    /// [`Self::LlmError`] so callers such as the improve orchestrator can stop
+    /// on it without matching on text (Python's `LLMPaymentRequiredError`).
+    #[error("LLM payment required: {0}")]
+    PaymentRequired(String),
+
     #[error("Fact extraction error: {0}")]
     FactExtractionError(String),
 
@@ -101,6 +108,37 @@ pub enum CognifyError {
         pipeline_name: String,
         dataset_id: Uuid,
     },
+}
+
+impl CognifyError {
+    /// The cognify-side form of an LLM error: [`Self::PaymentRequired`] for an
+    /// exhausted budget, [`Self::LlmError`] for everything else.
+    pub fn from_llm(error: cognee_llm::LlmError) -> Self {
+        match error {
+            cognee_llm::LlmError::PaymentRequired(message) => Self::PaymentRequired(message),
+            other => Self::LlmError(other.to_string()),
+        }
+    }
+
+    /// [`Self::from_llm`] for the extractors that report their LLM failures
+    /// as [`Self::FactExtractionError`]: an exhausted budget stays typed.
+    pub fn from_fact_extraction_llm(error: cognee_llm::LlmError) -> Self {
+        match error {
+            cognee_llm::LlmError::PaymentRequired(message) => Self::PaymentRequired(message),
+            other => Self::FactExtractionError(other.to_string()),
+        }
+    }
+
+    /// Whether this error signals an exhausted LLM budget: the typed
+    /// [`Self::PaymentRequired`], or a run that failed with a budget failure
+    /// among the ones its report collected.
+    pub fn is_budget_exhausted(&self) -> bool {
+        match self {
+            Self::PaymentRequired(_) => true,
+            Self::RunFailed { report } => report.budget_exhausted(),
+            _ => false,
+        }
+    }
 }
 
 /// Convert GraphDBError to CognifyError
